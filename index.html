@@ -1,0 +1,1180 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Oracle-Datenbanken</title>
+<style>
+:root {
+  --paper: #eceeeb;
+  --sheet: #fafbfa;
+  --ink: #14252b;
+  --muted: #586a70;
+  --rule: #c6cfcc;
+  --rule-soft: #dde3e0;
+  --release: #1e5a84;
+  --branch: #62761a;
+  --ok: #2b7346;
+  --warn: #9c6700;
+  --err: #ad2a20;
+  --off: #87939a;
+  --focus: #1e5a84;
+  color-scheme: light;
+  font-family: ui-sans-serif, system-ui, "Segoe UI", "Noto Sans", "Helvetica Neue", Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.45;
+  color: var(--ink);
+  background: var(--paper);
+  font-variant-numeric: tabular-nums;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; min-height: 100vh; display: grid; grid-template-rows: auto 1fr; }
+button, input, select, textarea { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+a { color: var(--release); }
+h1, h2, h3 { margin: 0; line-height: 1.2; }
+
+/* Kopfzeile */
+.top { display: flex; align-items: center; gap: 24px; padding: 10px 20px; background: var(--ink); color: #e8eeec; }
+.top .brand { font-weight: 650; letter-spacing: .01em; }
+.top .host { color: #9fb2b0; font-size: 13px; }
+.top .grow { flex: 1; }
+.meter { display: grid; gap: 3px; min-width: 220px; font-size: 12.5px; color: #c9d6d3; }
+.meter .bar { height: 6px; background: #31474e; border-radius: 3px; overflow: hidden; }
+.meter .bar span { display: block; height: 100%; background: #b8cfc9; }
+.meter.tight .bar span { background: #e0a43a; }
+
+/* Grundlayout */
+.layout { display: grid; grid-template-columns: 230px minmax(0, 1fr); min-height: 0; }
+nav.side { border-right: 1px solid var(--rule); padding: 18px 12px; display: flex; flex-direction: column; gap: 4px; background: var(--paper); }
+nav.side h2 { font-size: 13px; font-weight: 600; color: var(--muted); padding: 0 10px 6px; }
+nav.side a { display: grid; grid-template-columns: 12px 1fr auto; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 6px; text-decoration: none; color: var(--ink); }
+nav.side a:hover { background: var(--rule-soft); }
+nav.side a[aria-current="page"] { background: var(--sheet); box-shadow: inset 3px 0 0 var(--ink); font-weight: 600; }
+nav.side .port { color: var(--muted); font-size: 12.5px; }
+nav.side .sep { height: 1px; background: var(--rule); margin: 12px 6px; }
+main { padding: 22px 28px 120px; min-width: 0; }
+
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; background: var(--off); flex: none; }
+.dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.err { background: var(--err); }
+.pill { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; padding: 2px 9px 2px 7px; border-radius: 999px; background: var(--rule-soft); white-space: nowrap; }
+.pill.ok { background: #dcebe1; color: #1f5534; } .pill.warn { background: #f3e6c8; color: #6e4a00; }
+.pill.err { background: #f4dcd9; color: #82201a; } .pill.off { background: var(--rule-soft); color: var(--muted); }
+
+/* Datenbank-Kopf */
+.dbhead { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 14px 28px; padding-bottom: 18px; border-bottom: 2px solid var(--ink); }
+.dbhead h1 { font-size: 34px; font-weight: 700; letter-spacing: -.01em; }
+.dbhead .facts { min-width: 0; max-width: 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; color: var(--muted); }
+.dbhead .actions { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
+.jdbc { display: flex; align-items: center; gap: 6px; }
+.jdbc { max-width: 100%; min-width: 0; }
+.jdbc input { flex: 0 1 auto; min-width: 0; max-width: 100%; font-size: 13px; padding: 3px 7px; border: 1px solid var(--rule); border-radius: 5px; background: var(--sheet); color: var(--ink); }
+
+button { cursor: pointer; border: 1px solid var(--rule); background: var(--sheet); padding: 6px 12px; border-radius: 6px; }
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--ink); color: #f3f6f5; border-color: var(--ink); }
+button.primary:hover { background: #24404a; }
+button.quiet { border-color: transparent; background: transparent; color: var(--muted); padding: 4px 8px; }
+button.quiet:hover { color: var(--ink); background: var(--rule-soft); }
+button.danger { color: var(--err); }
+button.small { font-size: 13px; padding: 3px 9px; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+
+.cols { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 36px; margin-top: 26px; }
+.section-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 14px; }
+.section-head h2 { font-size: 18px; font-weight: 650; }
+.section-head .hint { color: var(--muted); font-size: 13px; }
+.section-head .grow { flex: 1; }
+
+/* Timeline: Stamm mit Releases, Äste zu Entwickler-DBs */
+.timeline { list-style: none; margin: 0; padding: 0; }
+.tl { display: grid; grid-template-columns: 34px 1fr; }
+.tl .rail { position: relative; }
+.tl .rail::before { content: ""; position: absolute; left: 16px; top: 0; bottom: 0; width: 2px; background: var(--ink); }
+.tl:first-child .rail::before { top: 14px; }
+.tl:last-child .rail::before { bottom: calc(100% - 14px); }
+.tl .mk { position: absolute; left: 17px; top: 14px; transform: translate(-50%, -50%); }
+.mk-release { width: 13px; height: 13px; background: var(--release); transform: translate(-50%, -50%) rotate(45deg) !important; box-shadow: 0 0 0 3px var(--paper); }
+.mk-gone { width: 11px; height: 11px; background: var(--paper); border: 2px solid var(--off); transform: translate(-50%, -50%) rotate(45deg) !important; }
+.mk-note { width: 11px; height: 11px; border-radius: 50%; background: var(--paper); border: 2px solid var(--ink); }
+.mk-event { width: 7px; height: 7px; border-radius: 50%; background: var(--branch); box-shadow: 0 0 0 3px var(--paper); }
+.tl .body { padding: 4px 0 18px 6px; min-width: 0; }
+.tl-event .body { padding-bottom: 10px; color: var(--muted); font-size: 13.5px; }
+.tl-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.tl-release .tl-head strong { font-size: 17px; color: var(--release); }
+.tl-gone .tl-head strong { color: var(--off); text-decoration: line-through; font-weight: 500; }
+.tl time { color: var(--muted); font-size: 13px; }
+.tl .desc { margin: 4px 0 0; max-width: 62ch; white-space: pre-wrap; }
+.tl .desc.empty { color: var(--muted); font-style: italic; }
+.tl .note-text { margin: 0; max-width: 62ch; white-space: pre-wrap; }
+.tl .acts { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; margin-left: -8px; }
+/* Baum: Äste zu abgeleiteten Releases, Entwickler-DBs und ihren Snapshots */
+.tree { list-style: none; margin: 8px 0 2px -23px; padding: 0 0 0 26px; }
+.tn-body > .tree { margin-left: -15px; }
+.tn { position: relative; display: grid; grid-template-columns: 14px minmax(0, 1fr); gap: 8px; padding: 3px 0; --line: var(--branch); }
+.tn-rel { --line: var(--release); }
+.tn::before { content: ""; position: absolute; left: -26px; top: 12px; width: 26px; height: 2px; background: var(--line); }
+.tn::after { content: ""; position: absolute; left: -26px; top: 0; bottom: 0; width: 2px; background: var(--line); }
+.tn:last-child::after { bottom: auto; height: 13px; border-bottom-left-radius: 8px; }
+.tn-snap::before { background: repeating-linear-gradient(90deg, var(--line) 0 4px, transparent 4px 7px); }
+.tmk { justify-self: center; margin-top: 7px; }
+.tmk-rel { width: 10px; height: 10px; margin-top: 8px; background: var(--release); transform: rotate(45deg); }
+.tmk-snap { width: 10px; height: 10px; margin-top: 7px; border: 2px solid var(--branch); background: var(--paper); }
+.tmk.dot { width: 10px; height: 10px; margin-top: 7px; }
+.tn-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; }
+.tn-rel .tn-title strong { color: var(--release); }
+.tn-title a { color: var(--ink); font-weight: 600; text-decoration: none; }
+.tn-title a:hover { text-decoration: underline; }
+.tn-title time, .tn-title .meta { color: var(--muted); font-size: 13px; }
+.tn-desc { margin: 1px 0 0; font-size: 14px; color: var(--ink); max-width: 60ch; white-space: pre-wrap; }
+.tn-acts { display: flex; flex-wrap: wrap; gap: 2px; margin-left: -8px; }
+.tn-acts button { font-size: 12.5px; padding: 2px 8px; }
+label.toggle { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--muted); cursor: pointer; }
+.tag { font-size: 12px; color: var(--muted); border: 1px solid var(--rule); border-radius: 4px; padding: 0 5px; }
+
+/* Entwickler-DBs */
+.devlist { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--rule); }
+.dev { min-width: 0; padding: 12px 0; border-bottom: 1px solid var(--rule); display: grid; gap: 6px; }
+.dev:target { background: linear-gradient(90deg, #e3ead9, transparent); }
+.dev-top { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; }
+.dev-top h3 { font-size: 16px; font-weight: 650; }
+.dev-meta { color: var(--muted); font-size: 13.5px; display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.dev .acts { display: flex; gap: 4px; flex-wrap: wrap; margin-left: -8px; }
+
+.snaps { list-style: none; margin: 4px 0 0; padding: 2px 0 2px 14px; border-left: 2px dotted var(--branch); display: grid; gap: 8px; }
+.snaps-title { font-size: 13px; color: var(--muted); margin-top: 4px; }
+.snap-item .snap-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+.snap-item .snap-head strong { font-weight: 600; }
+.snap-item time { color: var(--muted); font-size: 13px; }
+.snap-item .desc { margin: 2px 0 0; font-size: 14px; white-space: pre-wrap; }
+.snap-item .acts { margin-top: 2px; }
+label.check { display: flex; gap: 8px; align-items: flex-start; font-size: 14px; }
+label.check input { margin-top: 3px; }
+label.check small { display: block; color: var(--muted); }
+/* Verwaltung */
+.admin-grid { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 36px; margin-top: 26px; }
+.sched-list { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--rule); }
+.sched { padding: 12px 0; border-bottom: 1px solid var(--rule); display: grid; gap: 4px; }
+.sched.off { opacity: .6; }
+.sched-top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.sched-top h3 { font-size: 16px; font-weight: 650; }
+.sched-when { font-size: 15px; }
+.sched-when b { font-size: 17px; }
+.sched-meta { color: var(--muted); font-size: 13.5px; display: flex; flex-wrap: wrap; gap: 2px 14px; }
+.sched .acts { display: flex; flex-wrap: wrap; gap: 4px; margin-left: -8px; }
+dl.facts-list { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 0; font-size: 14px; }
+dl.facts-list dt { color: var(--muted); }
+dl.facts-list dd { margin: 0; word-break: break-all; }
+.days { display: flex; flex-wrap: wrap; gap: 6px; }
+.days label { display: inline-flex; align-items: center; gap: 4px; font-weight: 400; border: 1px solid var(--rule); border-radius: 6px; padding: 4px 8px; background: #fff; cursor: pointer; }
+.days label:has(input:checked) { background: var(--ink); color: #f3f6f5; border-color: var(--ink); }
+.days input { position: absolute; opacity: 0; pointer-events: none; }
+.days label:has(input:focus-visible) { outline: 2px solid var(--focus); outline-offset: 2px; }
+.devpick { display: grid; gap: 4px; max-height: 180px; overflow-y: auto; border: 1px solid var(--rule); border-radius: 6px; padding: 8px 10px; background: #fff; }
+.devpick label { display: flex; gap: 8px; align-items: center; font-weight: 400; }
+.devpick small { color: var(--muted); }
+.row3 { display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 12px; align-items: end; }
+.inline-num { display: flex; align-items: center; gap: 8px; font-weight: 400; }
+.inline-num input { width: 6em; }
+.hint-box { font-size: 13px; color: #6e4a00; background: #f3e6c8; border-radius: 6px; padding: 6px 10px; margin: 0; }
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 1100px) { .admin-grid { grid-template-columns: 1fr; } }
+.empty-state { border: 1px dashed var(--rule); border-radius: 8px; padding: 18px; color: var(--muted); max-width: 60ch; }
+.empty-state p { margin: 0 0 10px; }
+
+/* Snapshot-Übersicht */
+table.snap { width: 100%; border-collapse: collapse; background: var(--sheet); font-size: 14px; }
+table.snap th, table.snap td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+table.snap th { font-weight: 600; color: var(--muted); font-size: 13px; border-bottom: 1px solid var(--rule); }
+table.snap td:not(.path) { white-space: nowrap; }
+table.snap td.path { font-size: 12.5px; color: var(--muted); word-break: break-all; }
+table.snap td.num { text-align: right; white-space: nowrap; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 8px; }
+
+/* Vorgänge */
+.jobs { position: fixed; right: 16px; bottom: 16px; width: min(440px, calc(100vw - 32px)); background: var(--sheet); border: 1px solid var(--rule); border-radius: 10px; box-shadow: 0 6px 24px rgba(20, 37, 43, .14); max-height: 60vh; display: flex; flex-direction: column; }
+.jobs[hidden] { display: none; }
+.jobs header { display: flex; align-items: center; padding: 8px 10px 8px 14px; border-bottom: 1px solid var(--rule-soft); font-weight: 600; font-size: 14px; }
+.jobs header .grow { flex: 1; }
+.jobs ul { list-style: none; margin: 0; padding: 0; overflow-y: auto; }
+.job { border-bottom: 1px solid var(--rule-soft); }
+.job > button { width: 100%; display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; text-align: left; border: 0; border-radius: 0; background: none; padding: 8px 14px; }
+.job > button:hover { background: var(--paper); }
+.job > button .pill { align-self: start; }
+.job .when { font-size: 12px; color: var(--muted); }
+.job pre { margin: 0; padding: 8px 14px 12px; font-size: 12px; line-height: 1.4; max-height: 260px; overflow: auto; background: #f0f3f1; white-space: pre-wrap; word-break: break-word; }
+.job .err { color: var(--err); font-size: 13px; padding: 0 14px 8px; }
+
+/* Dialoge */
+dialog { border: 1px solid var(--rule); border-radius: 10px; padding: 0; width: min(480px, calc(100vw - 24px)); color: var(--ink); background: var(--sheet); }
+dialog::backdrop { background: rgba(20, 37, 43, .35); }
+dialog form { display: grid; gap: 14px; padding: 20px 22px; }
+dialog h2 { font-size: 19px; }
+dialog p.lead { margin: -6px 0 0; color: var(--muted); font-size: 14px; }
+label.field { display: grid; gap: 4px; font-size: 14px; font-weight: 600; }
+label.field small { font-weight: 400; color: var(--muted); }
+label.field input, label.field select, label.field textarea { font-weight: 400; padding: 7px 9px; border: 1px solid var(--rule); border-radius: 6px; background: #fff; }
+label.field textarea { min-height: 84px; resize: vertical; }
+.dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+.form-error { color: var(--err); font-size: 14px; margin: 0; }
+.form-error:empty { display: none; }
+
+.toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: var(--ink); color: #f1f5f4; padding: 9px 16px; border-radius: 8px; font-size: 14px; max-width: calc(100vw - 32px); }
+.toast[hidden] { display: none; }
+.offline { background: #f4dcd9; color: #82201a; padding: 8px 20px; font-size: 14px; }
+
+@media (max-width: 1100px) { .cols { grid-template-columns: 1fr; } }
+@media (max-width: 760px) {
+  .layout { grid-template-columns: minmax(0, 1fr); }
+  nav.side { border-right: 0; border-bottom: 1px solid var(--rule); flex-direction: row; flex-wrap: wrap; }
+  nav.side h2, nav.side .sep { display: none; }
+  main { padding: 18px 16px 140px; }
+  .top .host { display: none; }
+  .meter { min-width: 140px; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+</style>
+</head>
+<body>
+<header class="top">
+  <span class="brand">Oracle-Datenbanken</span>
+  <span class="host" id="host"></span>
+  <span class="grow"></span>
+  <div class="meter" id="meter" title="Belegung des Dateisystems unter /srv/oradb"></div>
+</header>
+<div class="layout">
+  <nav class="side" id="nav" aria-label="Datenbanken"></nav>
+  <main id="main"><p>Lade …</p></main>
+</div>
+<div class="offline" id="offline" hidden></div>
+
+<section class="jobs" id="jobs" hidden aria-label="Vorgänge">
+  <header><span>Vorgänge</span><span class="grow"></span><button class="quiet small" id="jobsHide">Ausblenden</button></header>
+  <ul id="jobList"></ul>
+</section>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<!-- Release erstellen -->
+<dialog id="dlgRelease">
+  <form method="dialog" id="fRelease">
+    <h2>Release erstellen</h2>
+    <input type="hidden" name="source">
+    <p class="lead js-lead"></p>
+    <label class="field">Release-Name
+      <input name="name" required maxlength="40" pattern="[A-Za-z0-9][A-Za-z0-9._\-]*" placeholder="z. B. 2026-11-sprint-23" autocomplete="off">
+      <small>Buchstaben, Ziffern, Punkt, Bindestrich, Unterstrich</small>
+    </label>
+    <label class="field">Beschreibung <small>optional</small>
+      <textarea name="description" maxlength="500" placeholder="Was steckt in diesem Stand?"></textarea>
+    </label>
+    <p class="form-error"></p>
+    <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Release erstellen</button></div>
+  </form>
+</dialog>
+
+<!-- Entwickler-DB anlegen -->
+<dialog id="dlgDev">
+  <form method="dialog" id="fDev">
+    <h2>Entwickler-DB anlegen</h2>
+    <p class="lead">Eine eigene, beschreibbare Kopie von <b class="js-sid"></b>, aus einem Release oder aus dem Snapshot einer anderen Entwickler-DB. Änderungen bleiben in dieser Kopie.</p>
+    <label class="field">Name
+      <input name="name" required maxlength="30" pattern="[a-z0-9][a-z0-9\-]*" placeholder="z. B. mueller" autocomplete="off">
+      <small>Kleinbuchstaben, Ziffern, Bindestrich</small>
+    </label>
+    <label class="field">Ausgangsstand
+      <select name="source" required></select>
+    </label>
+    <label class="field">Für wen <small>optional</small>
+      <input name="owner" maxlength="40" placeholder="z. B. Anna Müller" autocomplete="off">
+    </label>
+    <p class="form-error"></p>
+    <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Entwickler-DB anlegen</button></div>
+  </form>
+</dialog>
+
+<!-- Snapshot einer Entwickler-DB -->
+<dialog id="dlgSnap">
+  <form method="dialog" id="fSnap">
+    <h2>Snapshot erstellen</h2>
+    <p class="lead">Hält den aktuellen Stand der Entwickler-DB <b class="js-name"></b> fest. Darauf lässt sie sich später zurücksetzen; außerdem können neue Entwickler-DBs oder ein Release daraus entstehen.</p>
+    <label class="field">Snapshot-Name
+      <input name="name" required maxlength="40" pattern="[A-Za-z0-9][A-Za-z0-9._\-]*" placeholder="z. B. vor-migration-v43" autocomplete="off">
+      <small>Buchstaben, Ziffern, Punkt, Bindestrich, Unterstrich</small>
+    </label>
+    <label class="field">Beschreibung <small>optional</small>
+      <textarea name="description" maxlength="500" placeholder="Welcher Stand ist das?"></textarea>
+    </label>
+    <label class="check"><input type="checkbox" name="consistent" value="1">
+      <span>DB dafür kurz herunterfahren
+        <small>Ergibt einen sauber geschlossenen Stand; die DB ist dafür ein bis zwei Minuten nicht erreichbar. Ohne Haken entsteht der Snapshot sofort im laufenden Betrieb; Oracle stellt den Stand beim nächsten Start selbst wieder her.</small></span>
+    </label>
+    <p class="form-error"></p>
+    <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Snapshot erstellen</button></div>
+  </form>
+</dialog>
+
+<!-- Zeitplan -->
+<dialog id="dlgSched">
+  <form method="dialog" id="fSched">
+    <h2 class="js-title">Zeitplan anlegen</h2>
+    <input type="hidden" name="id">
+    <label class="field">Bezeichnung
+      <input name="label" required maxlength="80" placeholder="z. B. Nächtliches Release DLHTEST" autocomplete="off">
+    </label>
+    <div class="row2">
+      <label class="field">Aktion
+        <select name="action" required></select>
+      </label>
+      <label class="field">Datenbank
+        <select name="sid" required></select>
+      </label>
+    </div>
+    <label class="field js-dev">Entwickler-DB
+      <select name="dev"></select>
+    </label>
+    <div class="field js-devs">Entwickler-DBs
+      <div class="devpick"></div>
+    </div>
+    <div class="js-reset">
+      <label class="field">Zurücksetzen
+        <select name="target"></select>
+      </label>
+      <label class="check" style="margin-top:10px"><input type="checkbox" name="keep_stopped" value="1" checked>
+        <span>Gestoppte DBs danach wieder stoppen <small>Sonst laufen sie nach dem Zurücksetzen.</small></span>
+      </label>
+    </div>
+    <div class="field">Wochentage
+      <div class="days js-days"></div>
+    </div>
+    <div class="row3">
+      <label class="field">Häufigkeit
+        <select name="freq"></select>
+      </label>
+      <label class="field js-f-daily">Uhrzeit
+        <input type="time" name="time" value="02:00">
+      </label>
+      <label class="field js-f-every"><span class="js-every-label">Alle … Minuten</span>
+        <input type="number" name="every" min="1" max="720" value="15">
+      </label>
+      <label class="field js-f-minute">Zur Minute
+        <input type="number" name="minute" min="0" max="59" value="0">
+      </label>
+    </div>
+    <div class="js-f-window">
+      <label class="check"><input type="checkbox" name="use_window" value="1">
+        <span>Nur in einem Zeitfenster <small>z. B. 08:00 bis 18:00; über Mitternacht geht auch (22:00 bis 06:00)</small></span>
+      </label>
+      <div class="row2 js-window" style="margin-top:8px">
+        <label class="field">Von <input type="time" name="window_from" value="08:00"></label>
+        <label class="field">Bis <input type="time" name="window_to" value="18:00"></label>
+      </div>
+    </div>
+    <small class="js-tz" style="color:var(--muted)"></small>
+    <p class="hint-box js-busy-hint" hidden>Ein Release braucht einige Minuten. Fällt ein Termin in einen noch laufenden Vorgang, wird er übersprungen.</p>
+    <div class="row2 js-naming">
+      <label class="field">Namensmuster
+        <input name="template" maxlength="36" placeholder="nightly-{datum}" autocomplete="off">
+        <small>Platzhalter: {datum}, {zeit}, {wochentag}</small>
+      </label>
+      <label class="field">Aufbewahren
+        <input type="number" name="keep" min="0" max="999" value="7">
+        <small>die neuesten n behalten, 0 = alle</small>
+      </label>
+    </div>
+    <label class="check js-consistent"><input type="checkbox" name="consistent" value="1">
+      <span>DB dafür kurz herunterfahren <small>Sauber geschlossener Stand; ohne Haken entsteht der Snapshot im laufenden Betrieb.</small></span>
+    </label>
+    <label class="check"><input type="checkbox" name="enabled" value="1" checked>
+      <span>Aktiv</span>
+    </label>
+    <p class="form-error"></p>
+    <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Zeitplan speichern</button></div>
+  </form>
+</dialog>
+
+<!-- Notiz -->
+<dialog id="dlgNote">
+  <form method="dialog" id="fNote">
+    <h2 class="js-title">Notiz hinzufügen</h2>
+    <input type="hidden" name="id">
+    <label class="field js-date">Datum
+      <input type="date" name="date">
+    </label>
+    <label class="field">Text
+      <textarea name="text" required maxlength="500" placeholder="z. B. Schema-Migration V42 auf Master eingespielt"></textarea>
+    </label>
+    <p class="form-error"></p>
+    <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Notiz speichern</button></div>
+  </form>
+</dialog>
+
+<!-- Release-Beschreibung -->
+<dialog id="dlgDesc">
+  <form method="dialog" id="fDesc">
+    <h2>Beschreibung von <span class="js-name"></span></h2>
+    <input type="hidden" name="name">
+    <label class="field">Beschreibung
+      <textarea name="description" maxlength="500"></textarea>
+    </label>
+    <p class="form-error"></p>
+    <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Beschreibung speichern</button></div>
+  </form>
+</dialog>
+
+<script>
+"use strict";
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const STATE = { "Vorgang läuft": "warn", "bereit": "ok", "startet": "warn", "startet neu": "warn", "gestoppt": "off", "Fehler": "err", "ohne Container": "err", "kein Container": "off" };
+const pill = s => `<span class="pill ${STATE[s] || "off"}"><span class="dot ${STATE[s] || ""}"></span>${esc(s)}</span>`;
+
+function fmtBytes(n) {
+  if (n == null) return "–";
+  const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toLocaleString("de-DE", { maximumFractionDigits: i >= 3 ? 1 : 0 }) + " " + u[i];
+}
+function fmtTime(s, withTime = true) {
+  if (!s) return "–";
+  const d = new Date(s);
+  if (isNaN(d)) return esc(s);
+  const o = { day: "2-digit", month: "2-digit", year: "numeric" };
+  if (withTime) Object.assign(o, { hour: "2-digit", minute: "2-digit" });
+  return d.toLocaleString("de-DE", o);
+}
+
+async function api(method, url, body) {
+  const r = await fetch(url, {
+    method,
+    headers: { "X-Requested-With": "oradb-ui", "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || `Serverfehler (HTTP ${r.status})`);
+  return j;
+}
+
+let S = null;
+let view = { kind: "db", sid: null };
+let openJobs = new Set();
+let jobsHidden = false;
+let snapRows = null;
+let admin = null;
+let showEvents = false;
+try { showEvents = localStorage.getItem("oradb.showEvents") === "1"; } catch {}
+
+function parseHash() {
+  const h = decodeURIComponent(location.hash.slice(1));
+  if (h === "snapshots") view = { kind: "snapshots" };
+  else if (h === "verwaltung") view = { kind: "admin" };
+  else view = { kind: "db", sid: (h.match(/^db=(.+)$/) || [])[1] || null };
+}
+window.addEventListener("hashchange", () => { parseHash(); if (view.kind === "snapshots") loadSnapshots(); if (view.kind === "admin") loadAdmin(); render(); });
+
+function toast(msg) {
+  const t = $("#toast"); t.textContent = msg; t.hidden = false;
+  clearTimeout(toast.t); toast.t = setTimeout(() => (t.hidden = true), 4000);
+}
+
+async function refresh() {
+  try {
+    S = await api("GET", "/api/state");
+    $("#offline").hidden = true;
+    render();
+  } catch (e) {
+    $("#offline").hidden = false;
+    $("#offline").textContent = "Keine Verbindung zum Server: " + e.message;
+  }
+}
+
+function currentDb() {
+  if (!S || !S.dbs.length) return null;
+  return S.dbs.find(d => d.sid === view.sid) || S.dbs[0];
+}
+
+/* ------------------------------------------------------------ Rendern */
+function render() {
+  if (!S) return;
+  $("#host").textContent = S.host;
+  const used = 1 - S.disk.free / S.disk.total;
+  $("#meter").className = "meter" + (used > 0.85 ? " tight" : "");
+  $("#meter").innerHTML = `<span>${fmtBytes(S.disk.free)} frei von ${fmtBytes(S.disk.total)}</span>
+    <span class="bar"><span style="width:${(used * 100).toFixed(1)}%"></span></span>`;
+  renderNav();
+  if (view.kind === "snapshots") renderSnapshots();
+  else if (view.kind === "admin") renderAdmin();
+  else renderDb(currentDb());
+  renderJobs();
+}
+
+function renderNav() {
+  const db = currentDb();
+  const items = S.dbs.map(d => {
+    const cur = view.kind === "db" && db && d.sid === db.sid;
+    return `<a href="#db=${encodeURIComponent(d.sid)}" ${cur ? 'aria-current="page"' : ""}>
+      <span class="dot ${STATE[d.master.state] || ""}" title="${esc(d.master.state)}"></span>
+      <span>${esc(d.sid)}</span><span class="port">${d.master.port ?? ""}</span></a>`;
+  }).join("");
+  $("#nav").innerHTML = `<h2>Datenbanken</h2>${items || '<p class="port" style="padding:0 10px">Keine Master-DB unter /srv/oradb/master</p>'}
+    <div class="sep"></div>
+    <a href="#snapshots" ${view.kind === "snapshots" ? 'aria-current="page"' : ""}><span></span><span>Alle Snapshots</span><span></span></a>
+    <a href="#verwaltung" ${view.kind === "admin" ? 'aria-current="page"' : ""}><span></span><span>Verwaltung</span><span></span></a>`;
+}
+
+function renderDb(db) {
+  const main = $("#main");
+  if (!db) {
+    main.innerHTML = `<div class="empty-state"><p>Unter <code>/srv/oradb/master</code> liegt noch keine Datenbank.</p>
+      <p>Lege die Master-DB nach Abschnitt 5a des Runbooks als Subvolume an und starte sie mit <code>startdb.sh</code>.</p></div>`;
+    return;
+  }
+  const m = db.master;
+  const hasRel = db.releases.length > 0;
+  main.innerHTML = `
+    <section class="dbhead">
+      <h1>${esc(db.sid)}</h1>
+      <div class="facts">
+        ${pill(m.state)}
+        ${m.port ? `<span>Port ${m.port}</span>` : ""}
+        ${m.jdbc ? jdbcField(m.jdbc) : `<span>Master-Container nicht gefunden – mit <code>startdb.sh ${esc(db.sid)} &lt;Port&gt;</code> starten</span>`}
+      </div>
+      <div class="actions">
+        <button data-act="note-add">Notiz hinzufügen</button>
+        <button class="primary" data-act="release-new" ${db.release_busy ? 'disabled title="Ein Release wird gerade erstellt"' : ""}>${db.release_busy ? "Release wird erstellt …" : "Release erstellen"}</button>
+      </div>
+    </section>
+    <div class="cols">
+      <section aria-labelledby="h-tl">
+        <div class="section-head"><h2 id="h-tl">Timeline</h2><span class="hint">${db.releases.length} ${db.releases.length === 1 ? "Release" : "Releases"}, neueste oben</span><span class="grow"></span>
+          <label class="toggle"><input type="checkbox" data-act="toggle-events" ${showEvents ? "checked" : ""}> Ereignisse anzeigen</label></div>
+        ${renderTimeline(db)}
+      </section>
+      <section aria-labelledby="h-dev">
+        <div class="section-head"><h2 id="h-dev">Entwickler-DBs</h2><span class="grow"></span>
+          <button class="small" data-act="dev-new" ${hasRel || allSnapshots(db).length ? "" : 'disabled title="Zuerst ein Release erstellen"'}>Entwickler-DB anlegen</button></div>
+        ${renderDevs(db)}
+      </section>
+    </div>`;
+}
+
+function jdbcField(url) {
+  return `<span class="jdbc"><input readonly size="${url.length}" value="${esc(url)}" aria-label="JDBC-URL"><button class="small" data-act="copy" data-text="${esc(url)}">Kopieren</button></span>`;
+}
+
+/* Baum aufbauen: wer hängt an welchem Release bzw. Snapshot? */
+function treeIndex(db) {
+  const rels = new Map(db.releases.map(r => [r.name, r]));
+  const snaps = new Map(allSnapshots(db).map(n => [n.source, n]));
+  const exists = k => k.startsWith("release:") ? rels.has(k.slice(8)) : snaps.has(k);
+  const children = new Map();
+  const push = (k, type, item, note) => {
+    if (!children.has(k)) children.set(k, { releases: [], devs: [] });
+    children.get(k)[type].push({ item, note });
+  };
+  const nested = new Set();
+  for (const r of db.releases) {
+    if (!r.parent) continue;
+    if (exists(r.parent)) { push(r.parent, "releases", r); nested.add(r.name); }
+    else if (r.lineage && r.lineage !== r.name && rels.has(r.lineage)) { push("release:" + r.lineage, "releases", r, "Herkunft gelöscht"); nested.add(r.name); }
+  }
+  for (const d of db.devdbs) {
+    if (!d.base) continue;
+    if (exists(d.base)) push(d.base, "devs", d);
+    else if (d.release && rels.has(d.release)) push("release:" + d.release, "devs", d, "Ausgangsstand gelöscht");
+  }
+  const count = key => {
+    const c = children.get(key);
+    return c ? { releases: c.releases.length, devs: c.devs.length } : { releases: 0, devs: 0 };
+  };
+  return { children, nested, count };
+}
+
+function suggestName(...parts) {
+  return parts.join("-").toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/-+/g, "-").replace(/^-/, "").slice(0, 30).replace(/-$/, "");
+}
+
+function relActions(db, T, name) {
+  const c = T.count("release:" + name);
+  return `<button class="quiet small" data-act="dev-new" data-release="${esc(name)}" data-suggest="${esc(suggestName(name))}">Als Entwickler-DB starten</button>
+    <button class="quiet small" data-act="release-new" data-source="release:${esc(name)}" data-label="${esc(name)}" ${db.release_busy ? "disabled" : ""}>Release ableiten</button>
+    <button class="quiet small" data-act="desc-edit" data-name="${esc(name)}">Beschreibung bearbeiten</button>
+    <button class="quiet small danger" data-act="release-del" data-name="${esc(name)}" data-releases="${c.releases}" data-devs="${c.devs}">Release löschen</button>`;
+}
+
+function subtree(db, T, key, depth) {
+  const c = T.children.get(key);
+  if (!c || depth > 10) return "";
+  const rels = [...c.releases].sort((a, b) => (b.item.created || "").localeCompare(a.item.created || ""));
+  const items = [
+    ...rels.map(({ item, note }) => relNode(db, T, item, note, depth)),
+    ...c.devs.map(({ item, note }) => devNode(db, T, item, note, depth)),
+  ];
+  return items.length ? `<ul class="tree">${items.join("")}</ul>` : "";
+}
+
+function relNode(db, T, r, note, depth) {
+  return `<li class="tn tn-rel"><span class="tmk tmk-rel" aria-hidden="true"></span><div class="tn-body">
+    <div class="tn-title"><strong>${esc(r.name)}</strong><time>${fmtTime(r.created)}</time>
+      <span class="meta">Release</span>${note ? `<span class="tag">${esc(note)}</span>` : ""}</div>
+    ${r.description ? `<p class="tn-desc">${esc(r.description)}</p>` : ""}
+    <div class="tn-acts">${relActions(db, T, r.name)}</div>
+    ${subtree(db, T, "release:" + r.name, depth + 1)}</div></li>`;
+}
+
+function devNode(db, T, d, note, depth) {
+  const stopped = d.state === "gestoppt";
+  const snaps = (d.snapshots || []).map(n => snapNode(db, T, d, n, depth)).join("");
+  return `<li class="tn tn-dev"><span class="tmk dot ${STATE[d.state] || ""}" title="${esc(d.state)}"></span><div class="tn-body">
+    <div class="tn-title"><a href="#db=${encodeURIComponent(db.sid)}" data-act="focus-dev" data-id="${esc(d.id)}">${esc(d.name)}</a>
+      <span class="meta">Entwickler-DB${d.port ? ", Port " + d.port : ""}, ${esc(d.state)}</span>${note ? `<span class="tag">${esc(note)}</span>` : ""}</div>
+    <div class="tn-acts">
+      ${stopped && d.container ? `<button class="quiet small" data-act="dev-start" data-id="${esc(d.id)}" ${d.busy ? "disabled" : ""}>Starten</button>` : ""}
+      ${d.container ? `<button class="quiet small" data-act="snap-new" data-id="${esc(d.id)}" ${d.busy ? "disabled" : ""}>Snapshot erstellen</button>` : ""}
+    </div>
+    ${snaps ? `<ul class="tree">${snaps}</ul>` : ""}</div></li>`;
+}
+
+function snapNode(db, T, d, n, depth) {
+  return `<li class="tn tn-snap"><span class="tmk tmk-snap" aria-hidden="true"></span><div class="tn-body">
+    <div class="tn-title"><strong>${esc(n.name)}</strong><time>${fmtTime(n.created)}</time>
+      <span class="meta">Snapshot</span><span class="tag">${n.consistent ? "sauber geschlossen" : "im Betrieb"}</span></div>
+    ${n.description ? `<p class="tn-desc">${esc(n.description)}</p>` : ""}
+    <div class="tn-acts">
+      <button class="quiet small" data-act="dev-new" data-source="${esc(n.source)}" data-suggest="${esc(suggestName(d.name, n.name))}">Als Entwickler-DB starten</button>
+      <button class="quiet small" data-act="release-new" data-source="${esc(n.source)}" data-label="${esc(n.name + " von " + d.name)}" ${db.release_busy ? "disabled" : ""}>Als Release übernehmen</button>
+    </div>
+    ${subtree(db, T, n.source, depth + 1)}</div></li>`;
+}
+
+function renderTimeline(db) {
+  if (!db.timeline.length) {
+    return `<div class="empty-state"><p>Noch keine Releases. Ein Release friert den aktuellen Stand der Master-DB ein; daraus entstehen Entwickler-DBs.</p>
+      <button class="primary" data-act="release-new">Erstes Release erstellen</button></div>`;
+  }
+  const T = treeIndex(db);
+  const rows = db.timeline.map(e => {
+    if (e.kind === "release") {
+      const gone = !e.exists;
+      if (!gone && T.nested.has(e.ref)) return "";   // hängt als Ast an seinem Ursprung
+      const r = db.releases.find(x => x.name === e.ref);
+      const derived = r && r.parent ? `<span class="tag" title="${esc(r.origin)}">Herkunft gelöscht</span>` : "";
+      return `<li class="tl tl-release ${gone ? "tl-gone" : ""}">
+        <div class="rail"><span class="mk ${gone ? "mk-gone" : "mk-release"}"></span></div>
+        <div class="body">
+          <div class="tl-head"><strong>${esc(e.ref)}</strong><time>${fmtTime(e.ts)}</time>
+            ${e.external ? '<span class="tag" title="Nicht über diese Oberfläche erstellt (z. B. golden.sh)">extern</span>' : ""}
+            ${gone ? '<span class="tag">gelöscht</span>' : derived}</div>
+          ${gone ? "" : `<p class="desc ${e.description ? "" : "empty"}">${e.description ? esc(e.description) : "Keine Beschreibung"}</p>
+          <div class="acts">${relActions(db, T, e.ref)}</div>
+          ${subtree(db, T, "release:" + e.ref, 0)}`}
+        </div></li>`;
+    }
+    if (e.kind === "note") {
+      return `<li class="tl tl-note"><div class="rail"><span class="mk mk-note"></span></div>
+        <div class="body"><div class="tl-head"><time>${fmtTime(e.ts, false)}</time></div>
+          <p class="note-text">${esc(e.text)}</p>
+          <div class="acts"><button class="quiet small" data-act="note-edit" data-id="${esc(e.id)}">Bearbeiten</button>
+            <button class="quiet small danger" data-act="note-del" data-id="${esc(e.id)}">Löschen</button></div></div></li>`;
+    }
+    if (!showEvents) return "";
+    return `<li class="tl tl-event"><div class="rail"><span class="mk ${e.kind === "release-deleted" ? "mk-gone" : "mk-event"}"></span></div>
+      <div class="body">${esc(e.text)} <time>${fmtTime(e.ts)}</time></div></li>`;
+  }).join("");
+  return `<ol class="timeline">${rows}</ol>`;
+}
+
+function renderDevs(db) {
+  if (!db.devdbs.length) {
+    return `<div class="empty-state"><p>Keine Entwickler-DBs für ${esc(db.sid)}.</p>
+      <p>${db.releases.length ? "Jede Entwickler-DB ist eine eigene Kopie eines Releases mit eigenem Port." : "Erstelle zuerst ein Release; daraus lassen sich Entwickler-DBs anlegen."}</p></div>`;
+  }
+  return `<ul class="devlist">${db.devdbs.map(d => {
+    const running = d.state === "bereit" || d.state === "startet" || d.state === "startet neu";
+    const working = d.busy;
+    const noCont = !d.container;
+    return `<li class="dev" id="dev-${esc(d.id)}">
+      <div class="dev-top"><h3>${esc(d.name)}</h3>${pill(working ? "Vorgang läuft" : d.state)}</div>
+      <div class="dev-meta">
+        ${d.owner ? `<span>Für ${esc(d.owner)}</span>` : ""}
+        <span>${d.base_label ? "aus " + esc(d.base_label) : "Ausgangsstand unbekannt"}</span>
+        ${d.port ? `<span>Port ${d.port}</span>` : ""}
+        ${d.created ? `<span>angelegt ${fmtTime(d.created, false)}</span>` : ""}
+      </div>
+      ${d.jdbc ? jdbcField(d.jdbc) : ""}
+      <div class="acts">
+        ${noCont ? "" : running
+          ? `<button class="quiet small" data-act="dev-stop" data-id="${esc(d.id)}" ${working ? "disabled" : ""}>Stoppen</button>`
+          : `<button class="quiet small" data-act="dev-start" data-id="${esc(d.id)}" ${working ? "disabled" : ""}>Starten</button>`}
+        ${noCont ? "" : `<button class="quiet small" data-act="snap-new" data-id="${esc(d.id)}" ${working ? "disabled" : ""}>Snapshot erstellen</button>`}
+        ${noCont ? "" : `<button class="quiet small" data-act="dev-reset" data-id="${esc(d.id)}" ${working || !d.base ? "disabled" : ""}>Auf Ausgangsstand zurücksetzen</button>`}
+        <button class="quiet small danger" data-act="dev-del" data-id="${esc(d.id)}" ${working ? "disabled" : ""}>Löschen</button>
+      </div>
+      ${renderDevSnaps(d, working)}</li>`;
+  }).join("")}</ul>`;
+}
+
+function renderDevSnaps(d, working) {
+  if (!d.snapshots || !d.snapshots.length) return "";
+  const items = d.snapshots.map(n => `<li class="snap-item">
+    <div class="snap-head"><strong>${esc(n.name)}</strong><time>${fmtTime(n.created)}</time>
+      <span class="tag" title="${n.consistent ? "Bei heruntergefahrener DB erstellt" : "Im laufenden Betrieb erstellt; Oracle stellt beim Start selbst wieder her"}">${n.consistent ? "sauber geschlossen" : "im Betrieb"}</span></div>
+    ${n.description ? `<p class="desc">${esc(n.description)}</p>` : ""}
+    <div class="acts">
+      ${d.container ? `<button class="quiet small" data-act="snap-restore" data-id="${esc(d.id)}" data-snap="${esc(n.name)}" ${working ? "disabled" : ""}>Darauf zurücksetzen</button>` : ""}
+      <button class="quiet small" data-act="dev-new" data-source="${esc(n.source)}">Neue Entwickler-DB daraus</button>
+      <button class="quiet small" data-act="release-new" data-source="${esc(n.source)}" data-label="${esc(n.name + " von " + d.name)}">Als Release übernehmen</button>
+      <button class="quiet small" data-act="snap-desc" data-id="${esc(d.id)}" data-snap="${esc(n.name)}">Beschreibung bearbeiten</button>
+      <button class="quiet small danger" data-act="snap-del" data-id="${esc(d.id)}" data-snap="${esc(n.name)}" ${working ? "disabled" : ""}>Löschen</button>
+    </div></li>`).join("");
+  return `<div class="snaps-title">Snapshots</div><ul class="snaps">${items}</ul>`;
+}
+
+function allSnapshots(db) {
+  return db.devdbs.flatMap(d => (d.snapshots || []).map(n => ({ ...n, devname: d.name })));
+}
+
+async function loadAdmin() {
+  try {
+    const [sch, sys] = await Promise.all([api("GET", "/api/schedules"), api("GET", "/api/admin")]);
+    admin = { ...sch, sys };
+    render();
+  } catch (e) { toast(e.message); }
+}
+
+const DAY_NAMES = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"];
+function timingText(sc) {
+  const days = daysText(sc.days);
+  const win = sc.window ? `, ${sc.window.start}–${sc.window.end} Uhr` : "";
+  const mm = n => String(n).padStart(2, "0");
+  if (!sc.freq || sc.freq === "daily") return `<b>${esc(sc.time)} Uhr</b>, ${days}`;
+  if (sc.freq === "hours") return `<b>${sc.every === 1 ? "stündlich" : `alle ${sc.every} Stunden`}</b> zur Minute ${mm(sc.minute)}${win}, ${days}`;
+  return `<b>${sc.every === 1 ? "jede Minute" : `alle ${sc.every} Minuten`}</b>${win}, ${days}`;
+}
+function daysText(days) {
+  if (days.length === 7) return "täglich";
+  if (days.join() === "0,1,2,3,4") return "werktags (Mo–Fr)";
+  if (days.join() === "5,6") return "am Wochenende";
+  return days.map(d => DAY_NAMES[d]).join(", ");
+}
+
+function renderAdmin() {
+  const main = $("#main");
+  if (!admin) { main.innerHTML = "<p>Lade Verwaltung …</p>"; return; }
+  const runKls = { "läuft": "warn", "fertig": "ok", "fehlgeschlagen": "err", "übersprungen": "err" };
+  const scheds = admin.schedules.map(sc => {
+    const lr = sc.last_run || {};
+    const devName = id => esc((id || "").split("-").slice(1).join("-"));
+    const target = sc.action === "devsnap" ? `${esc(sc.sid)} / ${devName(sc.dev)}`
+      : sc.action === "resetdevs" ? `${esc(sc.sid)} / ${(sc.devs || []).map(devName).join(", ")} ${esc(admin.reset_targets[sc.target] || "")}`
+      : esc(sc.sid);
+    return `<li class="sched ${sc.enabled ? "" : "off"}">
+      <div class="sched-top"><h3>${esc(sc.label)}</h3>${sc.enabled ? "" : '<span class="pill off">pausiert</span>'}</div>
+      <div class="sched-when">${timingText(sc)}</div>
+      <div class="sched-meta">
+        <span>${esc(sc.action_label)}: ${target}</span>
+        ${sc.template ? `<span>Name ${esc(sc.template)}</span>` : ""}
+        ${sc.action === "release" || sc.action === "devsnap" ? `<span>${sc.keep ? `behält die neuesten ${sc.keep}` : "behält alle"}</span>` : ""}
+        ${sc.action === "resetdevs" && sc.keep_stopped ? "<span>gestoppte bleiben gestoppt</span>" : ""}
+        ${sc.action === "devsnap" ? `<span>${sc.consistent ? "kurz heruntergefahren" : "im laufenden Betrieb"}</span>` : ""}
+      </div>
+      <div class="sched-meta">
+        <span>Nächster Lauf: ${sc.next_run ? fmtTime(sc.next_run) : "–"}</span>
+        ${lr.ts ? `<span>Letzter Lauf: ${fmtTime(lr.ts)} ${pillPlain(lr.status, runKls[lr.status])}</span>` : "<span>Noch nicht gelaufen</span>"}
+      </div>
+      ${lr.error ? `<div class="form-error">${esc(lr.error)}</div>` : ""}
+      <div class="acts">
+        <button class="quiet small" data-act="sched-run" data-id="${esc(sc.id)}">Jetzt ausführen</button>
+        <button class="quiet small" data-act="sched-toggle" data-id="${esc(sc.id)}">${sc.enabled ? "Pausieren" : "Aktivieren"}</button>
+        <button class="quiet small" data-act="sched-edit" data-id="${esc(sc.id)}">Bearbeiten</button>
+        <button class="quiet small danger" data-act="sched-del" data-id="${esc(sc.id)}">Löschen</button>
+      </div></li>`;
+  }).join("");
+  const sys = admin.sys, lo = sys.leftovers;
+  const nLeft = lo.builds.length + lo.containers.length;
+  main.innerHTML = `
+    <section class="dbhead"><h1>Verwaltung</h1>
+      <div class="facts"><span>Serverzeit ${fmtTime(admin.server_time)}</span></div>
+      <div class="actions"><button class="primary" data-act="sched-new" ${S.dbs.length ? "" : "disabled"}>Zeitplan anlegen</button></div></section>
+    <div class="admin-grid">
+      <section aria-labelledby="h-sched">
+        <div class="section-head"><h2 id="h-sched">Zeitpläne</h2><span class="hint">Zeiten in Serverzeit; war der Dienst zu einem Termin aus, wird nur der jüngste verpasste Termin desselben Tages nachgeholt</span></div>
+        ${scheds ? `<ul class="sched-list">${scheds}</ul>` : `<div class="empty-state"><p>Noch keine Zeitpläne.</p>
+          <p>Ein Zeitplan erstellt zum Beispiel jede Nacht ein Release der Master-DB, sichert täglich den Stand einer Entwickler-DB als Snapshot stoppt abends alle Entwickler-DBs, um Arbeitsspeicher freizugeben, oder setzt ausgewählte Entwickler-DBs jeden Morgen zurück. Mit „Aufbewahren“ werden ältere automatisch erstellte Stände gelöscht, sofern nichts mehr daran hängt.</p>
+          <button class="primary" data-act="sched-new" ${S.dbs.length ? "" : "disabled"}>Ersten Zeitplan anlegen</button></div>`}
+      </section>
+      <section aria-labelledby="h-sys">
+        <div class="section-head"><h2 id="h-sys">System</h2></div>
+        <dl class="facts-list">
+          <dt>Host</dt><dd>${esc(sys.host)}</dd>
+          <dt>Image</dt><dd>${esc(sys.image)}</dd>
+          <dt>Ablage</dt><dd>${esc(sys.base)}</dd>
+          <dt>Speicher</dt><dd>${fmtBytes(sys.disk.free)} frei von ${fmtBytes(sys.disk.total)}</dd>
+          <dt>Ports</dt><dd>${esc(sys.ports)} für Entwickler-DBs</dd>
+          <dt>Startwartezeit</dt><dd>${Math.round(sys.ready_timeout / 60)} Minuten</dd>
+          <dt>Release-SQL</dt><dd>${esc(sys.release_sql)}</dd>
+        </dl>
+        <div class="section-head" style="margin-top:26px"><h2>Aufräumen</h2></div>
+        ${nLeft ? `<p>Übrig gebliebene Zwischenstände abgebrochener Release-Vorgänge: ${lo.builds.length} Subvolume(s), ${lo.containers.length} Container.</p>
+          <button data-act="cleanup" ${lo.release_running ? 'disabled title="Gerade läuft ein Release-Vorgang"' : ""}>Zwischenstände entfernen</button>`
+          : `<p style="color:var(--muted)">Nichts aufzuräumen.</p>`}
+      </section>
+    </div>`;
+}
+function pillPlain(text, kls) { return `<span class="pill ${kls || "off"}"><span class="dot ${kls || ""}"></span>${esc(text)}</span>`; }
+
+function openSchedDialog(sc) {
+  openDialog("dlgSched", f => {
+    $(".js-title", f).textContent = sc ? "Zeitplan bearbeiten" : "Zeitplan anlegen";
+    $(".js-tz", f).textContent = "Alle Zeiten in Serverzeit, jetzt " + fmtTime(admin.server_time).split(", ")[1] + " Uhr";
+    f.action.innerHTML = Object.entries(admin.actions).map(([k, v]) => `<option value="${k}">${esc(v)}</option>`).join("");
+    f.sid.innerHTML = S.dbs.map(d => `<option>${esc(d.sid)}</option>`).join("");
+    f.freq.innerHTML = Object.entries(admin.freqs).map(([k, v]) => `<option value="${k}">${esc(v[0].toUpperCase() + v.slice(1))}</option>`).join("");
+    $(".js-days", f).innerHTML = DAY_NAMES.map((n, i) => `<label><input type="checkbox" name="day" value="${i}" checked>${n}</label>`).join("");
+    f.target.innerHTML = Object.entries(admin.reset_targets).map(([k, v]) => `<option value="${k}">${esc(v.replace(/^auf /, "Auf "))}</option>`).join("");
+    const fillDevs = () => {
+      const db = S.dbs.find(d => d.sid === f.sid.value);
+      const devs = (db ? db.devdbs : []).filter(d => d.container);
+      f.dev.innerHTML = devs.map(d => `<option value="${esc(d.id)}">${esc(d.name)}</option>`).join("") || '<option value="">keine Entwickler-DB vorhanden</option>';
+      const chosen = new Set(sc && sc.devs ? sc.devs : []);
+      $(".devpick", f).innerHTML = devs.map(d => `<label><input type="checkbox" name="devsel" value="${esc(d.id)}" ${chosen.has(d.id) ? "checked" : ""}>
+        ${esc(d.name)} <small>${d.base_label ? "aus " + esc(d.base_label) : ""}</small></label>`).join("") || "<small>Keine Entwickler-DB vorhanden.</small>";
+    };
+    const sync = () => {
+      const a = f.action.value;
+      $(".js-dev", f).hidden = a !== "devsnap";
+      $(".js-consistent", f).hidden = a !== "devsnap";
+      const fq = f.freq.value;
+      $(".js-f-daily", f).hidden = fq !== "daily";
+      $(".js-f-every", f).hidden = fq === "daily";
+      $(".js-f-minute", f).hidden = fq !== "hours";
+      $(".js-f-window", f).hidden = fq === "daily";
+      $(".js-window", f).hidden = !f.use_window.checked;
+      $(".js-every-label", f).textContent = fq === "hours" ? "Alle … Stunden" : "Alle … Minuten";
+      f.every.max = fq === "hours" ? 23 : 720;
+      f.time.required = fq === "daily";
+      $(".js-busy-hint", f).hidden = !(a === "release" && fq === "minutes" && +f.every.value < 60);
+      $(".js-naming", f).hidden = a === "stopdevs" || a === "resetdevs";
+      $(".js-devs", f).hidden = a !== "resetdevs";
+      $(".js-reset", f).hidden = a !== "resetdevs";
+      if (!sc && (!f.template.value || f.template.dataset.auto === "1")) {
+        const often = f.freq.value !== "daily";
+        f.template.value = (a === "devsnap" ? "auto-{datum}" : often ? "release-{datum}" : "nightly-{datum}") + (often ? "-{zeit}" : "");
+        f.template.dataset.auto = "1";
+      }
+    };
+    f.template.oninput = () => { f.template.dataset.auto = "0"; };
+    f.action.onchange = sync;
+    f.freq.onchange = () => {
+      f.every.value = f.freq.value === "hours" ? 1 : 15;
+      sync();
+    };
+    f.use_window.onchange = sync;
+    f.every.oninput = sync;
+    f.sid.onchange = fillDevs;
+    if (sc) {
+      f.id.value = sc.id; f.label.value = sc.label; f.action.value = sc.action; f.sid.value = sc.sid;
+      f.freq.value = sc.freq || "daily";
+      if (sc.time) f.time.value = sc.time;
+      if (sc.every) f.every.value = sc.every;
+      if (sc.minute != null) f.minute.value = sc.minute;
+      f.use_window.checked = !!sc.window;
+      if (sc.window) { f.window_from.value = sc.window.start; f.window_to.value = sc.window.end; }
+      f.template.value = sc.template || ""; f.keep.value = sc.keep ?? 7;
+      f.consistent.checked = !!sc.consistent; f.enabled.checked = !!sc.enabled;
+      if (sc.target) f.target.value = sc.target;
+      f.keep_stopped.checked = sc.keep_stopped !== false;
+      f.querySelectorAll('input[name=day]').forEach(cb => { cb.checked = sc.days.includes(+cb.value); });
+    } else {
+      Object.assign(f.action, { value: "release" });
+      f.freq.value = "daily"; f.time.value = "02:00"; f.every.value = 15; f.minute.value = 0;
+      f.use_window.checked = false; f.template.value = ""; f.template.dataset.auto = "1"; f.keep.value = 7;
+      f.consistent.checked = false; f.enabled.checked = true; f.keep_stopped.checked = true;
+      f.sid.value = (currentDb() || S.dbs[0]).sid;
+    }
+    fillDevs();
+    if (sc && sc.dev) f.dev.value = sc.dev;
+    sync();
+  }, async v => {
+    const f = $("#fSched");
+    const body = {
+      label: v.label, action: v.action, sid: v.sid, dev: v.dev, time: v.time,
+      freq: v.freq, every: +v.every, minute: +v.minute,
+      window_from: v.use_window ? v.window_from : "", window_to: v.use_window ? v.window_to : "",
+      days: [...f.querySelectorAll('input[name=day]:checked')].map(cb => +cb.value),
+      template: v.template, keep: +v.keep || 0, consistent: !!v.consistent, enabled: !!v.enabled,
+      devs: [...f.querySelectorAll('input[name=devsel]:checked')].map(cb => cb.value),
+      target: v.target, keep_stopped: !!v.keep_stopped,
+    };
+    if (sc) await api("PUT", `/api/schedules/${encodeURIComponent(sc.id)}`, body);
+    else await api("POST", "/api/schedules", body);
+    toast("Zeitplan gespeichert");
+    await loadAdmin();
+  });
+}
+
+async function loadSnapshots() {
+  try { snapRows = await api("GET", "/api/snapshots"); render(); }
+  catch (e) { toast(e.message); }
+}
+
+function renderSnapshots() {
+  const main = $("#main");
+  if (!snapRows) { main.innerHTML = "<p>Lade Snapshots …</p>"; return; }
+  const kinds = ["Master-DB", "Release", "Entwickler-DB", "Entwickler-Snapshot", "Zwischenstand"];
+  const rows = [...snapRows].sort((a, b) => kinds.indexOf(a.kind) - kinds.indexOf(b.kind) || a.sid.localeCompare(b.sid) || (b.created || "").localeCompare(a.created || ""));
+  main.innerHTML = `
+    <section class="dbhead"><h1>Alle Snapshots</h1>
+      <div class="facts"><span>${rows.length} Subvolumes unter /srv/oradb</span></div>
+      <div class="actions"><button data-act="snap-reload">Neu laden</button></div></section>
+    <p class="hint" style="color:var(--muted);max-width:70ch">„Exklusiv“ ist der Platz, der frei würde, wenn das Subvolume gelöscht wird. Die Ermittlung liest die Blockzuordnung und kann bei großen Datenbanken eine Weile dauern.</p>
+    <div class="table-wrap"><table class="snap">
+      <thead><tr><th>Art</th><th>Datenbank</th><th>Name</th><th>Erstellt</th><th>Schreibschutz</th><th>Container</th><th class="num">Exklusiv</th><th>Pfad</th></tr></thead>
+      <tbody>${rows.map(r => `<tr>
+        <td>${esc(r.kind)}</td><td>${esc(r.sid)}</td><td>${esc(r.label)}</td><td>${fmtTime(r.created)}</td>
+        <td>${r.readonly ? "ja" : "nein"}</td><td>${esc(r.container || "–")}</td>
+        <td class="num" data-usage="${esc(r.path)}">${r.usage ? fmtBytes(r.usage.exclusive) : `<button class="quiet small" data-act="usage" data-path="${esc(r.path)}">ermitteln</button>`}</td>
+        <td class="path">${esc(r.path)}</td></tr>`).join("")}</tbody>
+    </table></div>
+    ${rows.some(r => r.kind === "Zwischenstand") ? `<p style="color:var(--muted)">Zwischenstände bleiben nur zurück, wenn ein Release-Vorgang hart abgebrochen wurde. Löschen mit <code>btrfs subvolume delete &lt;Pfad&gt;</code>, sobald kein Vorgang mehr läuft.</p>` : ""}`;
+}
+
+function renderJobs() {
+  const box = $("#jobs");
+  const jobs = S.jobs.slice(0, 8);
+  const running = jobs.some(j => j.status === "läuft");
+  if (running) jobsHidden = false;
+  box.hidden = !jobs.length || jobsHidden;
+  const kls = { "läuft": "warn", "fertig": "ok", "fehlgeschlagen": "err" };
+  $("#jobList").innerHTML = jobs.map(j => `<li class="job">
+    <button data-act="job-toggle" data-id="${j.id}" aria-expanded="${openJobs.has(j.id)}">
+      <span>${esc(j.title)}</span><span class="pill ${kls[j.status]}"><span class="dot ${kls[j.status]}"></span>${esc(j.status)}</span>
+      <span class="when">${fmtTime(j.started)}${j.ended ? " bis " + new Date(j.ended).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" }) : ""}</span>
+    </button>
+    ${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}
+    ${openJobs.has(j.id) ? `<pre id="log-${j.id}">${esc((jobLogs[j.id] || []).join("\n")) || "…"}</pre>` : ""}
+  </li>`).join("");
+  for (const id of openJobs) {
+    const pre = $("#log-" + id);
+    if (pre) pre.scrollTop = pre.scrollHeight;
+  }
+}
+const jobLogs = {};
+async function loadJobLogs() {
+  for (const id of openJobs) {
+    try { jobLogs[id] = (await api("GET", "/api/jobs/" + id)).log; } catch { openJobs.delete(id); }
+  }
+}
+
+/* ------------------------------------------------------------ Dialoge */
+function openDialog(id, setup, submit) {
+  const dlg = $("#" + id), form = dlg.querySelector("form"), err = form.querySelector(".form-error");
+  form.reset(); err.textContent = "";
+  // reset() lässt versteckte Felder stehen – sonst würde z. B. die ID des zuletzt bearbeiteten Eintrags übernommen
+  form.querySelectorAll('input[type="hidden"]').forEach(i => { i.value = ""; });
+  setup && setup(form, dlg);
+  form.onsubmit = async ev => {
+    if (ev.submitter && ev.submitter.value === "cancel") return;
+    ev.preventDefault();
+    const btn = ev.submitter; btn.disabled = true; err.textContent = "";
+    try {
+      await submit(Object.fromEntries(new FormData(form)));
+      dlg.close(); await refresh();
+    } catch (e) { err.textContent = e.message; }
+    finally { btn.disabled = false; }
+  };
+  dlg.showModal();
+}
+
+function startedJob(res) {
+  if (res && res.job) { openJobs.add(res.job.id); jobsHidden = false; toast("Gestartet: " + res.job.title); }
+}
+
+document.addEventListener("click", async ev => {
+  const b = ev.target.closest("[data-act]");
+  if (!b) return;
+  const db = currentDb();
+  const act = b.dataset.act;
+  try {
+    switch (act) {
+      case "sched-new":
+        if (!admin) await loadAdmin();
+        openSchedDialog(null);
+        break;
+      case "sched-edit":
+        openSchedDialog(admin.schedules.find(x => x.id === b.dataset.id));
+        break;
+      case "sched-toggle": {
+        const sc = admin.schedules.find(x => x.id === b.dataset.id);
+        await api("PUT", `/api/schedules/${encodeURIComponent(sc.id)}`, { ...sc, enabled: !sc.enabled });
+        toast(sc.enabled ? "Zeitplan pausiert" : "Zeitplan aktiviert"); await loadAdmin();
+        break;
+      }
+      case "sched-run":
+        startedJob(await api("POST", `/api/schedules/${encodeURIComponent(b.dataset.id)}/run`));
+        await loadAdmin(); await refresh();
+        break;
+      case "sched-del": {
+        const sc = admin.schedules.find(x => x.id === b.dataset.id);
+        if (!confirm(`Zeitplan „${sc.label}“ löschen?\n\nBereits erstellte Releases und Snapshots bleiben erhalten.`)) return;
+        await api("DELETE", `/api/schedules/${encodeURIComponent(sc.id)}`);
+        toast("Zeitplan gelöscht"); await loadAdmin();
+        break;
+      }
+      case "cleanup": {
+        if (!confirm("Übrig gebliebene Zwischenstände und Build-Container entfernen?")) return;
+        const r = await api("POST", "/api/admin/cleanup");
+        toast(`${r.removed} Element(e) entfernt`); await loadAdmin();
+        break;
+      }
+      case "toggle-events":
+        showEvents = b.checked;
+        try { localStorage.setItem("oradb.showEvents", showEvents ? "1" : "0"); } catch {}
+        render();
+        break;
+      case "copy": {
+        const inp = b.parentElement.querySelector("input");
+        inp.select();
+        let ok = false;
+        try { await navigator.clipboard.writeText(b.dataset.text); ok = true; } catch { ok = document.execCommand && document.execCommand("copy"); }
+        toast(ok ? "JDBC-URL kopiert" : "Markiert – mit Strg+C kopieren");
+        break;
+      }
+      case "release-new":
+        openDialog("dlgRelease", f => {
+          f.source.value = b.dataset.source || "";
+          const src = b.dataset.source || "";
+          $(".js-lead", f).innerHTML = src.startsWith("release:")
+            ? `Leitet ein neues Release von <b>${esc(b.dataset.label)}</b> ab – wie ein Branch in Git. Es erscheint im Baum als Ast unter seinem Ursprung und ist sofort fertig.`
+            : src
+            ? `Übernimmt den Snapshot <b>${esc(b.dataset.label)}</b> als Release von ${esc(db.sid)}. Die Entwickler-DB läuft dabei weiter; der Vorgang dauert einige Minuten.`
+            : `Friert den aktuellen Stand der Master-DB <b>${esc(db.sid)}</b> ein. Die Master-DB läuft dabei weiter; der Vorgang dauert einige Minuten.`;
+        }, async v => {
+          if (!v.source) delete v.source;
+          startedJob(await api("POST", `/api/db/${encodeURIComponent(db.sid)}/releases`, v));
+        });
+        break;
+      case "dev-new":
+        openDialog("dlgDev", f => {
+          $(".js-sid", f).textContent = db.sid;
+          const rel = db.releases.map(r => `<option value="release:${esc(r.name)}">${esc(r.name)} (${fmtTime(r.created, false)})</option>`).join("");
+          const snaps = allSnapshots(db).map(n => `<option value="${esc(n.source)}">${esc(n.name)} von ${esc(n.devname)} (${fmtTime(n.created, false)})</option>`).join("");
+          f.source.innerHTML = (rel ? `<optgroup label="Releases">${rel}</optgroup>` : "") + (snaps ? `<optgroup label="Snapshots von Entwickler-DBs">${snaps}</optgroup>` : "");
+          if (b.dataset.release) f.source.value = "release:" + b.dataset.release;
+          if (b.dataset.source) f.source.value = b.dataset.source;
+          if (b.dataset.suggest && !db.devdbs.some(x => x.name === b.dataset.suggest)) f.name.value = b.dataset.suggest;
+        }, async v => startedJob(await api("POST", `/api/db/${encodeURIComponent(db.sid)}/devdbs`, v)));
+        break;
+      case "desc-edit": {
+        const rel = db.releases.find(r => r.name === b.dataset.name);
+        openDialog("dlgDesc", f => { $(".js-name", f).textContent = rel.name; f.name.value = rel.name; f.description.value = rel.description || ""; },
+          async v => { await api("PATCH", `/api/db/${encodeURIComponent(db.sid)}/releases/${encodeURIComponent(v.name)}`, { description: v.description }); toast("Beschreibung gespeichert"); });
+        break;
+      }
+      case "release-del": {
+        const nd = +b.dataset.devs, nr = +b.dataset.releases;
+        const deps = [nd ? `${nd} Entwickler-DB(s)` : "", nr ? `${nr} abgeleitete(s) Release(s)` : ""].filter(Boolean).join(" und ");
+        const msg = `Release „${b.dataset.name}“ löschen?` + (deps ? `\n\nDaran hängen ${deps}. Sie behalten ihre Daten; Entwickler-DBs lassen sich danach aber nicht mehr auf dieses Release zurücksetzen.` : "");
+        if (!confirm(msg)) return;
+        await api("DELETE", `/api/db/${encodeURIComponent(db.sid)}/releases/${encodeURIComponent(b.dataset.name)}`);
+        toast("Release gelöscht"); await refresh();
+        break;
+      }
+      case "note-add":
+        openDialog("dlgNote", f => { $(".js-title", f).textContent = "Notiz hinzufügen"; $(".js-date", f).hidden = false; f.date.value = new Date().toISOString().slice(0, 10); },
+          async v => { await api("POST", `/api/db/${encodeURIComponent(db.sid)}/notes`, { text: v.text, date: v.date }); toast("Notiz gespeichert"); });
+        break;
+      case "note-edit": {
+        const note = db.timeline.find(e => e.id === b.dataset.id);
+        openDialog("dlgNote", f => { $(".js-title", f).textContent = "Notiz bearbeiten"; $(".js-date", f).hidden = true; f.id.value = note.id; f.text.value = note.text; },
+          async v => { await api("PATCH", `/api/db/${encodeURIComponent(db.sid)}/notes/${encodeURIComponent(v.id)}`, { text: v.text }); toast("Notiz gespeichert"); });
+        break;
+      }
+      case "note-del":
+        if (!confirm("Notiz löschen?")) return;
+        await api("DELETE", `/api/db/${encodeURIComponent(db.sid)}/notes/${encodeURIComponent(b.dataset.id)}`);
+        toast("Notiz gelöscht"); await refresh();
+        break;
+      case "dev-start": case "dev-stop":
+        startedJob(await api("POST", `/api/devdbs/${encodeURIComponent(b.dataset.id)}/${act.slice(4)}`)); await refresh();
+        break;
+      case "dev-reset": {
+        const d = db.devdbs.find(x => x.id === b.dataset.id);
+        if (!confirm(`„${d.name}“ auf den Ausgangsstand (${d.base_label}) zurücksetzen?\n\nAlle Änderungen in dieser Entwickler-DB gehen verloren. Ihre Snapshots bleiben erhalten.`)) return;
+        startedJob(await api("POST", `/api/devdbs/${encodeURIComponent(b.dataset.id)}/reset`)); await refresh();
+        break;
+      }
+      case "snap-new": {
+        const d = db.devdbs.find(x => x.id === b.dataset.id);
+        openDialog("dlgSnap", f => { $(".js-name", f).textContent = d.name; },
+          async v => startedJob(await api("POST", `/api/devdbs/${encodeURIComponent(d.id)}/snapshots`,
+            { name: v.name, description: v.description, consistent: !!v.consistent })));
+        break;
+      }
+      case "snap-restore":
+        if (!confirm(`Entwickler-DB auf Snapshot „${b.dataset.snap}“ zurücksetzen?\n\nÄnderungen seit diesem Snapshot gehen verloren.`)) return;
+        startedJob(await api("POST", `/api/devdbs/${encodeURIComponent(b.dataset.id)}/snapshots/${encodeURIComponent(b.dataset.snap)}/restore`)); await refresh();
+        break;
+      case "snap-desc": {
+        const d = db.devdbs.find(x => x.id === b.dataset.id);
+        const n = d.snapshots.find(x => x.name === b.dataset.snap);
+        openDialog("dlgDesc", f => { $(".js-name", f).textContent = n.name; f.name.value = n.name; f.description.value = n.description || ""; },
+          async v => { await api("PATCH", `/api/devdbs/${encodeURIComponent(d.id)}/snapshots/${encodeURIComponent(n.name)}`, { description: v.description }); toast("Beschreibung gespeichert"); });
+        break;
+      }
+      case "snap-del": {
+        const used = db.devdbs.filter(x => x.base === `snap:${b.dataset.id}/${b.dataset.snap}`).map(x => x.name);
+        const msg = `Snapshot „${b.dataset.snap}“ löschen?` + (used.length ? `\n\nDaraus angelegt: ${used.join(", ")}. Diese DBs behalten ihre Daten, lassen sich danach aber nicht mehr auf ihren Ausgangsstand zurücksetzen.` : "");
+        if (!confirm(msg)) return;
+        await api("DELETE", `/api/devdbs/${encodeURIComponent(b.dataset.id)}/snapshots/${encodeURIComponent(b.dataset.snap)}`);
+        toast("Snapshot gelöscht"); await refresh();
+        break;
+      }
+      case "dev-del": {
+        const d = db.devdbs.find(x => x.id === b.dataset.id);
+        const n = (d.snapshots || []).length;
+        if (!confirm(`Entwickler-DB „${d.name}“ löschen?\n\nContainer, Daten und Data-Pump-Verzeichnis werden entfernt` + (n ? `, ebenso ihre ${n} Snapshot(s). Einen Snapshot, der bleiben soll, vorher als Release übernehmen.` : "."))) return;
+        startedJob(await api("DELETE", `/api/devdbs/${encodeURIComponent(b.dataset.id)}`)); await refresh();
+        break;
+      }
+      case "focus-dev": {
+        ev.preventDefault();
+        const el = document.getElementById("dev-" + b.dataset.id);
+        if (el) { el.scrollIntoView({ block: "center" }); history.replaceState(null, "", location.hash); el.setAttribute("tabindex", "-1"); el.focus(); }
+        break;
+      }
+      case "job-toggle":
+        openJobs.has(b.dataset.id) ? openJobs.delete(b.dataset.id) : openJobs.add(b.dataset.id);
+        await loadJobLogs(); renderJobs();
+        break;
+      case "usage": {
+        b.disabled = true; b.textContent = "läuft …";
+        const u = await api("GET", "/api/usage?path=" + encodeURIComponent(b.dataset.path));
+        const row = snapRows.find(r => r.path === b.dataset.path); if (row) row.usage = u;
+        render();
+        break;
+      }
+      case "snap-reload":
+        snapRows = null; render(); await loadSnapshots();
+        break;
+    }
+  } catch (e) { toast(e.message); }
+});
+$("#jobsHide").addEventListener("click", () => { jobsHidden = true; renderJobs(); });
+
+/* ------------------------------------------------------------ Start */
+parseHash();
+if (view.kind === "snapshots") loadSnapshots();
+if (view.kind === "admin") loadAdmin();
+refresh();
+setInterval(async () => {
+  if (document.hidden) return;
+  if (openJobs.size) await loadJobLogs();
+  if (!document.querySelector("dialog[open]")) {
+    if (view.kind === "admin") await loadAdmin();
+    await refresh();
+  }
+}, 5000);
+</script>
+</body>
+</html>

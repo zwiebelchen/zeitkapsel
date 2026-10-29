@@ -1,0 +1,15 @@
+[Unit]
+Description=oradb-ui – Weboberfläche für Oracle-Master-DBs, Releases und Entwickler-DBs
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/oradb-ui.env
+ExecStart=/opt/oradb-ui/venv/bin/python /opt/oradb-ui/app.py
+Restart=on-failure
+RestartSec=5
+# läuft als root: braucht btrfs-Snapshots und Docker
+
+[Install]
+WantedBy=multi-user.target
