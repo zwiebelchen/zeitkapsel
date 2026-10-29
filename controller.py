@@ -201,7 +201,8 @@ def agent_call(host: dict, method: str, path: str, body=None, user: str = "", qu
 
 
 # --------------------------------------------------------------------------- Rechte
-USER_GET = (r"state", r"jobs/[^/]+", r"snapshots", r"usage", r"devdbs/[^/]+")
+USER_GET = (r"state", r"jobs", r"jobs/[^/]+", r"snapshots", r"usage", r"devdbs/[^/]+",
+            r"containers", r"containers/[^/]+")
 OWNER_ACTIONS = (
     ("POST", r"devdbs/([^/]+)/(start|stop|reset)"),
     ("DELETE", r"devdbs/([^/]+)"),
@@ -223,6 +224,22 @@ def authorize(host: dict, method: str, path: str, body):
     if method == "POST" and re.fullmatch(r"db/[^/]+/devdbs", path):
         body = dict(body or {})
         body["owner"] = g.user               # Benutzer legen immer für sich selbst an
+        return body
+    hit = re.fullmatch(r"jobs/([^/]+)/cancel", path)
+    if method == "POST" and hit:
+        status, job = agent_call(host, "GET", f"jobs/{hit.group(1)}", user=g.user)
+        if status != 200:
+            raise BadRequest(job.get("error", "Vorgang nicht gefunden."))
+        if job.get("actor") != g.user:
+            raise Denied("Nur eigene Vorgänge lassen sich abbrechen.")
+        return body
+    hit = re.fullmatch(r"containers/([^/]+)/(stop|kill)", path)
+    if method == "POST" and hit:
+        status, row = agent_call(host, "GET", f"containers/{hit.group(1)}", user=g.user)
+        if status != 200:
+            raise BadRequest(row.get("error", "Container nicht gefunden."))
+        if row.get("kind") != "Entwickler-DB" or row.get("owner") != g.user:
+            raise Denied("Nur Container der eigenen Entwickler-DBs.")
         return body
     for m, pattern in OWNER_ACTIONS:
         hit = re.fullmatch(pattern, path)

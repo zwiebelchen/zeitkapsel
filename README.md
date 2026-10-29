@@ -115,6 +115,17 @@ Jedes DB-Subvolume enthält die Markierungsdateien, ohne die das Startskript des
 
 Weil die Datei im Subvolume liegt, wandert sie mit jedem Release und jeder Entwickler-DB mit; Oberfläche und Skripte setzen die Angaben bei jedem `docker run` um.
 
+## Vorgänge und Container
+
+Lange Aktionen laufen als Vorgänge auf dem Agenten des Hosts. Das Fenster „Vorgänge“ unten rechts zeigt die letzten; es lässt sich jederzeit ausblenden, auch während etwas läuft – dann bleibt ein kleiner Knopf mit der Zahl der laufenden Vorgänge, der es wieder öffnet.
+
+Die Seite „Vorgänge und Container“ je Host zeigt:
+
+- alle Container von zeitkapsel (Master- und Entwickler-DBs, Hilfscontainer für Release-Erstellung, Neuanlage und Prüfstart) mit Status, Laufzeit, Port und Besitzer. „Stoppen“ fährt sauber herunter, „Abschießen“ beendet sofort (`docker kill`; die DB führt beim nächsten Start eine Instance Recovery aus, die Neustart-Regel wird dabei ausgesetzt und beim nächsten „Master starten“ wiederhergestellt), „Entfernen“ räumt übrig gebliebene Hilfscontainer weg. Container, die nichts mit zeitkapsel zu tun haben, erscheinen nicht;
+- die letzten 300 Vorgänge mit Status, Benutzer, Dauer und vollständigem Protokoll, filterbar nach laufend, fehlgeschlagen/abgebrochen und eigenen. Die Historie liegt in `/srv/oradb/meta/jobs/` (`<id>.json` und `<id>.log`, `ZK_JOBS_KEEP` Einträge, Standard 500) und bleibt über Neustarts erhalten; Vorgänge, die bei einem Neustart des Dienstes liefen, stehen danach als „unterbrochen“ darin.
+
+„Abbrechen“ beendet den laufenden Befehl des Vorgangs und entfernt sofort Hilfscontainer (dbca-Anlage, Prüfstart, Release-Zwischen-DB) bzw. beendet den Data-Pump-Job über `DBMS_DATAPUMP`; danach räumt der Vorgang wie bei einem Fehler auf (halbfertige Subvolumes werden gelöscht, eine für den Import heruntergefahrene Quelle wieder gestartet). Benutzer können eigene Vorgänge abbrechen und die Container ihrer eigenen Entwickler-DBs stoppen oder abschießen, Administratoren alles.
+
 ## Alle Snapshots: Platz, Löschen, Übernehmen
 
 Die Seite „Alle Snapshots“ listet jedes Subvolume eines Hosts. Der Platz wird im Hintergrund ermittelt und eine Viertelstunde zwischengespeichert (`ZK_USAGE_MAX_AGE`, Sekunden): „Exklusiv“ (`btrfs filesystem du`, ohne Kompression gezählt) ist der Platz, der beim Löschen frei würde; „Auf Platte“ (`compsize`, wenn installiert) der tatsächlich belegte Platz nach Kompression.

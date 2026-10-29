@@ -330,52 +330,137 @@ def next_port(cs: list[dict]) -> int:
 
 
 # --------------------------------------------------------------------------- Jobs
+class JobCancelled(Exception):
+    """Vorgang wurde abgebrochen."""
+
+
+JOBS_DIR = META / "jobs"        # Historie: <id>.json (Kopfdaten) und <id>.log (vollständiges Protokoll)
+JOBS_KEEP = int(env("JOBS_KEEP", "500"))
+
+
 class Job:
     def __init__(self, title: str, sid: str | None):
-        self.id = uuid.uuid4().hex[:10]
+        self.id = time.strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:6]
         self.title, self.sid = title, sid
         self.status, self.error = "läuft", None
         self.started, self.ended = now_iso(), None
         self.lines: list[str] = []
         self.actor = actor()
+        self.cancel_requested = False
+        self.cancelled_by = ""
+        self.proc: subprocess.Popen | None = None
+        self.cleanups: list = []              # bei Abbruch sofort auszuführen (z. B. Container entfernen)
+        self._lock = threading.Lock()
+        JOBS_DIR.mkdir(parents=True, exist_ok=True)
+        self.save()
 
+    # --- Protokoll und Historie
     def log(self, msg: str) -> None:
-        self.lines.append(f"{time.strftime('%H:%M:%S')}  {msg}")
+        line = f"{time.strftime('%H:%M:%S')}  {msg}"
+        self.lines.append(line)
         del self.lines[:-500]
+        try:
+            with (JOBS_DIR / f"{self.id}.log").open("a") as fh:
+                fh.write(line + "\n")
+        except OSError:
+            pass
+
+    def save(self) -> None:
+        try:
+            write_json(JOBS_DIR / f"{self.id}.json", self.as_dict())
+        except OSError:
+            pass
+
+    # --- Abbrechen
+    def check(self) -> None:
+        if self.cancel_requested:
+            raise JobCancelled("abgebrochen" + (f" von {self.cancelled_by}" if self.cancelled_by else ""))
+
+    def on_cancel(self, fn) -> None:
+        """Aufräumaktion, die beim Abbrechen sofort läuft (der Vorgang selbst räumt danach weiter auf)."""
+        self.cleanups.append(fn)
+
+    def cancel(self, by: str) -> None:
+        with self._lock:
+            if self.status != "läuft" or self.cancel_requested:
+                return
+            self.cancel_requested, self.cancelled_by = True, by
+        self.log(f"Abbruch angefordert von {by or 'unbekannt'}")
+        proc = self.proc
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        for fn in reversed(self.cleanups):
+            try:
+                fn()
+            except Exception as e:  # noqa: BLE001
+                self.log(f"Aufräumen beim Abbruch: {e}")
+
+    # --- Befehle
+    def _popen(self, cmd: list[str], input: str | None, merge: bool) -> subprocess.Popen:
+        self.check()
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge else subprocess.PIPE,
+                             text=True, bufsize=1)
+        self.proc = p
+        return p
 
     def run(self, cmd: list[str], secret: str | None = None, quiet: bool = False, allow_fail: bool = False,
-            **kw) -> subprocess.CompletedProcess:
+            input: str | None = None, timeout: int | None = None) -> subprocess.CompletedProcess:
         mask = (lambda t: t.replace(secret, "***")) if secret else (lambda t: t)
         self.log("$ " + mask(" ".join(cmd)))
-        p = sh(cmd, check=False, **kw)
-        lines = (p.stdout + p.stderr).strip().splitlines()
+        p = self._popen(cmd, input, merge=False)
+        try:
+            out, err = p.communicate(input=input, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            out, err = p.communicate()
+            raise RuntimeError(f"„{' '.join(cmd[:3])} …“: Zeitüberschreitung nach {timeout} s.") from None
+        finally:
+            self.proc = None
+        self.check()
+        lines = ((out or "") + (err or "")).strip().splitlines()
         for line in (lines[-30:] if not quiet or p.returncode else []):
             self.log("  " + mask(line))
         if p.returncode != 0 and not allow_fail:
             raise RuntimeError(f"„{' '.join(cmd[:3])} …“ ist mit Exit-Code {p.returncode} fehlgeschlagen.")
-        return p
+        return subprocess.CompletedProcess(cmd, p.returncode, out or "", err or "")
 
     def stream(self, cmd: list[str], input: str | None = None, secret: str | None = None) -> tuple[int, list[str]]:
         """Befehl ausführen und jede Ausgabezeile sofort protokollieren (für lange Vorgänge wie impdp)."""
         mask = (lambda t: t.replace(secret, "***")) if secret else (lambda t: t)
         self.log("$ " + mask(" ".join(cmd)))
-        p = subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        p = self._popen(cmd, input, merge=True)
         if input is not None:
             p.stdin.write(input)
             p.stdin.close()
         seen: list[str] = []
-        for line in p.stdout:
-            line = mask(line.rstrip())
-            if line:
-                self.log("  " + line)
-                if "ORA-" in line:
-                    seen.append(line)
-        return p.wait(), seen
+        try:
+            for line in p.stdout:
+                line = mask(line.rstrip())
+                if line:
+                    self.log("  " + line)
+                    if "ORA-" in line:
+                        seen.append(line)
+            rc = p.wait()
+        finally:
+            self.proc = None
+        self.check()
+        return rc, seen
+
+    def sleep(self, seconds: float) -> None:
+        end = time.time() + seconds
+        while time.time() < end:
+            self.check()
+            time.sleep(min(1.0, end - time.time()) if end > time.time() else 0)
 
     def as_dict(self, with_log: bool = False) -> dict:
-        d = dict(id=self.id, title=self.title, sid=self.sid, status=self.status,
-                 error=self.error, started=self.started, ended=self.ended, actor=self.actor)
+        d = dict(id=self.id, title=self.title, sid=self.sid, status=self.status, error=self.error,
+                 started=self.started, ended=self.ended, actor=self.actor,
+                 cancel_requested=self.cancel_requested, cancelled_by=self.cancelled_by)
         if with_log:
             d["log"] = self.lines
         return d
@@ -403,18 +488,70 @@ def start_job(title: str, sid: str | None, busy_key: str, fn, *args) -> Job:
         _ctx.actor = job.actor
         try:
             fn(job, *args)
+            job.check()
             job.status = "fertig"
             job.log("Fertig.")
         except Exception as e:  # noqa: BLE001 – jeder Fehler landet im Job-Protokoll
-            job.status, job.error = "fehlgeschlagen", str(e)
-            job.log("FEHLER: " + str(e))
+            if job.cancel_requested:
+                job.status, job.error = "abgebrochen", f"abgebrochen von {job.cancelled_by}" if job.cancelled_by else "abgebrochen"
+                job.log("ABGEBROCHEN" + ("" if isinstance(e, JobCancelled) else f" ({e})"))
+            else:
+                job.status, job.error = "fehlgeschlagen", str(e)
+                job.log("FEHLER: " + str(e))
         finally:
             job.ended = now_iso()
+            job.save()
             with _lock:
                 _busy.discard(busy_key)
 
     threading.Thread(target=worker, daemon=True).start()
     return job
+
+
+def job_history(limit: int = 300) -> list[dict]:
+    """Kopfdaten aller Vorgänge, neueste zuerst; laufende aus dem Speicher (aktueller Stand)."""
+    out: dict[str, dict] = {}
+    try:
+        files = sorted(JOBS_DIR.glob("*.json"), reverse=True)[:limit]
+    except OSError:
+        files = []
+    for f in files:
+        try:
+            d = json.loads(f.read_text())
+            out[d["id"]] = d
+        except (OSError, ValueError, KeyError):
+            continue
+    with _lock:
+        for j in JOBS.values():
+            out[j.id] = j.as_dict()
+    return sorted(out.values(), key=lambda d: d.get("started") or "", reverse=True)[:limit]
+
+
+def job_log(jid: str, max_lines: int = 5000) -> list[str]:
+    f = JOBS_DIR / f"{jid}.log"
+    try:
+        lines = f.read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    return lines[-max_lines:]
+
+
+def jobs_housekeeping() -> None:
+    """Beim Start: Vorgänge, die bei einem Neustart liefen, als unterbrochen markieren; alte entfernen."""
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    files = sorted(JOBS_DIR.glob("*.json"))
+    for f in files:
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if d.get("status") == "läuft":
+            d.update(status="unterbrochen", error="Dienst wurde neu gestartet, während der Vorgang lief.",
+                     ended=d.get("ended") or now_iso())
+            write_json(f, d)
+    for f in files[:-JOBS_KEEP] if len(files) > JOBS_KEEP else []:
+        f.unlink(missing_ok=True)
+        f.with_suffix(".log").unlink(missing_ok=True)
 
 
 def wait_ready(job: Job, cname: str, since: float, timeout: int | None = None) -> None:
@@ -432,7 +569,7 @@ def wait_ready(job: Job, cname: str, since: float, timeout: int | None = None) -
         running = sh(["docker", "inspect", "-f", "{{.State.Running}}", cname], check=False).stdout.strip()
         if running != "true":
             raise RuntimeError(f"Container {cname} läuft nicht mehr, siehe „docker logs {cname}“.")
-        time.sleep(5)
+        job.sleep(5)
     raise RuntimeError("Zeitüberschreitung beim Warten auf die Datenbank.")
 
 
@@ -659,6 +796,7 @@ def job_release(job: Job, sid: str, name: str, description: str,
     try:
         check_volume(tmp, sid)
         t0 = time.time()
+        job.on_cancel(lambda: sh(["docker", "rm", "-f", bname], check=False))
         job.run(["docker", "run", "-d", "--name", bname, "--init", "-e", f"ORACLE_SID={sid}",
                  "-v", f"{tmp}:/opt/oracle/oradata", *docker_extra(tmp), IMAGE])
         wait_ready(job, bname, t0)
@@ -1229,12 +1367,127 @@ def api_state():
                    dbs=dbs, jobs=jobs, busy=sorted(k for k in _busy if k.startswith(("newdb:", "import:"))))
 
 
+RE_JOBID = re.compile(r"^[0-9a-f-]{6,40}$")
+
+
+def job_info(jid: str) -> dict:
+    if not RE_JOBID.match(jid or ""):
+        raise UserError("Vorgang nicht gefunden.")
+    job = JOBS.get(jid)
+    if job:
+        return job.as_dict()
+    try:
+        return json.loads((JOBS_DIR / f"{jid}.json").read_text())
+    except (OSError, ValueError):
+        raise UserError("Vorgang nicht gefunden.") from None
+
+
+@bp.get("/api/jobs")
+def api_jobs():
+    limit = max(1, min(int(request.args.get("limit") or 300), 1000))
+    return jsonify(jobs=job_history(limit))
+
+
 @bp.get("/api/jobs/<jid>")
 def api_job(jid):
+    d = job_info(jid)
+    full = request.args.get("full") == "1"
     job = JOBS.get(jid)
-    if not job:
-        raise UserError("Vorgang nicht gefunden.")
-    return jsonify(job.as_dict(with_log=True))
+    d["log"] = job_log(jid) if (full or not job) else job.lines
+    if not d["log"] and job:
+        d["log"] = job.lines
+    return jsonify(d)
+
+
+@bp.post("/api/jobs/<jid>/cancel")
+def api_job_cancel(jid):
+    job = JOBS.get(jid) if RE_JOBID.match(jid or "") else None
+    if not job or job.status != "läuft":
+        raise UserError("Dieser Vorgang läuft nicht (mehr).")
+    threading.Thread(target=job.cancel, args=(actor(),), daemon=True).start()
+    return jsonify(ok=True)
+
+
+# --------------------------------------------------------------------------- Container
+def container_kind(c: dict) -> str | None:
+    name, mount = c["name"], c["mount"] or ""
+    if name.startswith("release-build-"):
+        return "Release-Erstellung"
+    if name.startswith("zk-create-"):
+        return "Neuanlage"
+    if name.startswith("zk-verify-"):
+        return "Prüfstart"
+    if c["labels"].get("devdb") == "1" or os.path.dirname(mount) == os.path.realpath(DEV):
+        return "Entwickler-DB"
+    if os.path.dirname(mount) == os.path.realpath(MASTER):
+        return "Master-DB"
+    base = os.path.realpath(BASE)
+    if mount == base or mount.startswith(base + os.sep):
+        return "Sonstiger"
+    return None   # Container, die nichts mit zeitkapsel zu tun haben, bleiben unsichtbar
+
+
+def container_rows() -> list[dict]:
+    cs = containers()
+    devs = {d["container"]: d for d in devdbs(cs) if d["container"]}
+    rows = []
+    for c in cs:
+        kind = container_kind(c)
+        if not kind:
+            continue
+        d = devs.get(c["name"], {})
+        sid = d.get("sid") or (os.path.basename(c["mount"]) if c["mount"] else "")
+        rows.append(dict(name=c["name"], kind=kind, sid=sid, running=c["running"], restarting=c["restarting"],
+                         started=c["started"], port=c["port"], state=db_state(c) if kind in ("Master-DB", "Entwickler-DB") else
+                         ("läuft" if c["running"] else "gestoppt"), owner=d.get("owner", ""), dev_id=d.get("id", "")))
+    order = ["Master-DB", "Entwickler-DB", "Release-Erstellung", "Neuanlage", "Prüfstart", "Sonstiger"]
+    return sorted(rows, key=lambda r: (order.index(r["kind"]), r["name"]))
+
+
+def find_container(name: str) -> dict:
+    row = next((r for r in container_rows() if r["name"] == name), None)
+    if not row:
+        raise UserError("Container nicht gefunden (oder gehört nicht zu zeitkapsel).")
+    return row
+
+
+@bp.get("/api/containers")
+def api_containers():
+    return jsonify(containers=container_rows())
+
+
+@bp.get("/api/containers/<name>")
+def api_container(name):
+    return jsonify(find_container(name))
+
+
+def job_container_stop(job: Job, name: str) -> None:
+    job.run(["docker", "stop", "-t", "600", name], timeout=700)
+
+
+@bp.post("/api/containers/<name>/<action>")
+def api_container_action(name, action):
+    row = find_container(name)
+    if action == "stop":
+        if not row["running"]:
+            raise UserError("Der Container läuft nicht.")
+        job = start_job(f"Container {name} stoppen", row["sid"] or None, f"container:{name}", job_container_stop, name)
+        return jsonify(job=job.as_dict())
+    if action == "kill":
+        if not row["running"] and not row["restarting"]:
+            raise UserError("Der Container läuft nicht.")
+        sh(["docker", "update", "--restart", "no", name], check=False)     # sonst startet Docker ihn gleich wieder
+        sh(["docker", "kill", name])
+        if row["sid"] and row["kind"] in ("Master-DB", "Entwickler-DB"):
+            sid = row["sid"] if row["kind"] == "Master-DB" else row["dev_id"].partition("-")[0]
+            tl_add(sid, "container-killed", f"Container {name} hart beendet ({row['kind']})")
+        return jsonify(ok=True)
+    if action == "remove":
+        if row["kind"] in ("Master-DB", "Entwickler-DB"):
+            raise UserError("Master- und Entwickler-DBs über ihre eigenen Aktionen löschen.")
+        sh(["docker", "rm", "-f", name])
+        return jsonify(ok=True)
+    raise UserError("Unbekannte Aktion.")
 
 
 @bp.post("/api/db/<sid>/releases")
@@ -1875,6 +2128,7 @@ def job_master_start(job: Job, sid: str, port: int | None = None) -> None:
         if c["running"]:
             job.log(f"Master-DB {sid} läuft bereits ({c['name']}).")
             return
+        sh(["docker", "update", "--restart", "unless-stopped", c["name"]], check=False)  # nach hartem Beenden zurücksetzen
         job.run(["docker", "start", c["name"]])
     else:
         port = port or db_meta(sid).get("port")
@@ -1993,6 +2247,7 @@ def job_newdb(job: Job, sid: str, pdb: str, password: str, charset: str, port: i
         job.run(["chown", f"{ORACLE_UID}:{ORACLE_UID}", str(vol)])
         kind = f"Container-DB mit PDB {pdb}" if pdb else "Non-CDB"
         job.log(f"{kind} wird mit dbca angelegt; das dauert typischerweise 15 bis 45 Minuten.")
+        job.on_cancel(lambda: sh(["docker", "rm", "-f", cname], check=False))
         p = job.run(["docker", "run", "--rm", "-i", "--name", cname, "--entrypoint", "bash",
                      "-e", f"ORACLE_SID={sid}", "-v", f"{vol}:/opt/oracle/oradata", IMAGE, "-s"],
                     input=newdb_script(sid, pdb, password, charset, memory_mb, ncharset), secret=password,
@@ -2695,6 +2950,7 @@ def job_local_import(job: Job, src: dict, port: int, opts: dict) -> None:
 
         job.log("Prüfstart in einem Wegwerf-Container (startup, Abfragen, shutdown immediate)")
         pw = opts.get("sys_password") if needs.get("orapw") else None
+        job.on_cancel(lambda: sh(["docker", "rm", "-f", f"zk-verify-{sid.lower()}"], check=False))
         p = job.run(["docker", "run", "--rm", "-i", "--name", f"zk-verify-{sid.lower()}", "--entrypoint", "bash",
                      "-e", f"ORACLE_SID={sid}", "-v", f"{vol}:/opt/oracle/oradata", *docker_extra(vol), IMAGE, "-s"],
                     input=verify_script(sid, not plan["spfile"], pw), secret=pw, timeout=3600, allow_fail=True)
@@ -3049,7 +3305,12 @@ def job_dp_import(job: Job, src: dict, tgt: dict) -> None:
 
         stamp = time.strftime("%Y%m%d-%H%M%S")
         par = ['userid="/ as sysdba"', "network_link=ZK_SRC", "directory=ZK_IMPORT_DIR",
-               f"logfile=import_{stamp}.log", f"parallel={parallel}", "logtime=all", "metrics=yes"]
+               f"logfile=import_{stamp}.log", f"parallel={parallel}", "logtime=all", "metrics=yes",
+               f"job_name=ZK_IMP_{stamp.replace('-', '_')}"]
+        dp_job = f"ZK_IMP_{stamp.replace('-', '_')}"
+        job.on_cancel(lambda: sh(["docker", "exec", "-i", cname, "sqlplus", "-s", "/ as sysdba"], check=False, timeout=120,
+                                 input=f"declare h number; begin h := dbms_datapump.attach('{dp_job}', 'SYS'); "
+                                       "dbms_datapump.stop_job(h, 1, 0); end;\n/\nexit\n"))
         if tgt["full"]:
             par += ["full=y", "exclude=tablespace"]
         else:
@@ -3149,5 +3410,6 @@ def start_agent() -> None:
         log.warning("Agent läuft nicht als root; btrfs- und docker-Befehle werden scheitern.")
     for d in (MASTER, GOLDEN, DEV, DEVSNAPS, BUILD, DEVDUMPS, IMPORT, META):
         d.mkdir(parents=True, exist_ok=True)
+    jobs_housekeeping()
     threading.Thread(target=scheduler_loop, daemon=True, name="zeitplaner").start()
     threading.Thread(target=usage_worker, daemon=True, name="platzermittlung").start()

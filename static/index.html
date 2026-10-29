@@ -233,6 +233,14 @@ table.snap td.num { text-align: right; white-space: nowrap; }
 .job .when { font-size: 12px; color: var(--muted); }
 .job pre { margin: 0; padding: 8px 14px 12px; font-size: 12px; line-height: 1.4; max-height: 260px; overflow: auto; background: #f0f3f1; white-space: pre-wrap; word-break: break-word; }
 .job .err { color: var(--err); font-size: 13px; padding: 0 14px 8px; }
+.job .job-acts { padding: 0 14px 8px; }
+.quiet-link { font-size: 13px; font-weight: 400; color: var(--muted); margin-right: 8px; }
+.jobs-reopen { position: fixed; right: 16px; bottom: 16px; display: inline-flex; align-items: center; gap: 8px; background: var(--ink); color: #f1f5f4; border-color: var(--ink); border-radius: 999px; padding: 8px 14px; box-shadow: 0 6px 24px rgba(20, 37, 43, .18); font-size: 14px; }
+.jobs-reopen[hidden] { display: none; }
+.jobs-reopen .dot { background: #e0a43a; }
+table.snap tr.logrow td { background: #f0f3f1; padding: 0; }
+table.snap tr.logrow pre { margin: 0; padding: 10px 14px; font-size: 12px; line-height: 1.4; max-height: 420px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+.filters { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
 
 /* Dialoge */
 dialog { max-height: calc(100vh - 24px); overflow-y: auto; border: 1px solid var(--rule); border-radius: 10px; padding: 0; width: min(480px, calc(100vw - 24px)); color: var(--ink); background: var(--sheet); }
@@ -279,9 +287,10 @@ label.field textarea { min-height: 84px; resize: vertical; }
 <div class="offline" id="offline" hidden></div>
 
 <section class="jobs" id="jobs" hidden aria-label="Vorgänge">
-  <header><span>Vorgänge</span><span class="grow"></span><button class="quiet small" id="jobsHide">Ausblenden</button></header>
+  <header><span>Vorgänge</span><span class="grow"></span><a class="quiet-link" id="jobsAll" href="#">Alle Vorgänge</a><button class="quiet small" id="jobsHide">Ausblenden</button></header>
   <ul id="jobList"></ul>
 </section>
+<button class="jobs-reopen" id="jobsReopen" hidden></button>
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
 <!-- Release erstellen -->
@@ -620,6 +629,9 @@ const canDev = d => isAdmin() || (O && d.owner === O.me.username);
 let openJobs = new Set();
 let jobsHidden = false;
 let snapRows = null;
+let jobsPage = null;          // { jobs, containers } der Seite „Vorgänge“
+let jobsFilter = "alle";
+const openPageLogs = new Set();
 let admin = null;
 let showEvents = false;
 try { showEvents = localStorage.getItem("oradb.showEvents") === "1"; } catch {}
@@ -629,6 +641,7 @@ function parseHash() {
   const hid = +p.get("h") || (view.hid || null);
   if (p.has("zugang")) view = { kind: "access", hid };
   else if (p.has("snapshots")) view = { kind: "snapshots", hid };
+  else if (p.has("vorgaenge")) view = { kind: "jobs", hid };
   else if (p.has("verwaltung")) view = { kind: "admin", hid };
   else view = { kind: "db", hid, sid: p.get("db") };
 }
@@ -636,7 +649,8 @@ const link = (o) => "#" + new URLSearchParams(o).toString();
 async function onHash() {
   const before = view.hid;
   parseHash();
-  if (view.hid !== before) { S = null; snapRows = null; admin = null; }
+  if (view.hid !== before) { S = null; snapRows = null; admin = null; jobsPage = null; }
+  if (view.kind === "jobs") loadJobsPage();
   if (view.kind === "snapshots") loadSnapshots();
   if (view.kind === "admin") loadAdmin();
   if (view.kind === "access") loadAccess();
@@ -690,6 +704,7 @@ function render() {
   else if (!host) $("#main").innerHTML = `<div class="empty-state"><p>Noch kein Host eingetragen.</p>${isAdmin() ? `<p><a href="${link({ zugang: 1 })}">Host hinzufügen</a></p>` : ""}</div>`;
   else if (!host.ok || !S) $("#main").innerHTML = `<div class="empty-state"><p><b>${esc(host.name)}</b> ist nicht erreichbar.</p><p>${esc(host.error || "")}</p></div>`;
   else if (view.kind === "snapshots") renderSnapshots();
+  else if (view.kind === "jobs") renderJobsPage();
   else if (view.kind === "admin") isAdmin() ? renderAdmin() : (location.hash = link({ h: view.hid }));
   else renderDb(currentDb());
   if (S) renderJobs(); else $("#jobs").hidden = true;
@@ -707,6 +722,7 @@ function renderNav() {
       <a class="hostname" href="${link({ h: h.id })}"><span class="dot ${h.ok ? "ok" : "err"}" title="${h.ok ? "erreichbar" : esc(h.error || "nicht erreichbar")}"></span><span>${esc(h.name)}</span><span class="port">${h.running_jobs ? h.running_jobs + " ⟳" : ""}</span></a>
       ${dbs || (h.ok ? '<p class="port nav-empty">noch keine Datenbank</p>' : '<p class="port nav-empty">nicht erreichbar</p>')}
       ${here && h.ok ? `<a href="${link({ h: h.id, snapshots: 1 })}" ${cur(view.kind === "snapshots")} class="sub"><span></span><span>Alle Snapshots</span><span></span></a>
+        <a href="${link({ h: h.id, vorgaenge: 1 })}" ${cur(view.kind === "jobs")} class="sub"><span></span><span>Vorgänge und Container</span><span></span></a>
         ${isAdmin() ? `<a href="${link({ h: h.id, verwaltung: 1 })}" ${cur(view.kind === "admin")} class="sub"><span></span><span>Verwaltung</span><span></span></a>` : ""}` : ""}
     </div>`;
   }).join("");
@@ -1395,19 +1411,26 @@ function renderSnapshots() {
     <p style="color:var(--muted)">Subvolumes von einer anderen zeitkapsel-Instanz oder per <code>btrfs send</code>/<code>receive</code> legst du unter <code>${esc(snapMeta.import_dir || "/srv/oradb/import")}</code> ab; sie erscheinen hier als „Import“ und lassen sich, wenn sie eine Datenbank enthalten, als Master-DB übernehmen. Die Quelle bleibt dabei erhalten.</p>`;
 }
 
+const JOB_KLS = { "läuft": "warn", "fertig": "ok", "fehlgeschlagen": "err", "abgebrochen": "err", "unterbrochen": "err" };
+const canCancel = j => j.status === "läuft" && !j.cancel_requested && (isAdmin() || (O && j.actor === O.me.username));
 function renderJobs() {
   const box = $("#jobs");
   const jobs = S.jobs.slice(0, 8);
-  const running = jobs.some(j => j.status === "läuft");
-  if (running) jobsHidden = false;
+  const runningCount = S.jobs.filter(j => j.status === "läuft").length;
   box.hidden = !jobs.length || jobsHidden;
-  const kls = { "läuft": "warn", "fertig": "ok", "fehlgeschlagen": "err" };
+  const reopen = $("#jobsReopen");
+  reopen.hidden = !(jobsHidden && jobs.length);
+  reopen.innerHTML = runningCount ? `<span class="dot"></span>${runningCount} ${runningCount === 1 ? "Vorgang läuft" : "Vorgänge laufen"}` : "Vorgänge";
+  $("#jobsAll").href = link({ h: view.hid, vorgaenge: 1 });
+  const kls = JOB_KLS;
   $("#jobList").innerHTML = jobs.map(j => `<li class="job">
     <button data-act="job-toggle" data-id="${j.id}" aria-expanded="${openJobs.has(j.id)}">
       <span>${esc(j.title)}</span><span class="pill ${kls[j.status]}"><span class="dot ${kls[j.status]}"></span>${esc(j.status)}</span>
       <span class="when">${fmtTime(j.started)}${j.ended ? " bis " + new Date(j.ended).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" }) : ""}</span>
     </button>
     ${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}
+    ${canCancel(j) ? `<div class="job-acts"><button class="quiet small danger" data-act="job-cancel" data-id="${esc(j.id)}" data-title="${esc(j.title)}">Abbrechen</button></div>` : ""}
+    ${j.cancel_requested && j.status === "läuft" ? '<div class="job-acts muted-note">wird abgebrochen …</div>' : ""}
     ${openJobs.has(j.id) ? `<pre id="log-${j.id}">${esc((jobLogs[j.id] || []).join("\n")) || "…"}</pre>` : ""}
   </li>`).join("");
   for (const id of openJobs) {
@@ -1419,6 +1442,80 @@ const jobLogs = {};
 async function loadJobLogs() {
   for (const id of openJobs) {
     try { jobLogs[id] = (await api("GET", "/api/jobs/" + id)).log; } catch { openJobs.delete(id); }
+  }
+}
+
+/* ------------------------------------------------------------ Seite „Vorgänge und Container“ */
+async function loadJobsPage() {
+  try {
+    const [j, c] = await Promise.all([api("GET", "/api/jobs?limit=300"), api("GET", "/api/containers")]);
+    jobsPage = { jobs: j.jobs, containers: c.containers };
+    for (const id of openPageLogs) {
+      const job = jobsPage.jobs.find(x => x.id === id);
+      if (!pageLogs[id] || (job && job.status === "läuft")) {
+        try { pageLogs[id] = (await api("GET", `/api/jobs/${encodeURIComponent(id)}?full=1`)).log; } catch { openPageLogs.delete(id); }
+      }
+    }
+    if (view.kind === "jobs") renderJobsPage();
+  } catch (e) { toast(e.message); }
+}
+const pageLogs = {};
+
+function fmtDuration(a, b) {
+  if (!a) return "–";
+  const s = Math.max(0, Math.round(((b ? new Date(b) : new Date()) - new Date(a)) / 1000));
+  if (s < 60) return s + " s";
+  if (s < 3600) return Math.floor(s / 60) + " min " + (s % 60) + " s";
+  return Math.floor(s / 3600) + " h " + Math.floor((s % 3600) / 60) + " min";
+}
+
+function renderJobsPage() {
+  const main = $("#main");
+  if (!jobsPage) { main.innerHTML = "<p>Lade Vorgänge …</p>"; return; }
+  const me = O.me.username;
+  const cts = jobsPage.containers;
+  const ctMine = c => isAdmin() || (c.kind === "Entwickler-DB" && c.owner === me);
+  const ctRows = cts.map(c => `<tr>
+      <td class="nw"><b>${esc(c.name)}</b></td><td class="nw">${esc(c.kind)}</td><td class="nw">${esc(c.sid || "–")}</td>
+      <td class="nw">${pillPlain(c.state, STATE[c.state] || (c.running ? "ok" : "off"))}</td>
+      <td class="nw">${c.running ? fmtDuration(c.started) : "–"}</td><td class="nw">${c.port || "–"}</td>
+      <td class="nw">${esc(c.owner || "–")}</td>
+      <td><div class="acts">${ctMine(c) ? `
+        ${c.running ? `<button class="quiet small" data-act="ct-stop" data-name="${esc(c.name)}" data-kind="${esc(c.kind)}">Stoppen</button>
+        <button class="quiet small danger" data-act="ct-kill" data-name="${esc(c.name)}" data-kind="${esc(c.kind)}">Abschießen</button>` : ""}
+        ${isAdmin() && !["Master-DB", "Entwickler-DB"].includes(c.kind) ? `<button class="quiet small danger" data-act="ct-remove" data-name="${esc(c.name)}">Entfernen</button>` : ""}` : ""}</div></td></tr>`).join("");
+  const filters = { alle: () => true, laufend: j => j.status === "läuft", fehler: j => ["fehlgeschlagen", "abgebrochen", "unterbrochen"].includes(j.status), meine: j => j.actor === me };
+  const jobs = jobsPage.jobs.filter(filters[jobsFilter] || filters.alle);
+  const running = jobsPage.jobs.filter(j => j.status === "läuft").length;
+  const jobRows = jobs.map(j => `<tr>
+      <td>${esc(j.title)}${j.error && j.status !== "abgebrochen" ? `<div class="bad">${esc(j.error)}</div>` : ""}</td>
+      <td class="nw">${pillPlain(j.cancel_requested && j.status === "läuft" ? "wird abgebrochen" : j.status, JOB_KLS[j.status])}</td>
+      <td class="nw">${esc(j.actor || "–")}${j.cancelled_by ? `<div class="muted-note">abgebrochen von ${esc(j.cancelled_by)}</div>` : ""}</td>
+      <td class="nw">${fmtTime(j.started)}</td><td class="nw">${fmtDuration(j.started, j.ended)}</td>
+      <td><div class="acts">
+        <button class="quiet small" data-act="pjob-log" data-id="${esc(j.id)}" aria-expanded="${openPageLogs.has(j.id)}">${openPageLogs.has(j.id) ? "Protokoll ausblenden" : "Protokoll"}</button>
+        ${canCancel(j) ? `<button class="quiet small danger" data-act="job-cancel" data-id="${esc(j.id)}" data-title="${esc(j.title)}">Abbrechen</button>` : ""}</div></td></tr>
+    ${openPageLogs.has(j.id) ? `<tr class="logrow"><td colspan="6"><pre id="plog-${esc(j.id)}">${esc((pageLogs[j.id] || ["…"]).join("\n"))}</pre></td></tr>` : ""}`).join("");
+  main.innerHTML = `
+    <section class="dbhead"><h1>Vorgänge und Container</h1>
+      <div class="facts"><span>${esc(currentHost().name)}</span><span>${running} laufend</span><span>${cts.filter(c => c.running).length} Container aktiv</span></div>
+      <div class="actions"><button data-act="jobs-reload">Neu laden</button></div></section>
+    <section style="margin-top:22px" aria-labelledby="h-ct">
+      <div class="section-head"><h2 id="h-ct">Container</h2><span class="hint">nur Container von zeitkapsel; „Abschießen“ beendet sofort ohne sauberes Herunterfahren</span></div>
+      <div class="table-wrap"><table class="snap"><thead><tr><th>Name</th><th>Art</th><th>Datenbank</th><th>Status</th><th>Läuft seit</th><th>Port</th><th>Besitzer</th><th></th></tr></thead>
+        <tbody>${ctRows || '<tr><td colspan="8">Keine Container.</td></tr>'}</tbody></table></div>
+    </section>
+    <section style="margin-top:28px" aria-labelledby="h-jobs">
+      <div class="section-head"><h2 id="h-jobs">Vorgänge</h2><span class="hint">die letzten 300, mit vollständigem Protokoll; bleiben über Neustarts erhalten</span></div>
+      <div class="filters days">${[["alle", "Alle"], ["laufend", `Laufend (${running})`], ["fehler", "Fehlgeschlagen oder abgebrochen"], ["meine", "Meine"]].map(([k, t]) =>
+        `<label><input type="radio" name="jobfilter" value="${k}" data-act="jobs-filter" ${jobsFilter === k ? "checked" : ""}>${t}</label>`).join("")}</div>
+      <div class="table-wrap"><table class="snap"><thead><tr><th>Vorgang</th><th>Status</th><th>Benutzer</th><th>Start</th><th>Dauer</th><th></th></tr></thead>
+        <tbody>${jobRows || '<tr><td colspan="6">Keine Vorgänge.</td></tr>'}</tbody></table></div>
+    </section>`;
+  for (const id of openPageLogs) {
+    const pre = document.getElementById("plog-" + id);
+    const job = jobsPage.jobs.find(x => x.id === id);
+    if (pre && job && job.status === "läuft") pre.scrollTop = pre.scrollHeight;
   }
 }
 
@@ -1697,6 +1794,36 @@ document.addEventListener("click", async ev => {
         if (el) { el.scrollIntoView({ block: "center" }); history.replaceState(null, "", location.hash); el.setAttribute("tabindex", "-1"); el.focus(); }
         break;
       }
+      case "job-cancel":
+        if (!confirm(`Vorgang „${b.dataset.title}“ abbrechen?\n\nLaufende Befehle werden beendet und halbfertige Ergebnisse (z. B. neue Subvolumes oder Hilfscontainer) wieder entfernt.`)) return;
+        await api("POST", `/api/jobs/${encodeURIComponent(b.dataset.id)}/cancel`);
+        toast("Abbruch angefordert"); await refresh(); if (view.kind === "jobs") await loadJobsPage();
+        break;
+      case "pjob-log":
+        if (openPageLogs.has(b.dataset.id)) openPageLogs.delete(b.dataset.id); else openPageLogs.add(b.dataset.id);
+        delete pageLogs[b.dataset.id];
+        await loadJobsPage();
+        break;
+      case "jobs-filter":
+        jobsFilter = b.value; renderJobsPage();
+        break;
+      case "jobs-reload":
+        await loadJobsPage();
+        break;
+      case "ct-stop":
+        if (!confirm(`Container „${b.dataset.name}“ sauber stoppen?${b.dataset.kind.endsWith("DB") ? "\n\nDie Datenbank wird heruntergefahren; das kann einige Minuten dauern." : ""}`)) return;
+        startedJob(await api("POST", `/api/containers/${encodeURIComponent(b.dataset.name)}/stop`)); await loadJobsPage(); await refresh();
+        break;
+      case "ct-kill":
+        if (!confirm(`Container „${b.dataset.name}“ abschießen?\n\nDer Container wird sofort beendet, ohne sauberes Herunterfahren${b.dataset.kind.endsWith("DB") ? ". Die Datenbank führt beim nächsten Start eine Instance Recovery aus" : ""}. Nur nutzen, wenn „Stoppen“ hängt.`)) return;
+        await api("POST", `/api/containers/${encodeURIComponent(b.dataset.name)}/kill`);
+        toast("Container beendet"); await loadJobsPage(); await refresh();
+        break;
+      case "ct-remove":
+        if (!confirm(`Hilfscontainer „${b.dataset.name}“ entfernen?`)) return;
+        await api("POST", `/api/containers/${encodeURIComponent(b.dataset.name)}/remove`);
+        toast("Container entfernt"); await loadJobsPage();
+        break;
       case "job-toggle":
         openJobs.has(b.dataset.id) ? openJobs.delete(b.dataset.id) : openJobs.add(b.dataset.id);
         await loadJobLogs(); renderJobs();
@@ -1743,7 +1870,9 @@ document.addEventListener("click", async ev => {
     }
   } catch (e) { toast(e.message); }
 });
-$("#jobsHide").addEventListener("click", () => { jobsHidden = true; renderJobs(); });
+$("#jobsHide").addEventListener("click", () => { jobsHidden = true; try { localStorage.setItem("zk.jobsHidden", "1"); } catch {} renderJobs(); });
+$("#jobsReopen").addEventListener("click", () => { jobsHidden = false; try { localStorage.removeItem("zk.jobsHidden"); } catch {} renderJobs(); });
+try { jobsHidden = localStorage.getItem("zk.jobsHidden") === "1"; } catch {}
 
 /* ------------------------------------------------------------ Start */
 parseHash();
@@ -1751,6 +1880,7 @@ refresh().then(() => {
   if (view.kind === "snapshots") loadSnapshots();
   if (view.kind === "admin") loadAdmin();
   if (view.kind === "access") loadAccess();
+  if (view.kind === "jobs") loadJobsPage();
 });
 setInterval(async () => {
   if (document.hidden) return;
@@ -1758,6 +1888,7 @@ setInterval(async () => {
   if (!document.querySelector("dialog[open]")) {
     if (view.kind === "admin") await loadAdmin();
     if (view.kind === "access") await loadAccess(true);
+    if (view.kind === "jobs") await loadJobsPage();
     if (view.kind === "snapshots" && snapRows && snapRows.some(r => r.usage_pending)) await loadSnapshots();
     await refresh();
   }
