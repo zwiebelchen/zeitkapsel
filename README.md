@@ -115,9 +115,44 @@ Jedes DB-Subvolume enthält die Markierungsdateien, ohne die das Startskript des
 
 Weil die Datei im Subvolume liegt, wandert sie mit jedem Release und jeder Entwickler-DB mit; Oberfläche und Skripte setzen die Angaben bei jedem `docker run` um.
 
+## Kompression
+
+zeitkapsel lässt Copy-on-Write eingeschaltet, damit die Kompression des Dateisystems (`compress` bzw. `compress-force` in den Mount-Optionen) auch für die Datenbankdateien greift. btrfs komprimiert nur Dateien mit Copy-on-Write; Dateien mit dem NOCOW-Attribut (`chattr +C`) werden unkomprimiert und ohne Prüfsummen gespeichert.
+
+| | Copy-on-Write (Standard) | NOCOW (`ZK_NOCOW=1`) |
+| --- | --- | --- |
+| Kompression | ja | nein |
+| Prüfsummen | ja, btrfs erkennt beschädigte Blöcke | nein |
+| Schreiben | Kopie bei jeder Änderung; Datendateien fragmentieren mit der Zeit | Überschreiben an Ort und Stelle (außer nach einem Snapshot) |
+| Snapshots | ja | ja |
+
+Für Entwicklungsdatenbanken auf SSDs überwiegt meist der Platzgewinn. Nicht defragmentieren (`btrfs filesystem defragment`, `autodefrag`): das hebt die gemeinsame Nutzung von Blöcken zwischen Master, Releases und Entwickler-DBs auf, und jeder Snapshot belegt danach seinen vollen Platz.
+
+„Verwaltung“ zeigt Dateisystem und Kompression des Hosts und warnt, wenn eine Master-DB noch NOCOW-Dateien hat. Prüfen von Hand:
+
+```bash
+lsattr -d /srv/oradb/master/<SID> /srv/oradb/master/<SID>/<SID>   # "C" = NOCOW
+compsize /srv/oradb/master/<SID>                                   # tatsächlich komprimierter Anteil
+```
+
+Eine Master-DB mit NOCOW-Dateien stellst du so um (das Attribut lässt sich an Dateien mit Inhalt nicht zuverlässig entfernen, sie müssen einmal neu geschrieben werden):
+
+```bash
+docker stop -t 600 <sid>
+btrfs subvolume create /srv/oradb/master/<SID>.neu
+lsattr -d /srv/oradb/master/<SID>.neu                     # darf kein C zeigen
+cp -a --reflink=never /srv/oradb/master/<SID>/. /srv/oradb/master/<SID>.neu/
+mv /srv/oradb/master/<SID> /srv/oradb/master/<SID>.alt
+mv /srv/oradb/master/<SID>.neu /srv/oradb/master/<SID>
+docker start <sid>
+btrfs subvolume delete /srv/oradb/master/<SID>.alt          # wenn alles läuft
+```
+
+Releases und Entwickler-DBs aus der Zeit davor bleiben unkomprimiert, bis sie durch neue ersetzt werden.
+
 ## Neue Datenbank
 
-„Verwaltung“ → „Neue Datenbank“ legt eine leere CDB mit einer PDB an: Subvolume (mit `chattr +C`), Anlage per dbca im Oracle-Image (15 bis 45 Minuten), danach wird der Anlage-Container entfernt – er trägt das Passwort in seiner Konfiguration – und die DB als normale Master-DB ohne Passwort-Variable gestartet. Das Passwort gilt für SYS, SYSTEM und PDBADMIN und erscheint nicht im Vorgangsprotokoll.
+„Verwaltung“ → „Neue Datenbank“ legt eine leere CDB mit einer PDB an: Subvolume, Anlage per dbca im Oracle-Image (15 bis 45 Minuten), danach wird der Anlage-Container entfernt – er trägt das Passwort in seiner Konfiguration – und die DB als normale Master-DB ohne Passwort-Variable gestartet. Das Passwort gilt für SYS, SYSTEM und PDBADMIN und erscheint nicht im Vorgangsprotokoll.
 
 ## Import von einem anderen Server
 

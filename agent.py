@@ -56,6 +56,9 @@ CREATE_TIMEOUT = int(env("CREATE_TIMEOUT", "5400"))      # Neuanlage einer DB mi
 RELEASE_SQL_FILE = env("RELEASE_SQL_FILE", "")
 AGENT_TOKEN = env("AGENT_TOKEN", "")
 SSH_KEY = Path(env("SSH_KEY", "/root/.ssh/zeitkapsel_ed25519"))
+# NOCOW (chattr +C) für neue DB-Subvolumes: schnellere Überschreibungen, aber keine Kompression und
+# keine Prüfsummen. Standard aus, damit compress/compress-force des Dateisystems greift.
+NOCOW = env("NOCOW", "0") == "1"
 log = logging.getLogger("zeitkapsel.agent")
 
 # Wird beim Erstellen eines Releases in der Zwischen-DB ausgeführt, vor "shutdown immediate".
@@ -1514,7 +1517,8 @@ def api_admin():
     return jsonify(host=DB_HOST, image=IMAGE, base=str(BASE), server_time=now_iso(),
                    disk=dict(total=du.total, used=du.used, free=du.free),
                    ports=f"{DEV_PORT_START}–{DEV_PORT_END}", ready_timeout=READY_TIMEOUT,
-                   release_sql=RELEASE_SQL_FILE or "(eingebaut)", leftovers=leftovers())
+                   release_sql=RELEASE_SQL_FILE or "(eingebaut)", leftovers=leftovers(),
+                   storage=storage_info())
 
 
 @bp.post("/api/admin/cleanup")
@@ -1566,6 +1570,36 @@ def api_usage():
     cols = p.stdout.strip().splitlines()[-1].split()
     nums = [int(x) if x.isdigit() else None for x in cols[:3]]
     return jsonify(total=nums[0], exclusive=nums[1], shared=nums[2])
+
+
+# --------------------------------------------------------------------------- Speicher: Kompression und NOCOW
+def is_nocow(path: Path) -> bool:
+    p = sh(["lsattr", "-d", str(path)], check=False)
+    flags = p.stdout.split()[0] if p.returncode == 0 and p.stdout.split() else ""
+    return "C" in flags
+
+
+def prepare_new_volume(job: Job, vol: Path) -> None:
+    """Neues DB-Subvolume: NOCOW nur auf ausdrücklichen Wunsch, sonst sicherstellen, dass kein
+    vom Elternverzeichnis geerbtes C-Attribut die Kompression verhindert."""
+    if NOCOW:
+        job.log("ZK_NOCOW=1: Copy-on-Write aus (keine Kompression, keine Prüfsummen)")
+        job.run(["chattr", "+C", str(vol)])
+    elif is_nocow(vol):
+        job.log("Subvolume hat ein geerbtes NOCOW-Attribut; wird entfernt, damit komprimiert wird")
+        job.run(["chattr", "-C", str(vol)])
+
+
+def storage_info() -> dict:
+    p = sh(["findmnt", "-no", "FSTYPE,OPTIONS", "-T", str(BASE)], check=False)
+    fstype, _, opts = p.stdout.strip().partition(" ")
+    compress = next((o for o in opts.strip().split(",") if o.startswith("compress")), "")
+    nocow = []
+    for sid in master_sids():
+        vol = MASTER / sid
+        if is_nocow(vol) or is_nocow(vol / sid):
+            nocow.append(sid)
+    return dict(fstype=fstype, compress=compress, nocow_setting=NOCOW, nocow_dbs=nocow)
 
 
 # --------------------------------------------------------------------------- Master-DB starten und stoppen
@@ -1659,7 +1693,7 @@ def job_newdb(job: Job, sid: str, pdb: str, password: str, charset: str, port: i
     cname = f"zk-create-{sid.lower()}"
     job.run(["btrfs", "subvolume", "create", str(vol)])
     try:
-        job.run(["chattr", "+C", str(vol)])
+        prepare_new_volume(job, vol)
         job.run(["chown", f"{ORACLE_UID}:{ORACLE_UID}", str(vol)])
         t0 = time.time()
         job.log("Datenbank wird mit dbca angelegt; das dauert typischerweise 15 bis 45 Minuten.")
@@ -1908,7 +1942,7 @@ def job_import(job: Job, src: dict, port: int, restart_source: bool) -> None:
         shut_down = True
         job.run(["btrfs", "subvolume", "create", str(vol)])
         created = True
-        job.run(["chattr", "+C", str(vol)])
+        prepare_new_volume(job, vol)
         job.log(f"Kopiere {plan['size'] / 1024 ** 3:.1f} GB Datendateien plus Redo-Logs und Controlfiles")
         for m in plan["mapping"]:
             dest = vol / m["rel"]

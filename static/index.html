@@ -987,7 +987,10 @@ function renderAdmin() {
           <dt>Ports</dt><dd>${esc(sys.ports)} für Entwickler-DBs</dd>
           <dt>Startwartezeit</dt><dd>${Math.round(sys.ready_timeout / 60)} Minuten</dd>
           <dt>Release-SQL</dt><dd>${esc(sys.release_sql)}</dd>
+          ${sys.storage ? `<dt>Dateisystem</dt><dd>${esc(sys.storage.fstype || "?")}</dd>
+          <dt>Kompression</dt><dd>${sys.storage.compress ? esc(sys.storage.compress) : "aus"}${sys.storage.nocow_setting ? " – neue DBs ohne Copy-on-Write (ZK_NOCOW=1), also unkomprimiert" : ""}</dd>` : ""}
         </dl>
+        ${sys.storage && sys.storage.compress && sys.storage.nocow_dbs.length ? `<p class="hint-box" style="margin-top:12px">Nicht komprimiert, weil Copy-on-Write abgeschaltet ist (NOCOW): <b>${sys.storage.nocow_dbs.map(esc).join(", ")}</b>. Zum Umstellen die Master-DB stoppen, in ein neues Subvolume ohne <code>C</code>-Attribut kopieren (<code>cp -a --reflink=never</code>) und tauschen – siehe README, Abschnitt „Kompression“.</p>` : ""}
         <div class="section-head" style="margin-top:26px"><h2>Aufräumen</h2></div>
         ${nLeft ? `<p>Übrig gebliebene Zwischenstände abgebrochener Release-Vorgänge: ${lo.builds.length} Subvolume(s), ${lo.containers.length} Container.</p>
           <button data-act="cleanup" ${lo.release_running ? 'disabled title="Gerade läuft ein Release-Vorgang"' : ""}>Zwischenstände entfernen</button>`
