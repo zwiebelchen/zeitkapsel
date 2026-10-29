@@ -166,6 +166,9 @@ nav.side a.sub[aria-current="page"] { color: var(--ink); }
 .dev-mine { box-shadow: inset 3px 0 0 var(--branch); padding-left: 10px; }
 .by { color: var(--muted); font-size: 12px; border: 1px solid var(--rule); border-radius: 4px; padding: 0 4px; }
 table.snap td .acts { display: flex; flex-wrap: wrap; gap: 2px; margin-left: -8px; }
+.muted-note { color: var(--muted); font-size: 12.5px; }
+.ok-note { color: var(--ok); font-size: 12.5px; margin-top: 2px; }
+td .bad { color: var(--err); font-size: 12.5px; }
 .keybox { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 12px; background: #fff; border: 1px solid var(--rule); border-radius: 6px; padding: 8px 10px; word-break: break-all; }
 .probe { display: grid; gap: 10px; }
 .probe dl.facts-list { font-size: 13.5px; }
@@ -210,7 +213,8 @@ dl.facts-list dd { margin: 0; word-break: break-all; }
 table.snap { width: 100%; border-collapse: collapse; background: var(--sheet); font-size: 14px; }
 table.snap th, table.snap td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
 table.snap th { font-weight: 600; color: var(--muted); font-size: 13px; border-bottom: 1px solid var(--rule); }
-table.snap td:not(.path) { white-space: nowrap; }
+table.snap td.nw, table.snap th { white-space: nowrap; }
+table.snap td.namecell { min-width: 14ch; max-width: 46ch; }
 table.snap td.path { font-size: 12.5px; color: var(--muted); word-break: break-all; }
 table.snap td.num { text-align: right; white-space: nowrap; }
 .table-wrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 8px; }
@@ -1189,31 +1193,71 @@ function openImportDialog() {
   });
 }
 
-async function loadSnapshots() {
-  try { snapRows = await api("GET", "/api/snapshots"); render(); }
-  catch (e) { toast(e.message); }
+let snapMeta = {};
+async function loadSnapshots(refresh) {
+  try {
+    const r = await api("GET", "/api/snapshots" + (refresh ? "?refresh=1" : ""));
+    snapRows = r.rows; snapMeta = r;
+    if (view.kind === "snapshots") render();
+  } catch (e) { toast(e.message); }
+}
+
+function usageCell(r) {
+  const u = r.usage;
+  if (!u) return r.usage_pending ? '<span class="muted-note">wird ermittelt …</span>' : "–";
+  if (u.error) return `<span class="bad" title="${esc(u.error)}">Fehler</span>`;
+  return `${fmtBytes(u.exclusive)}${r.usage_pending ? ' <span class="muted-note" title="wird gerade neu ermittelt">⟳</span>' : ""}`;
+}
+function diskCell(r) {
+  const u = r.usage;
+  if (!u || u.disk == null) return r.usage_pending && snapMeta.compsize ? '<span class="muted-note">…</span>' : "–";
+  const ratio = u.uncompressed ? Math.round(100 * u.disk / u.uncompressed) : null;
+  return `${fmtBytes(u.disk)}${ratio != null ? ` <span class="muted-note">(${ratio} %)</span>` : ""}`;
+}
+
+function snapActions(r) {
+  const acts = [];
+  const mine = r.owner && O && r.owner === O.me.username;
+  if (r.delete === "release" && isAdmin()) acts.push(`<button class="quiet small danger" data-act="sv-del-release" data-sid="${esc(r.sid)}" data-name="${esc(r.release)}">Löschen</button>`);
+  if (r.delete === "devdb" && (isAdmin() || mine)) acts.push(`<button class="quiet small danger" data-act="sv-del-dev" data-id="${esc(r.dev_id)}" ${r.container_running ? "" : ""}>Löschen</button>`);
+  if (r.delete === "devsnap" && (isAdmin() || mine)) acts.push(`<button class="quiet small danger" data-act="sv-del-devsnap" data-id="${esc(r.dev_id)}" data-snap="${esc(r.snap)}">Löschen</button>`);
+  if (r.delete === "subvolume" && isAdmin()) {
+    const d = r.detected;
+    if (d && d.ok && !d.exists) acts.push(`<button class="quiet small" data-act="sv-adopt" data-path="${esc(r.path)}" data-sid="${esc(d.sid)}">Als Master-DB ${esc(d.sid)} übernehmen</button>`);
+    acts.push(`<button class="quiet small danger" data-act="sv-del" data-path="${esc(r.path)}" data-kind="${esc(r.kind)}" data-name="${esc(r.label)}" ${r.container_running ? 'disabled title="Container läuft – erst stoppen"' : ""}>Löschen</button>`);
+  }
+  return acts.join("");
+}
+
+function detectedCell(r) {
+  const d = r.detected;
+  if (r.kind !== "Sonstiges Subvolume" && r.kind !== "Import") return "";
+  if (!d) return '<div class="muted-note">keine Datenbank erkannt</div>';
+  if (!d.ok) return `<div class="bad">Datenbank${d.sid ? " " + esc(d.sid) : ""} unvollständig: ${esc(d.problems.join("; "))}</div>`;
+  return `<div class="ok-note">enthält Datenbank <b>${esc(d.sid)}</b>${d.type ? " (" + (d.type === "cdb" ? "CDB" : "Non-CDB") + ")" : ""}${d.exists ? ` – Master-DB ${esc(d.sid)} gibt es schon` : ""}${d.fixes.length ? `<br><span class="muted-note" title="${esc(d.fixes.join("\n"))}">beim Übernehmen werden ${d.fixes.length} fehlende Dateien ergänzt</span>` : ""}</div>`;
 }
 
 function renderSnapshots() {
   const main = $("#main");
   if (!snapRows) { main.innerHTML = "<p>Lade Snapshots …</p>"; return; }
-  const kinds = ["Master-DB", "Release", "Entwickler-DB", "Entwickler-Snapshot", "Zwischenstand", "Sonstiges Subvolume"];
+  const kinds = ["Master-DB", "Release", "Entwickler-DB", "Entwickler-Snapshot", "Import", "Sonstiges Subvolume", "Zwischenstand"];
   const rows = [...snapRows].sort((a, b) => kinds.indexOf(a.kind) - kinds.indexOf(b.kind) || a.sid.localeCompare(b.sid) || (b.created || "").localeCompare(a.created || ""));
+  const pending = rows.some(r => r.usage_pending);
   main.innerHTML = `
     <section class="dbhead"><h1>Alle Snapshots</h1>
-      <div class="facts"><span>${rows.length} Subvolumes unter /srv/oradb</span></div>
-      <div class="actions"><button data-act="snap-reload">Neu laden</button></div></section>
-    <p class="hint" style="color:var(--muted);max-width:70ch">„Exklusiv“ ist der Platz, der frei würde, wenn das Subvolume gelöscht wird. Die Ermittlung liest die Blockzuordnung und kann bei großen Datenbanken eine Weile dauern.</p>
+      <div class="facts"><span>${rows.length} Subvolumes unter ${esc(snapMeta.import_dir ? snapMeta.import_dir.replace(/\/import$/, "") : "/srv/oradb")}</span>${pending ? '<span class="muted-note">Platz wird ermittelt …</span>' : ""}</div>
+      <div class="actions"><button data-act="snap-reload">Neu laden und Platz neu ermitteln</button></div></section>
+    <p class="hint" style="color:var(--muted);max-width:80ch">„Exklusiv“ ist der Platz, der beim Löschen frei würde – gezählt ohne Kompression. ${snapMeta.compsize ? "„Auf Platte“ ist der tatsächlich belegte Platz aller Blöcke des Subvolumes nach Kompression (inklusive der mit anderen Snapshots geteilten), in Klammern im Verhältnis zur unkomprimierten Größe." : "Für den tatsächlich belegten Platz nach Kompression auf dem Host <code>compsize</code> installieren."} Die Werte werden im Hintergrund ermittelt und eine Viertelstunde zwischengespeichert.</p>
     <div class="table-wrap"><table class="snap">
-      <thead><tr><th>Art</th><th>Datenbank</th><th>Name</th><th>Erstellt</th><th>Schreibschutz</th><th>Container</th><th class="num">Exklusiv</th><th>Pfad</th></tr></thead>
+      <thead><tr><th>Art</th><th>Datenbank</th><th>Name</th><th>Erstellt</th><th>Schreib&shy;schutz</th><th>Container</th><th class="num">Exklusiv</th>${snapMeta.compsize ? '<th class="num">Auf Platte</th>' : ""}<th>Pfad</th><th></th></tr></thead>
       <tbody>${rows.map(r => `<tr>
-        <td>${esc(r.kind)}</td><td>${esc(r.sid)}</td><td>${esc(r.label)}</td><td>${fmtTime(r.created)}</td>
-        <td>${r.readonly ? "ja" : "nein"}</td><td>${esc(r.container || "–")}</td>
-        <td class="num" data-usage="${esc(r.path)}">${r.usage ? fmtBytes(r.usage.exclusive) : `<button class="quiet small" data-act="usage" data-path="${esc(r.path)}">ermitteln</button>`}</td>
-        <td class="path">${esc(r.path)}</td></tr>`).join("")}</tbody>
+        <td class="nw">${esc(r.kind)}</td><td class="nw">${esc(r.sid)}</td><td class="namecell">${esc(r.label)}${detectedCell(r)}</td><td class="nw">${fmtTime(r.created)}</td>
+        <td class="nw">${r.readonly ? "ja" : "nein"}</td><td class="nw">${esc(r.container || "–")}${r.container && !r.container_running ? ' <span class="muted-note">(gestoppt)</span>' : ""}</td>
+        <td class="num nw">${usageCell(r)}</td>${snapMeta.compsize ? `<td class="num nw">${diskCell(r)}</td>` : ""}
+        <td class="path">${esc(r.path)}</td><td><div class="acts">${snapActions(r)}</div></td></tr>`).join("")}</tbody>
     </table></div>
-    ${rows.some(r => r.kind === "Sonstiges Subvolume") ? `<p style="color:var(--muted)">„Sonstiges Subvolume“: liegt unter <code>master/</code>, hat aber keinen gültigen SID-Namen (z. B. <code>DLHTEST.neu</code> oder <code>.alt</code> beim Umkopieren für die Kompression). Daraus entsteht keine Datenbank; nach dem Umbenennen bzw. Löschen verschwindet der Eintrag.</p>` : ""}
-    ${rows.some(r => r.kind === "Zwischenstand") ? `<p style="color:var(--muted)">Zwischenstände bleiben nur zurück, wenn ein Release-Vorgang hart abgebrochen wurde. Löschen mit <code>btrfs subvolume delete &lt;Pfad&gt;</code>, sobald kein Vorgang mehr läuft.</p>` : ""}`;
+    ${rows.some(r => r.kind === "Sonstiges Subvolume") ? `<p style="color:var(--muted)">„Sonstiges Subvolume“: liegt unter <code>master/</code>, hat aber keinen gültigen SID-Namen (z. B. <code>DLHTEST.neu</code> oder <code>.alt</code> beim Umkopieren). Enthält es eine vollständige Datenbank, lässt es sich als Master-DB übernehmen.</p>` : ""}
+    <p style="color:var(--muted)">Subvolumes von einer anderen zeitkapsel-Instanz oder per <code>btrfs send</code>/<code>receive</code> legst du unter <code>${esc(snapMeta.import_dir || "/srv/oradb/import")}</code> ab; sie erscheinen hier als „Import“ und lassen sich, wenn sie eine Datenbank enthalten, als Master-DB übernehmen. Die Quelle bleibt dabei erhalten.</p>`;
 }
 
 function renderJobs() {
@@ -1522,15 +1566,44 @@ document.addEventListener("click", async ev => {
         openJobs.has(b.dataset.id) ? openJobs.delete(b.dataset.id) : openJobs.add(b.dataset.id);
         await loadJobLogs(); renderJobs();
         break;
-      case "usage": {
-        b.disabled = true; b.textContent = "läuft …";
-        const u = await api("GET", "/api/usage?path=" + encodeURIComponent(b.dataset.path));
-        const row = snapRows.find(r => r.path === b.dataset.path); if (row) row.usage = u;
-        render();
+      case "sv-del": {
+        const isMaster = b.dataset.kind === "Master-DB";
+        let confirmName = "";
+        if (isMaster) {
+          confirmName = prompt(`Master-DB „${b.dataset.name}“ endgültig löschen?\n\nDie Datenbank und ihr gestoppter Container werden entfernt. Releases und Entwickler-DBs bleiben erhalten.\n\nZur Bestätigung den Namen eingeben:`) || "";
+          if (confirmName !== b.dataset.name) { if (confirmName) toast("Name stimmt nicht – nichts gelöscht."); return; }
+        } else if (!confirm(`Subvolume „${b.dataset.name}“ endgültig löschen?\n\n${b.dataset.path}`)) return;
+        await api("DELETE", "/api/subvolume?path=" + encodeURIComponent(b.dataset.path) + (isMaster ? "&confirm=" + encodeURIComponent(confirmName) : ""));
+        toast("Subvolume gelöscht"); await loadSnapshots(); await refresh();
+        break;
+      }
+      case "sv-del-release": {
+        if (!confirm(`Release „${b.dataset.name}“ von ${b.dataset.sid} löschen?\n\nEntwickler-DBs, die darauf basieren, behalten ihre Daten.`)) return;
+        await api("DELETE", `/api/db/${encodeURIComponent(b.dataset.sid)}/releases/${encodeURIComponent(b.dataset.name)}`);
+        toast("Release gelöscht"); await loadSnapshots(); await refresh();
+        break;
+      }
+      case "sv-del-dev":
+        if (!confirm(`Entwickler-DB „${b.dataset.id}“ löschen?\n\nContainer, Daten, Data-Pump-Verzeichnis und ihre Snapshots werden entfernt.`)) return;
+        startedJob(await api("DELETE", `/api/devdbs/${encodeURIComponent(b.dataset.id)}`)); await refresh();
+        setTimeout(() => loadSnapshots(), 4000);
+        break;
+      case "sv-del-devsnap":
+        if (!confirm(`Snapshot „${b.dataset.snap}“ von ${b.dataset.id} löschen?`)) return;
+        await api("DELETE", `/api/devdbs/${encodeURIComponent(b.dataset.id)}/snapshots/${encodeURIComponent(b.dataset.snap)}`);
+        toast("Snapshot gelöscht"); await loadSnapshots(); await refresh();
+        break;
+      case "sv-adopt": {
+        const used = new Set((S ? S.dbs : []).map(d => d.master.port));
+        let p = 1521; while (used.has(p)) p++;
+        const port = +prompt(`Datenbank ${b.dataset.sid} als Master-DB übernehmen und starten.\n\nPort:`, String(p));
+        if (!port) return;
+        startedJob(await api("POST", "/api/subvolume/adopt?path=" + encodeURIComponent(b.dataset.path), { port }));
+        await refresh(); setTimeout(() => loadSnapshots(), 4000);
         break;
       }
       case "snap-reload":
-        snapRows = null; render(); await loadSnapshots();
+        snapRows = null; render(); await loadSnapshots(true);
         break;
     }
   } catch (e) { toast(e.message); }
@@ -1550,6 +1623,7 @@ setInterval(async () => {
   if (!document.querySelector("dialog[open]")) {
     if (view.kind === "admin") await loadAdmin();
     if (view.kind === "access") await loadAccess(true);
+    if (view.kind === "snapshots" && snapRows && snapRows.some(r => r.usage_pending)) await loadSnapshots();
     await refresh();
   }
 }, 5000);

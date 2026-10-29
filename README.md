@@ -115,6 +115,14 @@ Jedes DB-Subvolume enthält die Markierungsdateien, ohne die das Startskript des
 
 Weil die Datei im Subvolume liegt, wandert sie mit jedem Release und jeder Entwickler-DB mit; Oberfläche und Skripte setzen die Angaben bei jedem `docker run` um.
 
+## Alle Snapshots: Platz, Löschen, Übernehmen
+
+Die Seite „Alle Snapshots“ listet jedes Subvolume eines Hosts. Der Platz wird im Hintergrund ermittelt und eine Viertelstunde zwischengespeichert (`ZK_USAGE_MAX_AGE`, Sekunden): „Exklusiv“ (`btrfs filesystem du`, ohne Kompression gezählt) ist der Platz, der beim Löschen frei würde; „Auf Platte“ (`compsize`, wenn installiert) der tatsächlich belegte Platz nach Kompression.
+
+Löschen geht für jede Art direkt in der Tabelle: Releases, Entwickler-DBs und ihre Snapshots über dieselben Aktionen wie in der Datenbank-Ansicht (Benutzer für die eigenen Entwickler-DBs), Master-DBs, Zwischenstände, importierte und sonstige Subvolumes nur für Administratoren. Eine Master-DB lässt sich nur löschen, wenn ihr Container nicht läuft, und nur nach Eingabe ihres Namens; ihr gestoppter Container wird mit entfernt, Releases und Entwickler-DBs bleiben.
+
+Subvolumes von einer anderen zeitkapsel-Instanz (z. B. per `btrfs send | ssh … btrfs receive /srv/oradb/import`) gehören nach `/srv/oradb/import/`. zeitkapsel prüft dort – und bei sonstigen Subvolumes unter `master/` –, ob sie eine Datenbank in seiner Ablage enthalten (Markierungsdatei `.<SID>.created` oder `dbconfig/<SID>/`, Datendateien, spfile, Passwortdatei). Ist sie vollständig und gibt es noch keine Master-DB gleichen Namens, übernimmt „Als Master-DB übernehmen“ sie: als beschreibbarer Snapshot unter `master/<SID>` (ein beschreibbares sonstiges Subvolume unter `master/` wird einfach umbenannt), fehlende Markierungs- und Netzwerkdateien werden ergänzt, dann startet die DB mit dem gewählten Port. Die Quelle bleibt erhalten.
+
 ## Kompression
 
 zeitkapsel lässt Copy-on-Write eingeschaltet, damit die Kompression des Dateisystems (`compress` bzw. `compress-force` in den Mount-Optionen) auch für die Datenbankdateien greift. btrfs komprimiert nur Dateien mit Copy-on-Write; Dateien mit dem NOCOW-Attribut (`chattr +C`) werden unkomprimiert und ohne Prüfsummen gespeichert.

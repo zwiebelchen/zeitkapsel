@@ -86,6 +86,7 @@ DEV = BASE / "dev"
 BUILD = BASE / "build"
 DEVDUMPS = BASE / "devdumps"
 DEVSNAPS = BASE / "devsnaps"
+IMPORT = BASE / "import"      # Ablage für Subvolumes von anderswo (btrfs receive, Kopie einer anderen Instanz)
 META = BASE / "meta"
 
 bp = Blueprint("agent", __name__, url_prefix="/agent")
@@ -1534,45 +1535,260 @@ def api_admin_cleanup():
     return jsonify(removed=len(lo["builds"]) + len(lo["containers"]))
 
 
+# --------------------------------------------------------------------------- Platzermittlung im Hintergrund
+USAGE_MAX_AGE = int(env("USAGE_MAX_AGE", "900"))
+_usage: dict[str, dict] = {}
+_usage_pending: list[str] = []
+_usage_lock = threading.Lock()
+_usage_event = threading.Event()
+
+
+def compute_usage(path: str) -> dict:
+    out: dict = {"ts": time.time()}
+    p = sh(["btrfs", "filesystem", "du", "-s", "--raw", path], check=False, timeout=3600)
+    if p.returncode == 0 and p.stdout.strip():
+        cols = p.stdout.strip().splitlines()[-1].split()
+        nums = [int(x) if x.isdigit() else None for x in cols[:3]]
+        out.update(total=nums[0], exclusive=nums[1], shared=nums[2])
+    else:
+        out["error"] = (p.stderr or p.stdout).strip()[-200:] or "btrfs filesystem du fehlgeschlagen"
+    if shutil.which("compsize"):
+        c = sh(["compsize", "-b", path], check=False, timeout=3600)
+        for line in c.stdout.splitlines():
+            parts = line.split()
+            if parts[:1] == ["TOTAL"] and len(parts) >= 5 and parts[2].isdigit():
+                out.update(disk=int(parts[2]), uncompressed=int(parts[3]), referenced=int(parts[4]))
+    return out
+
+
+def usage_worker() -> None:
+    while True:
+        _usage_event.wait(60)
+        _usage_event.clear()
+        while True:
+            with _usage_lock:
+                if not _usage_pending:
+                    break
+                path = _usage_pending.pop(0)
+            if not os.path.isdir(path):
+                continue
+            try:
+                result = compute_usage(path)
+            except Exception as e:  # noqa: BLE001
+                result = {"ts": time.time(), "error": str(e)}
+            with _usage_lock:
+                _usage[path] = result
+
+
+def usage_get(path: str, force: bool = False) -> tuple[dict | None, bool]:
+    """Liefert den zuletzt ermittelten Platz und ob gerade (neu) ermittelt wird."""
+    with _usage_lock:
+        u = _usage.get(path)
+        stale = force or u is None or time.time() - u["ts"] > USAGE_MAX_AGE
+        if stale and path not in _usage_pending:
+            _usage_pending.append(path)
+            _usage_event.set()
+        return u, path in _usage_pending
+
+
+def usage_forget(path: str) -> None:
+    with _usage_lock:
+        _usage.pop(path, None)
+
+
+# --------------------------------------------------------------------------- Datenbanken in fremden Subvolumes erkennen
+def detect_db(vol: Path) -> dict | None:
+    """Sucht im Wurzelverzeichnis eines Subvolumes eine Datenbank in der Ablage von zeitkapsel."""
+    try:
+        sids = sorted({p.name[1:-len(".created")] for p in vol.glob(".*.created")})
+        if not sids and (vol / "dbconfig").is_dir():
+            sids = sorted(p.name for p in (vol / "dbconfig").iterdir() if p.is_dir())
+    except OSError:
+        return None
+    if not sids:
+        return None
+    if len(sids) > 1:
+        return dict(sid=None, sids=sids, ok=False, problems=["mehrere Datenbanken in einem Subvolume (" + ", ".join(sids) + ")"], fixes=[])
+    sid = sids[0]
+    problems, fixes = [], []
+    if not RE_SID.match(sid):
+        problems.append(f"ungültige SID „{sid}“")
+    if not any((vol / sid).glob("*.dbf")):
+        problems.append(f"keine Datendateien in {sid}/")
+    for f in (f"spfile{sid}.ora", f"orapw{sid}"):
+        if not (vol / "dbconfig" / sid / f).exists():
+            problems.append(f"dbconfig/{sid}/{f} fehlt")
+    if not (vol / f".{sid}.created").exists():
+        fixes.append(f"Markierungsdatei .{sid}.created anlegen")
+    if not list((vol / "dbconfig" / sid).glob(".docker_*")):
+        fixes.append("Markierungsdatei .docker_enterprise anlegen")
+    for name in ("listener.ora", "sqlnet.ora", "tnsnames.ora", "oratab"):
+        if not (vol / "dbconfig" / sid / name).exists():
+            fixes.append(f"dbconfig/{sid}/{name} anlegen")
+    e = read_volume_env(vol)
+    return dict(sid=sid, sids=sids, ok=not problems, problems=problems, fixes=fixes,
+                type=e.get("ZK_DB_TYPE", ""), service=e.get("ZK_SERVICE") or e.get("ZK_PDB") or sid,
+                exists=(MASTER / sid).exists())
+
+
+def classify_subvolume(path: Path) -> str | None:
+    parent = path.parent
+    if parent == MASTER:
+        return "master" if RE_SID.match(path.name) else "other"
+    if parent == BUILD:
+        return "build"
+    if parent == IMPORT:
+        return "import"
+    return None
+
+
+def job_adopt(job: Job, src: Path, port: int) -> None:
+    det = detect_db(src)
+    if not det or not det["ok"]:
+        raise RuntimeError("Keine startbare Datenbank: " + "; ".join((det or {}).get("problems", ["nichts gefunden"])))
+    sid = det["sid"]
+    dst = MASTER / sid
+    if dst.exists():
+        raise RuntimeError(f"Eine Master-DB {sid} gibt es auf diesem Host schon; erst die vorhandene löschen oder umbenennen.")
+    if port_in_use(port, containers()):
+        raise RuntimeError(f"Port {port} ist belegt.")
+    info = subvol_info(src) or {}
+    if src.parent == MASTER and not info.get("readonly"):
+        job.log(f"{src.name} → {sid} umbenennen")
+        job.run(["mv", str(src), str(dst)])
+        sv_forget(src)
+        usage_forget(str(src))
+    else:
+        job.log(f"Beschreibbaren Snapshot von {src} als Master-DB {sid} anlegen (die Quelle bleibt erhalten)")
+        job.run(["btrfs", "subvolume", "snapshot", str(src), str(dst)])
+    cfg = dst / "dbconfig" / sid
+    if not (dst / f".{sid}.created").exists():
+        (dst / f".{sid}.created").touch()
+    if not list(cfg.glob(".docker_*")):
+        (cfg / ".docker_enterprise").touch()
+    for name, text in NET_FILES.items():
+        if not (cfg / name).exists():
+            (cfg / name).write_text(text)
+    if not (cfg / "tnsnames.ora").exists():
+        (cfg / "tnsnames.ora").write_text(
+            f"{sid} = (DESCRIPTION = (ADDRESS = (PROTOCOL = TCP)(HOST = localhost)(PORT = 1521))\n"
+            f"          (CONNECT_DATA = (SERVICE_NAME = {det['service']})))\n")
+    if not (cfg / "oratab").exists():
+        (cfg / "oratab").write_text(f"{sid}:/opt/oracle/product/19c/dbhome_1:N\n")
+    job.run(["chown", "-R", f"{ORACLE_UID}:{ORACLE_UID}", str(dst)])
+    db_meta_update(sid, port=port, origin=f"übernommen aus {src}", created=now_iso())
+    tl_add(sid, "db-adopted", f"Datenbank {sid} aus {src} übernommen")
+    job_master_start(job, sid, port)
+
+
+# --------------------------------------------------------------------------- Routen: Subvolumes
 @bp.get("/api/snapshots")
 def api_snapshots():
-    by_mount = {c["mount"]: c["name"] for c in containers() if c["mount"]}
+    cs = containers()
+    by_mount = {c["mount"]: c for c in cs if c["mount"]}
+    devs = {d["id"]: d for d in devdbs(cs)}
+    force = request.args.get("refresh") == "1"
     rows = []
 
-    def add(kind, sid, label, p):
+    def add(kind, sid, label, p, **extra):
         info = subvol_info(p)
         if info is None:
             return
+        c = by_mount.get(os.path.realpath(p))
+        u, pending = usage_get(str(p), force)
         rows.append(dict(kind=kind, sid=sid, label=label, path=str(p), created=info["created"],
-                         readonly=info["readonly"], container=by_mount.get(os.path.realpath(p))))
+                         readonly=info["readonly"], container=c["name"] if c else None,
+                         container_running=bool(c and c["running"]), usage=u, usage_pending=pending, **extra))
 
     for p in sorted(MASTER.glob("*")):
         if RE_SID.match(p.name):
-            add("Master-DB", p.name, p.name, p)
-        else:   # z. B. DLHTEST.neu/.alt beim Umkopieren: keine Datenbank, nur ein Subvolume
-            add("Sonstiges Subvolume", p.name.split(".")[0], p.name, p)
+            add("Master-DB", p.name, p.name, p, delete="subvolume")
+        else:   # z. B. DLHTEST.neu/.alt beim Umkopieren
+            add("Sonstiges Subvolume", p.name.split(".")[0], p.name, p, delete="subvolume", detected=detect_db(p))
+    for p in sorted(IMPORT.glob("*")):
+        det = detect_db(p)
+        add("Import", det["sid"] if det and det.get("sid") else "–", p.name, p, delete="subvolume", detected=det)
     for p in sorted(GOLDEN.glob("*/*")):
-        add("Release", p.parent.name, p.name, p)
+        add("Release", p.parent.name, p.name, p, delete="release", release=p.name)
     for p in sorted(DEV.glob("*")):
-        add("Entwickler-DB", p.name.partition("-")[0], p.name.partition("-")[2], p)
+        d = devs.get(p.name, {})
+        add("Entwickler-DB", p.name.partition("-")[0], p.name.partition("-")[2], p, delete="devdb",
+            dev_id=p.name, owner=d.get("owner", ""))
     for p in sorted(DEVSNAPS.glob("*/*")):
-        add("Entwickler-Snapshot", p.parent.name.partition("-")[0],
-            f"{p.parent.name.partition('-')[2]} / {p.name}", p)
+        d = devs.get(p.parent.name, {})
+        add("Entwickler-Snapshot", p.parent.name.partition("-")[0], f"{p.parent.name.partition('-')[2]} / {p.name}", p,
+            delete="devsnap", dev_id=p.parent.name, snap=p.name, owner=d.get("owner", ""))
     for p in sorted(BUILD.glob("*")):
-        add("Zwischenstand", p.name.partition("-")[0], p.name, p)
-    return jsonify(rows)
+        add("Zwischenstand", p.name.partition("-")[0], p.name, p, delete="subvolume")
+    return jsonify(rows=rows, compsize=bool(shutil.which("compsize")), import_dir=str(IMPORT))
 
 
 @bp.get("/api/usage")
 def api_usage():
     path = os.path.realpath(request.args.get("path", ""))
-    roots = [os.path.realpath(r) for r in (MASTER, GOLDEN, DEV, DEVSNAPS, BUILD)]
+    roots = [os.path.realpath(r) for r in (MASTER, GOLDEN, DEV, DEVSNAPS, BUILD, IMPORT)]
     if not any(path.startswith(r + os.sep) for r in roots) or subvol_info(Path(path)) is None:
         raise UserError("Ungültiger Pfad.")
-    p = sh(["btrfs", "filesystem", "du", "-s", "--raw", path], timeout=900)
-    cols = p.stdout.strip().splitlines()[-1].split()
-    nums = [int(x) if x.isdigit() else None for x in cols[:3]]
-    return jsonify(total=nums[0], exclusive=nums[1], shared=nums[2])
+    u, pending = usage_get(path, force=True)
+    return jsonify(usage=u, pending=pending)
+
+
+def resolve_subvolume_arg() -> tuple[Path, str]:
+    path = Path(os.path.realpath(request.args.get("path", "")))
+    kind = classify_subvolume(path)
+    if kind is None or subvol_info(path) is None:
+        raise UserError("Dieses Subvolume lässt sich hier nicht verwalten (Releases und Entwickler-DBs über ihre eigenen Aktionen).")
+    return path, kind
+
+
+@bp.delete("/api/subvolume")
+def api_subvolume_delete():
+    path, kind = resolve_subvolume_arg()
+    cs = containers()
+    users = [c for c in cs if c["mount"] == str(path)]
+    if any(c["running"] for c in users):
+        raise UserError(f"Das Subvolume wird vom laufenden Container {users[0]['name']} benutzt; erst stoppen.")
+    if users and kind != "master":
+        raise UserError(f"Das Subvolume gehört zum Container {users[0]['name']}; erst den Container entfernen.")
+    if kind == "master":
+        sid = path.name
+        if request.args.get("confirm") != sid:
+            raise UserError(f"Zum Löschen einer Master-DB den Namen {sid} zur Bestätigung angeben.")
+        with _lock:
+            busy = [k for k in _busy if k.split(":", 1)[-1] == sid]
+        if busy:
+            raise UserError("Für diese Datenbank läuft gerade ein Vorgang.")
+        for c in users:
+            sh(["docker", "rm", c["name"]])
+    if kind == "build":
+        with _lock:
+            if f"release:{path.name.partition('-')[0]}" in _busy:
+                raise UserError("Gerade läuft ein Release-Vorgang für diese Datenbank.")
+    sh(["btrfs", "subvolume", "delete", str(path)])
+    sv_forget(path)
+    usage_forget(str(path))
+    if kind == "master":
+        db_meta_file(path.name).unlink(missing_ok=True)
+        tl_add(path.name, "master-deleted", f"Master-DB {path.name} gelöscht (Releases und Entwickler-DBs bleiben)")
+    return jsonify(ok=True)
+
+
+@bp.post("/api/subvolume/adopt")
+def api_subvolume_adopt():
+    path, kind = resolve_subvolume_arg()
+    if kind not in ("other", "import", "build"):
+        raise UserError("Nur sonstige oder importierte Subvolumes lassen sich übernehmen.")
+    det = detect_db(path)
+    if not det or not det["ok"]:
+        raise UserError("Keine startbare Datenbank gefunden: " + "; ".join((det or {}).get("problems", ["keine Markierungen"])))
+    if det["exists"]:
+        raise UserError(f"Eine Master-DB {det['sid']} gibt es auf diesem Host schon; erst die vorhandene löschen.")
+    port = int((request.get_json(silent=True) or {}).get("port") or 0)
+    if not 1024 <= port <= 65535:
+        raise UserError("Port: 1024 bis 65535.")
+    job = start_job(f"Datenbank {det['sid']} aus {path.name} übernehmen", det["sid"], f"adopt:{det['sid']}",
+                    job_adopt, path, port)
+    return jsonify(job=job.as_dict())
 
 
 # --------------------------------------------------------------------------- Speicher: Kompression und NOCOW
@@ -2157,6 +2373,7 @@ def start_agent() -> None:
         raise SystemExit("ZK_AGENT_TOKEN ist nicht gesetzt – Agent kann nicht starten.")
     if os.geteuid() != 0:
         log.warning("Agent läuft nicht als root; btrfs- und docker-Befehle werden scheitern.")
-    for d in (MASTER, GOLDEN, DEV, DEVSNAPS, BUILD, DEVDUMPS, META):
+    for d in (MASTER, GOLDEN, DEV, DEVSNAPS, BUILD, DEVDUMPS, IMPORT, META):
         d.mkdir(parents=True, exist_ok=True)
     threading.Thread(target=scheduler_loop, daemon=True, name="zeitplaner").start()
+    threading.Thread(target=usage_worker, daemon=True, name="platzermittlung").start()
