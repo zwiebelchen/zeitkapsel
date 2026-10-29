@@ -176,6 +176,17 @@ Voraussetzungen auf der Quelle:
 
 Ablauf: Schritt 1 liest Version, Dateien, Parameter und plant den Import (Verzeichnisse, Zusatz-Mounts, Shared Memory, Service-Name, Hinweise). Schritt 2 fährt die Quelle sauber herunter, legt das Subvolume an, kopiert genau die Dateien der DB per `rsync`, holt spfile und Passwortdatei, schreibt Netzwerk-Konfiguration und Markierungsdateien und startet die DB als Master-DB. Liegen die Dateien auf der Quelle nicht unter `/opt/oracle/oradata/<SID>`, werden sie im Container zusätzlich unter ihrem alten Pfad eingehängt, sodass spfile und Controlfiles unverändert passen. Mit „Quell-DB nach dem Kopieren wieder starten“ ist es eine Kopie, ohne ist es ein Umzug. Geht etwas schief, wird die Quelle wieder gestartet und das halbfertige Subvolume entfernt. Ist das Image neuer als die Quelle, läuft danach `datapatch`.
 
+
+## Import aus einem Verzeichnis auf dem Host
+
+„Datenbank importieren“ → „Verzeichnis auf diesem Host“ übernimmt eine heruntergefahrene Datenbank, deren Dateien irgendwo im Dateisystem liegen – zum Beispiel noch in der Ablage eines früheren Oracle-Containers unter `/srv/oradata` (mit `<SID>/` und `dbconfig/<SID>/`) oder einfach als Verzeichnis mit Datendateien.
+
+Die Prüfung startet die DB nicht. Sie sucht spfile und Passwortdatei (angegebener Pfad, sonst `dbconfig/<SID>/` und das Datenverzeichnis), liest aus der spfile `control_files` und weitere Parameter, aus der Controlfile die Pfade der Daten-, Temp- und Redo-Dateien, und ordnet sie dem Datenverzeichnis bzw. weiteren Verzeichnissen zu. Läuft auf dem Host noch eine Instanz dieser SID oder ein Container auf dem Verzeichnis, wird abgebrochen.
+
+Fehlt die spfile, fragt der Dialog, ob eine neue angelegt werden soll – aus einer gefundenen pfile oder, wenn es keine gibt, aus Mindestangaben (DB-Name, Blockgröße, Undo-Tablespace, Speicher). Fehlt die Passwortdatei, fragt er nach einem neuen SYS-Passwort und legt sie mit `orapwd` an. Ohne Zustimmung läuft der Import nicht.
+
+Der Import legt unter `master/<SID>` ein neues Subvolume an (mit Kompression, siehe „Kompression“), kopiert die Dateien hinein, schreibt Netzwerk-Konfiguration, Markierungsdateien und `zeitkapsel.env` (Zusatz-Mounts für Dateien, die in der DB unter anderen Pfaden stehen) und startet die Kopie einmal in einem Wegwerf-Container (`startup`, Abfragen, `shutdown immediate`). Nur wenn sie dabei sauber öffnet, wird sie zur Master-DB und danach per `datapatch` auf den Patch-Stand des Images gebracht; sonst wird das neue Subvolume wieder entfernt und die Oracle-Fehlermeldung angezeigt. Die Quelle wird in keinem Fall verändert.
+
 ## Der Baum in der Timeline
 
 Der Stamm zeigt die Releases, die aus der Master-DB entstanden sind, neueste oben. An jedem Release

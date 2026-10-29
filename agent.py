@@ -343,7 +343,7 @@ class Job:
         self.lines.append(f"{time.strftime('%H:%M:%S')}  {msg}")
         del self.lines[:-500]
 
-    def run(self, cmd: list[str], secret: str | None = None, quiet: bool = False,
+    def run(self, cmd: list[str], secret: str | None = None, quiet: bool = False, allow_fail: bool = False,
             **kw) -> subprocess.CompletedProcess:
         mask = (lambda t: t.replace(secret, "***")) if secret else (lambda t: t)
         self.log("$ " + mask(" ".join(cmd)))
@@ -351,7 +351,7 @@ class Job:
         lines = (p.stdout + p.stderr).strip().splitlines()
         for line in (lines[-30:] if not quiet or p.returncode else []):
             self.log("  " + mask(line))
-        if p.returncode != 0:
+        if p.returncode != 0 and not allow_fail:
             raise RuntimeError(f"„{' '.join(cmd[:3])} …“ ist mit Exit-Code {p.returncode} fehlgeschlagen.")
         return p
 
@@ -2363,6 +2363,366 @@ def api_import():
         raise UserError(f"Eine Datenbank {src['sid']} gibt es auf diesem Host schon.")
     job = start_job(f"Datenbank {src['sid']} von {src['host']} importieren", src["sid"], f"import:{src['sid']}",
                     job_import, src, port, bool(data.get("restart_source")))
+    return jsonify(job=job.as_dict())
+
+
+# --------------------------------------------------------------------------- Import aus einem Verzeichnis auf diesem Host
+DB_FILE_RE = re.compile(rb"(/[A-Za-z0-9_.+/-]{2,400}\.(?:dbf|DBF|log|LOG|rdo|RDO|tmp|TMP|ctl|CTL))")
+
+
+def read_param_file(path: Path) -> dict[str, str]:
+    """Parameter aus einer spfile (binär mit Textzeilen) oder pfile lesen: *.name=wert bzw. name=wert."""
+    out: dict[str, str] = {}
+    try:
+        text = path.read_bytes().decode("latin-1")
+    except OSError:
+        return out
+    for raw in re.split(r"[\x00\n\r]", text):
+        line = re.sub(r"[\x01-\x08\x0b-\x1f\x7f-\x9f]+", " ", raw)
+        if line.lstrip().startswith("#"):
+            continue
+        # spfile: *.name=wert bzw. SID.name=wert, auch hinter Binärresten; pfile: name=wert
+        m = (re.search(r"\*\.([A-Za-z_]\w*)\s*=\s*(.+?)\s*$", line)
+             or re.match(r"^\s*[A-Za-z0-9_]+\.([A-Za-z_]\w*)\s*=\s*(.+?)\s*$", line)
+             or re.match(r"^\s*([A-Za-z_]\w*)\s*=\s*(.+?)\s*$", line))
+        if m:
+            out.setdefault(m.group(1).lower(), m.group(2))
+    return out
+
+
+def quoted_list(value: str) -> list[str]:
+    items = re.findall(r"'([^']+)'", value or "")
+    return items or [v.strip() for v in (value or "").split(",") if v.strip()]
+
+
+def controlfile_paths(ctl: Path) -> list[str]:
+    """Pfade von Daten-, Temp- und Redo-Dateien aus einer Controlfile (Textstellen im Binärformat)."""
+    try:
+        data = ctl.read_bytes()
+    except OSError:
+        return []
+    seen, out = set(), []
+    for m in DB_FILE_RE.finditer(data):
+        p = m.group(1).decode("latin-1")
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def instance_running(sid: str) -> bool:
+    return sh(["pgrep", "-f", f"ora_pmon_{sid}$"], check=False).returncode == 0
+
+
+def validate_local(data: dict) -> dict:
+    src = dict(path=(data.get("path") or "").strip().rstrip("/"), sid=(data.get("sid") or "").strip().upper(),
+               spfile=(data.get("spfile") or "").strip(), orapw=(data.get("orapw") or "").strip())
+    if not RE_ABSPATH.match(src["path"] or "x"):
+        raise UserError("Verzeichnis: absoluter Pfad.")
+    for k in ("spfile", "orapw"):
+        if src[k] and not RE_ABSPATH.match(src[k]):
+            raise UserError(f"{k}: absoluter Pfad.")
+    if not RE_SID.match(src["sid"]):
+        raise UserError("SID ungültig.")
+    real = os.path.realpath(src["path"])
+    for managed in (MASTER, GOLDEN, DEV, DEVSNAPS, BUILD):
+        m = os.path.realpath(managed)
+        if real == m or real.startswith(m + os.sep):
+            raise UserError("Das Verzeichnis gehört zur Ablage von zeitkapsel; dafür „Als Master-DB übernehmen“ in „Alle Snapshots“ nutzen.")
+    return src
+
+
+def probe_local(src: dict) -> dict:
+    """Plant den Import einer DB aus einem Verzeichnis auf diesem Host (ohne die DB zu starten)."""
+    sid, base = src["sid"], Path(src["path"])
+    problems, warnings = [], []
+    if not base.is_dir():
+        raise UserError(f"{base} gibt es nicht oder ist kein Verzeichnis.")
+    # Datenverzeichnis: entweder das angegebene oder <angegeben>/<SID> (Ablage eines Oracle-Containers)
+    data_dir = base / sid if (base / sid).is_dir() else base
+    cfg_dirs = [base / "dbconfig" / sid, data_dir.parent / "dbconfig" / sid, data_dir, base]
+
+    def find(explicit: str, names: list[str]) -> Path | None:
+        if explicit:
+            return Path(explicit) if Path(explicit).is_file() else None
+        for d in cfg_dirs:
+            for n in names:
+                if (d / n).is_file():
+                    return d / n
+        return None
+
+    spfile = find(src["spfile"], [f"spfile{sid}.ora", "spfile.ora"])
+    pfile = None if spfile else find("", [f"init{sid}.ora", "init.ora", "pfile.ora"])
+    orapw = find(src["orapw"], [f"orapw{sid}", "orapw"])
+    if src["spfile"] and not spfile:
+        problems.append(f"Die angegebene spfile {src['spfile']} gibt es nicht.")
+    if src["orapw"] and not orapw:
+        problems.append(f"Die angegebene Passwortdatei {src['orapw']} gibt es nicht.")
+    params = read_param_file(spfile or pfile) if (spfile or pfile) else {}
+
+    # Controlfiles: aus den Parametern, sonst alle *.ctl im Datenverzeichnis
+    db_ctl = quoted_list(params.get("control_files", ""))
+    host_ctl_guess = sorted(str(p) for p in data_dir.rglob("*.ctl")) + sorted(str(p) for p in data_dir.rglob("*.CTL"))
+
+    # DB-Pfad (wie in spfile/Controlfile) → Pfad auf dem Host: Wurzel suchen, unter der die Dateien liegen
+    def find_root(db_paths: list[str]) -> str | None:
+        for p in db_paths:
+            d = os.path.dirname(p)
+            for _ in range(4):
+                if (data_dir / os.path.relpath(p, d)).exists():
+                    return d
+                d = os.path.dirname(d)
+        return None
+
+    first_ctl_host = None
+    if db_ctl:
+        db_root = find_root(db_ctl)
+        for c in db_ctl:
+            h = (data_dir / os.path.relpath(c, db_root)) if db_root and (c + "/").startswith(db_root + "/") else Path(c)
+            if h.exists():
+                first_ctl_host = first_ctl_host or h
+    else:
+        db_root = None
+        first_ctl_host = Path(host_ctl_guess[0]) if host_ctl_guess else None
+    db_files = controlfile_paths(first_ctl_host) if first_ctl_host else []
+    if not db_root:
+        db_root = find_root([p for p in db_files if p.lower().endswith(".dbf")] + db_ctl)
+    if not first_ctl_host:
+        problems.append("Keine Controlfile gefunden.")
+    if not db_root:
+        problems.append(f"Die Dateien der Datenbank liegen nicht unter {data_dir}.")
+        db_root = f"/opt/oracle/oradata/{sid}"
+
+    # Zuordnung: alles unter db_root kommt nach <SID>/, Dateien außerhalb (sofern auf dem Host vorhanden) nach _extra/<n>
+    mapping = [dict(src=str(data_dir), rel=sid, db_path=db_root, files=None)]
+    extra: dict[str, list[str]] = {}
+    missing = []
+    for p in db_ctl + db_files:
+        if (p + "/").startswith(db_root + "/"):
+            if not (data_dir / os.path.relpath(p, db_root)).exists():
+                missing.append(p)
+        elif os.path.exists(p):
+            extra.setdefault(os.path.dirname(p), []).append(os.path.basename(p))
+        else:
+            missing.append(p)
+    for i, (d, files) in enumerate(sorted(extra.items()), 1):
+        mapping.append(dict(src=d, rel=f"_extra/{i}", db_path=d, files=sorted(set(files))))
+    if missing:
+        warnings.append(f"{len(missing)} in der Controlfile genannte Dateien fehlen (z. B. {missing[0]}); "
+                        "das können alte Einträge sein – der Prüfstart zeigt, ob die DB trotzdem öffnet.")
+    mounts = [f"{m['rel']}:{m['db_path']}" for m in mapping if m["db_path"] != f"/opt/oracle/oradata/{sid}"]
+    audit = params.get("audit_file_dest", "").strip("'\"")
+    if audit and audit != f"/opt/oracle/admin/{sid}/adump":
+        mounts.append(f"_audit:{audit}")
+    mt = params.get("memory_target", "0").strip("'\"")
+    mt_bytes = parse_size(mt)
+    shm = f"{math.ceil(mt_bytes * 1.15 / 1024 ** 3)}g" if mt_bytes > 0 else ""
+    if shm:
+        warnings.append(f"AMM aktiv (memory_target {mt}); Container bekommen --shm-size {shm}.")
+    size = sum(f.stat().st_size for f in data_dir.rglob("*") if f.is_file()) + \
+        sum(os.path.getsize(os.path.join(m["src"], f)) for m in mapping[1:] for f in m["files"])
+
+    # Läuft die Quelle noch?
+    if instance_running(sid):
+        problems.append(f"Auf diesem Host läuft eine Instanz {sid} (nativ oder in einem Container); vorher sauber herunterfahren.")
+    real = os.path.realpath(base)
+    for c in containers():
+        if c["running"] and c["mount"] and (c["mount"] == real or real.startswith(c["mount"] + os.sep)
+                                             or c["mount"].startswith(real + os.sep)):
+            problems.append(f"Der Container {c['name']} benutzt das Verzeichnis und läuft noch.")
+    if (MASTER / sid).exists():
+        problems.append(f"Auf diesem Host gibt es bereits eine Master-DB {sid}.")
+
+    needs = {}
+    if not spfile:
+        needs["spfile"] = "pfile" if pfile else "minimal"
+        warnings.append(f"Keine spfile gefunden; sie wird aus {pfile} erzeugt." if pfile else
+                        "Weder spfile noch pfile gefunden; eine neue lässt sich nur aus Mindestangaben erzeugen "
+                        "(DB-Name, Blockgröße, Undo-Tablespace, Speicher).")
+    if not orapw:
+        needs["orapw"] = True
+        warnings.append("Keine Passwortdatei gefunden; eine neue braucht ein SYS-Passwort.")
+    ll = params.get("local_listener", "").strip("'\"")
+    db_control_files = db_ctl or [db_root.rstrip("/") + "/" + os.path.relpath(h, data_dir) for h in host_ctl_guess]
+    return dict(mode="local", source=src, data_dir=str(data_dir), spfile=str(spfile or ""), pfile=str(pfile or ""),
+                orapw=str(orapw or ""), control_files=db_control_files, db_root=db_root,
+                mapping=[dict(m, count=None if m["files"] is None else len(m["files"])) for m in mapping],
+                mounts=mounts, shm=shm, size=size, db_name=params.get("db_name", sid).strip("'\""),
+                local_listener=ll, local_listener_kind="" if not ll else ("address" if "(" in ll or ":" in ll else "alias"),
+                needs=needs, problems=problems, warnings=warnings, image_version=image_version())
+
+
+def parse_size(value: str) -> int:
+    m = re.match(r"^\s*(\d+)\s*([KMGT]?)\s*$", (value or "0").upper())
+    if not m:
+        return 0
+    return int(m.group(1)) * {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}[m.group(2)]
+
+
+def minimal_pfile(sid: str, db_name: str, control_files: list[str], block_size: int, undo: str, memory_mb: int) -> str:
+    ctl = ",".join(f"'{c}'" for c in control_files)
+    return (f"db_name='{db_name}'\ncontrol_files={ctl}\ndb_block_size={block_size}\ncompatible='19.0.0'\n"
+            f"undo_tablespace='{undo}'\nundo_management='AUTO'\nsga_target={memory_mb * 7 // 10}M\n"
+            f"pga_aggregate_target={memory_mb * 3 // 10}M\nprocesses=300\nremote_login_passwordfile='EXCLUSIVE'\n"
+            f"audit_file_dest='/opt/oracle/admin/{sid}/adump'\naudit_trail='none'\ndiagnostic_dest='/opt/oracle'\n")
+
+
+def verify_script(sid: str, make_spfile: bool, sys_pw: str | None) -> str:
+    q = shlex.quote
+    lines = [f"set -uo pipefail\nSID={q(sid)}\nexport ORACLE_SID=\"$SID\"\nC=/opt/oracle/oradata/dbconfig/$SID",
+             'mkdir -p "$ORACLE_BASE/admin/$SID/adump"']
+    if make_spfile:
+        lines.append("""sqlplus -s / as sysdba <<EOF || { echo "ZKERR=spfile konnte nicht erzeugt werden"; exit 1; }
+whenever sqlerror exit 3
+create spfile='$C/spfile$SID.ora' from pfile='$C/init$SID.ora';
+exit
+EOF""")
+    if sys_pw:
+        lines.append(f'orapwd file="$C/orapw$SID" password={q(sys_pw)} format=12.2 force=y '
+                     '|| { echo "ZKERR=Passwortdatei konnte nicht angelegt werden"; exit 1; }')
+    lines.append('ln -sf "$C/spfile$SID.ora" "$ORACLE_HOME/dbs/spfile$SID.ora"; ln -sf "$C/orapw$SID" "$ORACLE_HOME/dbs/orapw$SID"')
+    lines.append("""sqlplus -s / as sysdba <<'EOF'
+set heading off feedback off pagesize 0 linesize 300
+whenever sqlerror exit 7
+startup
+select 'ZK_BANNER='||banner from v$version where rownum = 1;
+select 'ZK_CDB='||cdb from v$database;
+select 'ZK_PDBNAME='||name from v$pdbs where name <> 'PDB$SEED';
+select 'ZK_DOMAIN='||value from v$parameter where name = 'db_domain';
+select 'ZK_DBNAME='||value from v$parameter where name = 'db_name';
+shutdown immediate
+exit
+EOF
+rc=$?
+[ $rc -eq 0 ] || { echo "ZKERR=Prüfstart fehlgeschlagen (Exit $rc)"; exit 1; }
+echo "ZK_DONE=1"
+""")
+    return "\n".join(lines) + "\n"
+
+
+def job_local_import(job: Job, src: dict, port: int, opts: dict) -> None:
+    sid = src["sid"]
+    vol = MASTER / sid
+    plan = probe_local(src)
+    if plan["problems"]:
+        raise RuntimeError("Import nicht möglich: " + " ".join(plan["problems"]))
+    needs = plan["needs"]
+    if needs.get("spfile") and not opts.get("create_spfile"):
+        raise RuntimeError("Es gibt keine spfile; der Import geht nur mit „neue spfile anlegen“.")
+    if needs.get("orapw") and not opts.get("sys_password"):
+        raise RuntimeError("Ohne Passwortdatei geht es nur mit einem SYS-Passwort für eine neue.")
+    if port_in_use(port, containers()):
+        raise RuntimeError(f"Port {port} ist belegt.")
+    for w in plan["warnings"]:
+        job.log("Hinweis: " + w)
+    job.run(["btrfs", "subvolume", "create", str(vol)])
+    try:
+        prepare_new_volume(job, vol)
+        job.log(f"Kopiere {plan['size'] / 1024 ** 3:.1f} GB in das neue Subvolume (wird dabei komprimiert)")
+        for m in plan["mapping"]:
+            dest = vol / m["rel"]
+            dest.mkdir(parents=True, exist_ok=True)
+            if m["files"] is None:
+                job.run(["rsync", "-a", f"{m['src']}/", f"{dest}/"], timeout=86400, quiet=True)
+            else:
+                job.run(["rsync", "-a", "--files-from=-", f"{m['src']}/", f"{dest}/"],
+                        input="\n".join(m["files"]) + "\n", timeout=86400, quiet=True)
+        cfg = vol / "dbconfig" / sid
+        cfg.mkdir(parents=True, exist_ok=True)
+        if plan["spfile"]:
+            job.run(["cp", "-p", plan["spfile"], str(cfg / f"spfile{sid}.ora")])
+        elif plan["pfile"]:
+            job.run(["cp", "-p", plan["pfile"], str(cfg / f"init{sid}.ora")])
+        else:
+            o = opts
+            (cfg / f"init{sid}.ora").write_text(minimal_pfile(
+                sid, o.get("db_name") or plan["db_name"] or sid, plan["control_files"],
+                int(o.get("block_size") or 8192), o.get("undo") or "UNDOTBS1", int(o.get("memory_mb") or 2048)))
+            job.log(f"Minimale pfile geschrieben: {cfg / f'init{sid}.ora'}")
+        if plan["orapw"]:
+            job.run(["cp", "-p", plan["orapw"], str(cfg / f"orapw{sid}")])
+        alias = plan["local_listener"] if plan["local_listener_kind"] == "alias" else ""
+        write_dbconfig(vol, sid, "enterprise", alias, sid)
+        for m in plan["mounts"]:
+            (vol / m.partition(":")[0]).mkdir(parents=True, exist_ok=True)
+        write_volume_env(vol, dict(ZK_DB_TYPE="noncdb", ZK_SHM_SIZE=plan["shm"], ZK_MOUNTS=" ".join(plan["mounts"])))
+        job.run(["chown", "-R", f"{ORACLE_UID}:{ORACLE_UID}", str(vol)])
+
+        job.log("Prüfstart in einem Wegwerf-Container (startup, Abfragen, shutdown immediate)")
+        pw = opts.get("sys_password") if needs.get("orapw") else None
+        p = job.run(["docker", "run", "--rm", "-i", "--name", f"zk-verify-{sid.lower()}", "--entrypoint", "bash",
+                     "-e", f"ORACLE_SID={sid}", "-v", f"{vol}:/opt/oracle/oradata", *docker_extra(vol), IMAGE, "-s"],
+                    input=verify_script(sid, not plan["spfile"], pw), secret=pw, timeout=3600, allow_fail=True)
+        out = p.stdout + p.stderr
+        if "ZK_DONE=1" not in out:
+            ora = sorted(set(re.findall(r"(ORA-\d{5}[^\n]*)", out)))[:3]
+            raise RuntimeError((re.search(r"ZKERR=(.*)", out) or [None, "Prüfstart fehlgeschlagen"])[1]
+                               + (": " + " | ".join(ora) if ora else "") + " – nichts übernommen, die Quelle ist unverändert.")
+        kv = {}
+        for line in out.splitlines():
+            if line.startswith("ZK_") and "=" in line:
+                k, _, v = line.partition("=")
+                kv.setdefault(k, []).append(v.strip())
+        cdb = (kv.get("ZK_CDB") or ["NO"])[0] == "YES"
+        pdbs = kv.get("ZK_PDBNAME", [])
+        domain = (kv.get("ZK_DOMAIN") or [""])[0]
+        base_service = pdbs[0] if cdb and pdbs else (kv.get("ZK_DBNAME") or [sid])[0]
+        service = f"{base_service}.{domain}" if domain else base_service
+        edition = "standard" if "Standard" in (kv.get("ZK_BANNER") or [""])[0] else "enterprise"
+        if edition != "enterprise":
+            (cfg / ".docker_enterprise").unlink(missing_ok=True)
+            (cfg / f".docker_{edition}").touch()
+        write_dbconfig(vol, sid, edition, alias, service)
+        write_volume_env(vol, dict(ZK_DB_TYPE="cdb" if cdb else "noncdb", ZK_PDB=pdbs[0] if cdb and pdbs else "",
+                                   ZK_SERVICE=service, ZK_SHM_SIZE=plan["shm"], ZK_EDITION=edition,
+                                   ZK_MOUNTS=" ".join(plan["mounts"])))
+        job.run(["chown", "-R", f"{ORACLE_UID}:{ORACLE_UID}", str(vol / "dbconfig"), str(vol / VOLUME_ENV)])
+        check_volume(vol, sid)
+    except Exception:
+        sh(["docker", "rm", "-f", f"zk-verify-{sid.lower()}"], check=False)
+        sh(["btrfs", "subvolume", "delete", str(vol)], check=False)
+        sv_forget(vol)
+        raise
+    db_meta_update(sid, port=port, origin=f"importiert aus {src['path']}", created=now_iso())
+    tl_add(sid, "db-imported", f"Datenbank {sid} aus {src['path']} importiert")
+    job_master_start(job, sid, port)
+    if plan["local_listener_kind"] == "address":
+        job.run(["docker", "exec", "-i", sid.lower(), "sqlplus", "-s", "/ as sysdba"],
+                input="alter system set local_listener='(ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=1521))' scope=both;\n"
+                      "alter system register;\nexit\n")
+    job.log("datapatch einspielen (gleicht das Data Dictionary an den Patch-Stand des Images an)")
+    job.run(["docker", "exec", sid.lower(), "bash", "-c", "$ORACLE_HOME/OPatch/datapatch -verbose"], timeout=7200)
+
+
+@bp.post("/api/import/local/probe")
+def api_local_probe():
+    return jsonify(probe_local(validate_local(request.get_json(force=True))))
+
+
+@bp.post("/api/import/local")
+def api_local_import():
+    data = request.get_json(force=True)
+    src = validate_local(data)
+    port = int(data.get("port") or 0)
+    if not 1024 <= port <= 65535:
+        raise UserError("Port: 1024 bis 65535.")
+    opts = dict(create_spfile=bool(data.get("create_spfile")), db_name=(data.get("db_name") or "").strip().upper(),
+                block_size=int(data.get("block_size") or 8192), undo=(data.get("undo") or "UNDOTBS1").strip().upper(),
+                memory_mb=int(data.get("memory_mb") or 2048), sys_password=data.get("sys_password") or "")
+    if opts["db_name"] and not re.match(r"^[A-Z][A-Z0-9_]{0,7}$", opts["db_name"]):
+        raise UserError("DB-Name: höchstens 8 Zeichen, Großbuchstaben, Ziffern, Unterstrich.")
+    if opts["block_size"] not in (2048, 4096, 8192, 16384, 32768):
+        raise UserError("Blockgröße: 2048, 4096, 8192, 16384 oder 32768.")
+    if not re.match(r"^[A-Z][A-Z0-9_$#]{0,29}$", opts["undo"]):
+        raise UserError("Undo-Tablespace ungültig.")
+    if not 1024 <= opts["memory_mb"] <= 262144:
+        raise UserError("Speicher: 1024 bis 262144 MB.")
+    if opts["sys_password"] and not RE_DBPWD.match(opts["sys_password"]):
+        raise UserError("SYS-Passwort: 8–30 Zeichen mit Groß- und Kleinbuchstaben und Ziffer; erlaubt sind A–Z, a–z, 0–9, _ # $.")
+    if (MASTER / src["sid"]).exists():
+        raise UserError(f"Eine Datenbank {src['sid']} gibt es auf diesem Host schon.")
+    job = start_job(f"Datenbank {src['sid']} aus {src['path']} importieren", src["sid"], f"import:{src['sid']}",
+                    job_local_import, src, port, opts)
     return jsonify(job=job.as_dict())
 
 

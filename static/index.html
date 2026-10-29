@@ -167,6 +167,7 @@ nav.side a.sub[aria-current="page"] { color: var(--ink); }
 .by { color: var(--muted); font-size: 12px; border: 1px solid var(--rule); border-radius: 4px; padding: 0 4px; }
 table.snap td .acts { display: flex; flex-wrap: wrap; gap: 2px; margin-left: -8px; }
 .muted-note { color: var(--muted); font-size: 12.5px; }
+.needbox { border: 1px solid var(--rule); border-radius: 8px; padding: 10px 12px; background: #fff; }
 .ok-note { color: var(--ok); font-size: 12.5px; margin-top: 2px; }
 td .bad { color: var(--err); font-size: 12.5px; }
 .keybox { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 12px; background: #fff; border: 1px solid var(--rule); border-radius: 6px; padding: 8px 10px; word-break: break-all; }
@@ -234,7 +235,7 @@ table.snap td.num { text-align: right; white-space: nowrap; }
 .job .err { color: var(--err); font-size: 13px; padding: 0 14px 8px; }
 
 /* Dialoge */
-dialog { border: 1px solid var(--rule); border-radius: 10px; padding: 0; width: min(480px, calc(100vw - 24px)); color: var(--ink); background: var(--sheet); }
+dialog { max-height: calc(100vh - 24px); overflow-y: auto; border: 1px solid var(--rule); border-radius: 10px; padding: 0; width: min(480px, calc(100vw - 24px)); color: var(--ink); background: var(--sheet); }
 dialog::backdrop { background: rgba(20, 37, 43, .35); }
 dialog form { display: grid; gap: 14px; padding: 20px 22px; }
 dialog h2 { font-size: 19px; }
@@ -451,19 +452,34 @@ label.field textarea { min-height: 84px; resize: vertical; }
     <h2>Datenbank importieren</h2>
     <p class="steps"><span class="js-step1"><b>1. Quelle prüfen</b></span><span>→</span><span class="js-step2">2. Übernehmen</span></p>
     <div class="js-s1">
-      <p class="lead">Übernimmt eine Oracle-Datenbank von einem anderen Server per SSH auf <b class="js-host"></b>: Datendateien, Redo-Logs, Controlfiles, spfile und Passwortdatei. Die Quell-DB muss laufen, damit sie geprüft werden kann.</p>
-      <div class="row2">
-        <label class="field">Quell-Host <input name="host" required placeholder="z. B. db05" autocomplete="off"></label>
-        <label class="field">SID <input name="sid" required placeholder="z. B. DLHTEST" autocomplete="off"></label>
+      <div class="field">Quelle
+        <div class="days js-mode">
+          <label><input type="radio" name="mode" value="ssh" checked>Anderer Server per SSH</label>
+          <label><input type="radio" name="mode" value="local">Verzeichnis auf diesem Host</label>
+        </div>
       </div>
-      <div class="row3">
-        <label class="field">SSH-Benutzer <input name="user" value="oracle" required></label>
-        <label class="field">SSH-Port <input type="number" name="ssh_port" value="22" min="1" max="65535"></label>
-        <label class="field">ORACLE_HOME <input name="oracle_home" placeholder="aus dem Login-Profil"><small>nur falls nicht gesetzt</small></label>
+      <label class="field">SID <input name="sid" required placeholder="z. B. DLHTEST" autocomplete="off"></label>
+      <div class="js-ssh">
+        <p class="lead">Übernimmt eine laufende Oracle-Datenbank von einem anderen Server auf <b class="js-host"></b>: Datendateien, Redo-Logs, Controlfiles, spfile und Passwortdatei. Die Quell-DB muss laufen, damit sie geprüft werden kann.</p>
+        <label class="field">Quell-Host <input name="host" placeholder="z. B. db05" autocomplete="off"></label>
+        <div class="row3">
+          <label class="field">SSH-Benutzer <input name="user" value="oracle"></label>
+          <label class="field">SSH-Port <input type="number" name="ssh_port" value="22" min="1" max="65535"></label>
+          <label class="field">ORACLE_HOME <input name="oracle_home" placeholder="aus dem Login-Profil"><small>nur falls nicht gesetzt</small></label>
+        </div>
+        <div class="field">Öffentlicher SSH-Schlüssel dieses Hosts
+          <small>gehört auf der Quelle in ~/.ssh/authorized_keys des SSH-Benutzers</small>
+          <div class="keybox js-key">…</div>
+        </div>
       </div>
-      <div class="field">Öffentlicher SSH-Schlüssel dieses Hosts
-        <small>gehört auf der Quelle in ~/.ssh/authorized_keys des SSH-Benutzers</small>
-        <div class="keybox js-key">…</div>
+      <div class="js-local" hidden>
+        <p class="lead">Kopiert eine heruntergefahrene Datenbank aus einem Verzeichnis auf <b class="js-host"></b> in ein neues, komprimiertes Subvolume und startet sie dort. Die Quelle bleibt unverändert.</p>
+        <label class="field">Verzeichnis <input name="path" placeholder="z. B. /srv/oradata" autocomplete="off">
+          <small>das Datenverzeichnis selbst oder die Ablage eines Oracle-Containers mit &lt;SID&gt;/ und dbconfig/&lt;SID&gt;/</small></label>
+        <div class="row2">
+          <label class="field">spfile <small>optional</small><input name="spfile" placeholder="wird gesucht" autocomplete="off"></label>
+          <label class="field">Passwortdatei <small>optional</small><input name="orapw" placeholder="wird gesucht" autocomplete="off"></label>
+        </div>
       </div>
     </div>
     <div class="js-s2 probe" hidden></div>
@@ -1144,11 +1160,65 @@ function renderAccess() {
     </div>`;
 }
 
+function importPlanHtml(plan, host, freePort) {
+  const local = plan.mode === "local";
+  const facts = local ? `
+      <dt>Verzeichnis</dt><dd>${esc(plan.data_dir)}</dd>
+      <dt>Größe</dt><dd>${fmtBytes(plan.size)}</dd>
+      <dt>Zuordnung</dt><dd>${plan.mapping.map(m => `${esc(m.src)} → ${esc(m.rel)}/ ${m.count == null ? "(alles)" : "(" + m.count + " Dateien)"}${m.db_path !== m.src ? ` <span class="muted-note">in der DB: ${esc(m.db_path)}</span>` : ""}`).join("<br>")}</dd>
+      <dt>Controlfiles</dt><dd>${plan.control_files.map(esc).join("<br>") || "–"}</dd>
+      <dt>spfile</dt><dd>${plan.spfile ? esc(plan.spfile) : `<span class="bad">nicht gefunden</span>${plan.pfile ? ` – pfile: ${esc(plan.pfile)}` : ""}`}</dd>
+      <dt>Passwortdatei</dt><dd>${plan.orapw ? esc(plan.orapw) : '<span class="bad">nicht gefunden</span>'}</dd>
+      <dt>Image</dt><dd>${esc(plan.image_version)}</dd>` : `
+      <dt>Quelle</dt><dd>${esc(plan.source.user)}@${esc(plan.source.host)}, SID ${esc(plan.source.sid)} (${esc(plan.status)})</dd>
+      <dt>Version</dt><dd>${esc(plan.version)} – Image ${esc(plan.image_version)}</dd>
+      <dt>Art</dt><dd>${plan.cdb ? "Container-DB, PDBs: " + esc(plan.pdbs.join(", ")) : "Non-CDB"}, ${esc(plan.edition === "standard" ? "Standard Edition" : "Enterprise Edition")}, ${esc(plan.charset)}</dd>
+      <dt>Größe</dt><dd>${fmtBytes(plan.size)} Datendateien</dd>
+      <dt>Verzeichnisse</dt><dd>${plan.mapping.map(m => `${esc(m.src)} → ${esc(m.rel)}/ (${m.files.length} Dateien)`).join("<br>")}</dd>
+      <dt>spfile</dt><dd>${esc(plan.spfile || "–")}</dd>
+      <dt>Service</dt><dd>${esc(plan.service)}</dd>`;
+  const needs = plan.needs || {};
+  const spfileBox = local && needs.spfile ? `
+      <div class="needbox">
+        <label class="check"><input type="checkbox" name="create_spfile" value="1"><span><b>Neue spfile anlegen</b>
+          <small>${needs.spfile === "pfile" ? `aus der gefundenen pfile ${esc(plan.pfile)}` : "Es gibt weder spfile noch pfile. Eine neue entsteht aus diesen Mindestangaben; stimmen DB-Name, Blockgröße oder Undo-Tablespace nicht, scheitert der Prüfstart, und es wird nichts übernommen."}</small></span></label>
+        ${needs.spfile === "minimal" ? `<div class="row3" style="margin-top:8px">
+          <label class="field">DB-Name <input name="db_name" value="${esc(plan.db_name || plan.source.sid)}" maxlength="8"></label>
+          <label class="field">Blockgröße <select name="block_size"><option>2048</option><option>4096</option><option selected>8192</option><option>16384</option><option>32768</option></select></label>
+          <label class="field">Speicher (MB) <input type="number" name="memory_mb" value="2048" min="1024" step="256"></label></div>
+          <label class="field">Undo-Tablespace <input name="undo" value="UNDOTBS1"></label>` : ""}
+      </div>` : "";
+  const orapwBox = local && needs.orapw ? `
+      <div class="needbox">
+        <label class="check"><input type="checkbox" name="create_orapw" value="1"><span><b>Neue Passwortdatei anlegen</b>
+          <small>mit einem neuen SYS-Passwort (8–30 Zeichen, Groß- und Kleinbuchstaben und Ziffer)</small></span></label>
+        <div class="row2" style="margin-top:8px">
+          <label class="field">SYS-Passwort <input type="password" name="sys_password" autocomplete="new-password"></label>
+          <label class="field">wiederholen <input type="password" name="sys_password2" autocomplete="new-password"></label></div>
+      </div>` : "";
+  return `<dl class="facts-list">${facts}</dl>
+    ${plan.problems.length ? `<div><b class="bad">Import nicht möglich</b><ul>${plan.problems.map(p => `<li class="bad">${esc(p)}</li>`).join("")}</ul></div>` : ""}
+    ${plan.warnings.length ? `<div><b>Hinweise</b><ul>${plan.warnings.map(w => `<li class="warn">${esc(w)}</li>`).join("")}</ul></div>` : ""}
+    ${plan.problems.length ? "" : `${spfileBox}${orapwBox}
+      <label class="field">Port auf ${esc(host.name)} <input type="number" name="port" min="1024" max="65535" value="${freePort}" required></label>
+      ${local ? `<p class="hint-box">Die Dateien werden in ein neues Subvolume unter <code>master/${esc(plan.source.sid)}</code> kopiert und dabei komprimiert. Vor der Übernahme startet die Kopie einmal in einem Wegwerf-Container; nur wenn sie sauber öffnet, wird sie zur Master-DB. Die Quelle wird nicht verändert.</p>`
+        : `<p class="hint-box">Die Quell-DB wird für das Kopieren sauber heruntergefahren. Ohne den folgenden Haken bleibt sie danach aus – das ist der Umzug. Mit Haken läuft sie danach wieder – das ist eine Kopie.</p>
+      <label class="check"><input type="checkbox" name="restart_source" value="1"><span>Quell-DB nach dem Kopieren wieder starten</span></label>`}`}`;
+}
+
 function openImportDialog() {
   let plan = null;
   const host = currentHost();
   openDialog("dlgImport", f => {
     $(".js-host", f).textContent = host.name;
+    f.querySelectorAll(".js-host").forEach(x => { x.textContent = host.name; });
+    const syncMode = () => {
+      const local = f.querySelector('input[name=mode]:checked').value === "local";
+      $(".js-ssh", f).hidden = local; $(".js-local", f).hidden = !local;
+      f.host.required = !local; f.path.required = local;
+    };
+    f.querySelectorAll('input[name=mode]').forEach(r => { r.onchange = syncMode; });
+    syncMode();
     const show = step => {
       $(".js-s1", f).hidden = step !== 1; $(".js-s2", f).hidden = step !== 2;
       $(".js-back", f).hidden = step !== 2;
@@ -1158,37 +1228,36 @@ function openImportDialog() {
       f.querySelectorAll(".js-s1 input").forEach(i => { i.disabled = step !== 1; });
     };
     f.dataset.step = "1"; show(1);
-    $(".js-back", f).onclick = () => { f.dataset.step = "1"; show(1); $(".form-error", f).textContent = ""; };
+    $(".js-back", f).onclick = () => { f.dataset.step = "1"; show(1); $(".js-next", f).disabled = false; $(".form-error", f).textContent = ""; };
     api("GET", "/api/sshkey").then(r => { $(".js-key", f).textContent = r.public_key; }).catch(e => { $(".js-key", f).textContent = e.message; });
     f._show = show;
   }, async v => {
     const f = $("#fImport");
     if (f.dataset.step === "1") {
+      const local = v.mode === "local";
       const btn = $(".js-next", f); btn.textContent = "Prüfe …";
-      try { plan = await api("POST", "/api/import/probe", { host: v.host, user: v.user, sid: v.sid, ssh_port: +v.ssh_port, oracle_home: v.oracle_home }); }
-      finally { btn.textContent = "Quelle prüfen"; }
+      try {
+        plan = local
+          ? await api("POST", "/api/import/local/probe", { path: v.path, sid: v.sid, spfile: v.spfile, orapw: v.orapw })
+          : await api("POST", "/api/import/probe", { host: v.host, user: v.user, sid: v.sid, ssh_port: +v.ssh_port, oracle_home: v.oracle_home });
+      } finally { btn.textContent = "Quelle prüfen"; }
       const freePort = 1521 + Math.max(0, ...S.dbs.map(d => (d.master.port || 1521) - 1521)) + 1;
-      $(".js-s2", f).innerHTML = `
-        <dl class="facts-list">
-          <dt>Quelle</dt><dd>${esc(plan.source.user)}@${esc(plan.source.host)}, SID ${esc(plan.source.sid)} (${esc(plan.status)})</dd>
-          <dt>Version</dt><dd>${esc(plan.version)} – Image ${esc(plan.image_version)}</dd>
-          <dt>Art</dt><dd>${plan.cdb ? "Container-DB, PDBs: " + esc(plan.pdbs.join(", ")) : "Non-CDB"}, ${esc(plan.edition === "standard" ? "Standard Edition" : "Enterprise Edition")}, ${esc(plan.charset)}</dd>
-          <dt>Größe</dt><dd>${fmtBytes(plan.size)} Datendateien</dd>
-          <dt>Verzeichnisse</dt><dd>${plan.mapping.map(m => `${esc(m.src)} → ${esc(m.rel)}/ (${m.files.length} Dateien)`).join("<br>")}</dd>
-          <dt>spfile</dt><dd>${esc(plan.spfile || "–")}</dd>
-          <dt>Service</dt><dd>${esc(plan.service)}</dd>
-        </dl>
-        ${plan.problems.length ? `<div><b class="bad">Import nicht möglich</b><ul>${plan.problems.map(p => `<li class="bad">${esc(p)}</li>`).join("")}</ul></div>` : ""}
-        ${plan.warnings.length ? `<div><b>Hinweise</b><ul>${plan.warnings.map(w => `<li class="warn">${esc(w)}</li>`).join("")}</ul></div>` : ""}
-        ${plan.problems.length ? "" : `
-        <label class="field">Port auf ${esc(host.name)} <input type="number" name="port" min="1024" max="65535" value="${freePort}" required></label>
-        <p class="hint-box">Die Quell-DB wird für das Kopieren sauber heruntergefahren. Ohne den folgenden Haken bleibt sie danach aus – das ist der Umzug. Mit Haken läuft sie danach wieder – das ist eine Kopie.</p>
-        <label class="check"><input type="checkbox" name="restart_source" value="1"><span>Quell-DB nach dem Kopieren wieder starten</span></label>`}`;
+      $(".js-s2", f).innerHTML = importPlanHtml(plan, host, freePort);
       f.dataset.step = "2"; f._show(2);
       $(".js-next", f).disabled = plan.problems.length > 0;
       throw Object.assign(new Error(""), { keepOpen: true });
     }
-    startedJob(await api("POST", "/api/import", { host: v.host || plan.source.host, user: plan.source.user, sid: plan.source.sid,
+    if (plan.mode === "local") {
+      const needs = plan.needs || {};
+      if (needs.spfile && !v.create_spfile) throw new Error("Ohne spfile geht es nur mit „Neue spfile anlegen“.");
+      if (needs.orapw && !v.create_orapw) throw new Error("Ohne Passwortdatei geht es nur mit „Neue Passwortdatei anlegen“.");
+      if (needs.orapw && v.sys_password !== v.sys_password2) throw new Error("Die SYS-Passwörter stimmen nicht überein.");
+      startedJob(await api("POST", "/api/import/local", { ...plan.source, port: +v.port,
+        create_spfile: !!v.create_spfile, db_name: v.db_name, block_size: +v.block_size || 8192, undo: v.undo,
+        memory_mb: +v.memory_mb || 2048, sys_password: needs.orapw ? v.sys_password : "" }));
+      return;
+    }
+    startedJob(await api("POST", "/api/import", { host: plan.source.host, user: plan.source.user, sid: plan.source.sid,
       ssh_port: plan.source.ssh_port, oracle_home: plan.source.oracle_home, port: +v.port, restart_source: !!v.restart_source }));
   });
 }
