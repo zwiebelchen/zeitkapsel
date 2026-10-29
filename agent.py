@@ -1916,6 +1916,14 @@ def image_can_create() -> str | None:
             13: "sqlplus ist leer"}.get(p.returncode, (p.stderr or p.stdout).strip()[-300:] or "unbekannt")
 
 
+TZ_UPGRADE_SH = """echo "Zeitzonendatei auf den neuesten Stand im Oracle Home bringen (startet die DB zweimal neu)"
+sqlplus -s / as sysdba <<'EOF'
+set feedback off
+@?/rdbms/admin/utltz_upg_check.sql
+@?/rdbms/admin/utltz_upg_apply.sql
+EOF"""
+
+
 def newdb_script(sid: str, pdb: str, password: str, charset: str, memory_mb: int,
                  ncharset: str = "AL16UTF16") -> str:
     """Bash-Skript, das im Image per dbca eine Datenbank in der Ablage von zeitkapsel anlegt.
@@ -1928,6 +1936,9 @@ def newdb_script(sid: str, pdb: str, password: str, charset: str, memory_mb: int
     cdb_args = (f"-createAsContainerDatabase true -numberOfPDBs 1 -pdbName {q(pdb)} -pdbAdminPassword \"$PW\""
                 if pdb else "-createAsContainerDatabase false")
     save_state = f"alter pluggable database {pdb} save state;" if pdb else ""
+    # dbca übernimmt die Zeitzonendatei der Vorlage (19c: Version 32), das Oracle Home bringt mit den
+    # RUs neuere mit. Ohne Anheben scheitert z. B. Data Pump aus neueren Quellen (ORA-39405).
+    tz_block = "" if pdb else TZ_UPGRADE_SH
     return f"""set -uo pipefail
 PW={q(password)}
 SID={q(sid)}
@@ -1948,9 +1959,11 @@ if [ $rc -ne 0 ] || [ ! -s "$ORACLE_HOME/dbs/spfile$SID.ora" ]; then
   tail -n 40 "$ORACLE_BASE"/cfgtoollogs/dbca/"$SID"/*.log 2>/dev/null
   exit 1
 fi
+{tz_block}
 sqlplus -s / as sysdba <<'EOF'
 set heading off feedback off pagesize 0 linesize 300
 select 'ZK_BANNER='||banner from v$version where rownum = 1;
+select 'ZK_TZ='||version from v$timezone_file;
 select 'ZK_CDB='||cdb from v$database;
 {save_state}
 shutdown immediate
@@ -2066,6 +2079,19 @@ def vtuple(v: str) -> tuple:
         return tuple(int(x) for x in v.split("."))
     except ValueError:
         return ()
+
+
+_image_tz: dict[str, int] = {}
+
+
+def image_tz_max() -> int:
+    """Höchste Zeitzonendatei (timezlrg_<n>.dat) im Oracle Home des Images."""
+    if IMAGE not in _image_tz:
+        p = sh(["docker", "run", "--rm", "--entrypoint", "bash", IMAGE, "-c",
+                "ls $ORACLE_HOME/oracore/zoneinfo/ 2>/dev/null"], check=False, timeout=120)
+        nums = [int(n) for n in re.findall(r"timezlrg_(\d+)\.dat", p.stdout)]
+        _image_tz[IMAGE] = max(nums) if nums else 0
+    return _image_tz[IMAGE]
 
 
 _image_version: dict[str, str] = {}
@@ -2788,6 +2814,7 @@ select 'ZK_TS='||t.tablespace_name||'|'||t.block_size||'|'||t.bigfile||'|'||
 select 'ZK_LONG='||count(*) from dba_tab_columns c join dba_users u on u.username = c.owner
  where u.oracle_maintained = 'N' and c.data_type in ('LONG','LONG RAW');
 select 'ZK_UNDORET='||value from v$parameter where name = 'undo_retention';
+select 'ZK_TZ='||version from v$timezone_file;
 exit
 """
 
@@ -2830,6 +2857,12 @@ def probe_dp(src: dict, target_sid: str = "") -> dict:
     if size > 50 * 1024 ** 3 and ret < 3600:
         warnings.append(f"undo_retention der Quelle ist {ret} s; bei {size / 1024 ** 3:.0f} GB und konsistentem Stand "
                         "droht ORA-01555. Auf der Quelle erhöhen oder „konsistent“ abwählen.")
+    src_tz, img_tz = int(one("ZK_TZ", "0") or 0), image_tz_max()
+    if src_tz and img_tz and src_tz > img_tz:
+        problems.append(f"Die Zeitzonendatei der Quelle (Version {src_tz}) ist neuer als die neueste im Image ({img_tz}); "
+                        "dafür braucht das Image einen RU mit passendem DST-Stand.")
+    elif src_tz and img_tz:
+        warnings.append(f"Zeitzonendatei: Quelle Version {src_tz}, Image bis {img_tz}; die neue DB wird bei Bedarf angehoben.")
     major = vtuple(one("ZK_VERSION"))[:1]
     img = image_version()
     if major and major > vtuple(img)[:1]:
@@ -2849,12 +2882,38 @@ def probe_dp(src: dict, target_sid: str = "") -> dict:
     return dict(mode="dp", target=target, source={k: v for k, v in src.items() if k != "password"}, version=one("ZK_VERSION"),
                 dbname=one("ZK_DBNAME"), cdb=one("ZK_CDB") == "YES", logmode=one("ZK_LOGMODE"),
                 charset=one("ZK_CHARSET", "AL32UTF8"), ncharset=one("ZK_NCHARSET", "AL16UTF16"),
-                banner=one("ZK_BANNER"), roles=roles, schemas=schemas, tablespaces=tablespaces,
+                banner=one("ZK_BANNER"), roles=roles, schemas=schemas, tablespaces=tablespaces, tz=src_tz, image_tz=img_tz,
                 size=size, undo_retention=ret, image_version=img, problems=problems, warnings=warnings)
 
 
 def sql_str(v: str) -> str:
     return "'" + v.replace("'", "''") + "'"
+
+
+def db_tz(cname: str) -> int:
+    p = sh(["docker", "exec", "-i", cname, "sqlplus", "-s", "/ as sysdba"],
+           input="set heading off feedback off pagesize 0\nselect 'ZK_TZ='||version from v$timezone_file;\nexit\n",
+           check=False, timeout=120)
+    m = re.search(r"ZK_TZ=(\d+)", p.stdout)
+    return int(m.group(1)) if m else 0
+
+
+def ensure_tz(job: Job, cname: str, needed: int) -> None:
+    """Zeitzonendatei der DB anheben, wenn sie älter ist als needed (Data Pump verlangt Ziel >= Quelle)."""
+    if not needed:
+        return
+    have = db_tz(cname)
+    job.log(f"Zeitzonendatei: Quelle Version {needed}, neue DB Version {have or '?'}")
+    if have and have >= needed:
+        return
+    job.log("Zeitzonendatei der neuen DB anheben (utltz_upg_check/apply; die DB startet dabei zweimal neu)")
+    rc, _ = job.stream(["docker", "exec", "-i", cname, "sqlplus", "-s", "/ as sysdba"],
+                       input="set feedback off\n@?/rdbms/admin/utltz_upg_check.sql\n@?/rdbms/admin/utltz_upg_apply.sql\nexit\n")
+    have = db_tz(cname)
+    if have < needed:
+        raise RuntimeError(f"Zeitzonendatei der neuen DB ist nach dem Anheben Version {have or '?'}, "
+                           f"die Quelle hat {needed}; Data Pump würde mit ORA-39405 abbrechen.")
+    job.log(f"Zeitzonendatei jetzt Version {have}")
 
 
 def job_dp_import(job: Job, src: dict, tgt: dict) -> None:
@@ -2889,6 +2948,7 @@ def job_dp_import(job: Job, src: dict, tgt: dict) -> None:
     parallel = tgt["parallel"] if edition == "enterprise" else 1
     try:
         job.run(["docker", "exec", cname, "mkdir", "-p", "/opt/oracle/oradata/zk_import"])
+        ensure_tz(job, cname, plan.get("tz") or 0)
         # Tablespaces vorab als OMF-Dateien im Subvolume anlegen (die Pfade der Quelle gibt es hier nicht)
         caches = sorted({t["block_size"] for t in plan["tablespaces"] if t["block_size"] != 8192})
         ts_calls = "\n".join(

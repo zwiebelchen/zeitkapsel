@@ -203,6 +203,8 @@ Schritt 2: ganze Datenbank oder ausgewählte Schemas, SID, Port, Speicher und Pa
 
 Exit-Code 5 von impdp („mit Fehlern abgeschlossen“) gilt als fertig, die Meldungen stehen im Protokoll. Scheitert der Import, bleibt die neue DB zur Analyse stehen und lässt sich unter „Alle Snapshots“ löschen. Die Passwörter von Quelle und neuer DB werden per stdin übergeben und erscheinen nicht im Protokoll; das Quell-Passwort liegt nur während des Imports im DB-Link der neuen DB.
 
+Zeitzonendatei: Data Pump importiert nur in eine Datenbank mit gleicher oder neuerer Zeitzonendatei (sonst ORA-39405). dbca übernimmt die Version der Vorlage (in 19c: 32), obwohl das Oracle Home mit den RUs neuere mitbringt. zeitkapsel hebt deshalb jede neu angelegte Non-CDB mit `utltz_upg_check.sql`/`utltz_upg_apply.sql` auf den neuesten Stand im Home an und prüft vor dem Data-Pump-Import noch einmal; ist die Quelle neuer als alles im Image, meldet das schon die Prüfung.
+
 Grenzen: Tabellen mit `LONG`/`LONG RAW` lassen sich über einen DB-Link nicht übertragen (ORA-31679) und müssen per expdp-Datei nachgeholt werden – die Prüfung zählt sie vorab. Für einen konsistenten Stand muss die Quelle genug Undo vorhalten (`undo_retention`), sonst droht ORA-01555. Die Übertragung läuft über das Netz und dauert entsprechend; Statistiken werden mit übernommen.
 
 ## Der Baum in der Timeline
