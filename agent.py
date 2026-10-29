@@ -355,6 +355,24 @@ class Job:
             raise RuntimeError(f"„{' '.join(cmd[:3])} …“ ist mit Exit-Code {p.returncode} fehlgeschlagen.")
         return p
 
+    def stream(self, cmd: list[str], input: str | None = None, secret: str | None = None) -> tuple[int, list[str]]:
+        """Befehl ausführen und jede Ausgabezeile sofort protokollieren (für lange Vorgänge wie impdp)."""
+        mask = (lambda t: t.replace(secret, "***")) if secret else (lambda t: t)
+        self.log("$ " + mask(" ".join(cmd)))
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        if input is not None:
+            p.stdin.write(input)
+            p.stdin.close()
+        seen: list[str] = []
+        for line in p.stdout:
+            line = mask(line.rstrip())
+            if line:
+                self.log("  " + line)
+                if "ORA-" in line:
+                    seen.append(line)
+        return p.wait(), seen
+
     def as_dict(self, with_log: bool = False) -> dict:
         d = dict(id=self.id, title=self.title, sid=self.sid, status=self.status,
                  error=self.error, started=self.started, ended=self.ended, actor=self.actor)
@@ -1898,7 +1916,8 @@ def image_can_create() -> str | None:
             13: "sqlplus ist leer"}.get(p.returncode, (p.stderr or p.stdout).strip()[-300:] or "unbekannt")
 
 
-def newdb_script(sid: str, pdb: str, password: str, charset: str, memory_mb: int) -> str:
+def newdb_script(sid: str, pdb: str, password: str, charset: str, memory_mb: int,
+                 ncharset: str = "AL16UTF16") -> str:
     """Bash-Skript, das im Image per dbca eine Datenbank in der Ablage von zeitkapsel anlegt.
 
     Wird über stdin übergeben, damit das Passwort weder in der Container-Konfiguration noch im
@@ -1918,7 +1937,7 @@ mkdir -p "$D/fast_recovery_area" "$ORACLE_BASE/admin/$SID/adump"
 dbca -silent -createDatabase -templateName General_Purpose.dbc \\
   -gdbName "$SID" -sid "$SID" {cdb_args} \\
   -sysPassword "$PW" -systemPassword "$PW" \\
-  -characterSet {q(charset)} -nationalCharacterSet AL16UTF16 \\
+  -characterSet {q(charset)} -nationalCharacterSet {q(ncharset)} \\
   -storageType FS -datafileDestination "$D" -useOMF false \\
   -recoveryAreaDestination "$D/fast_recovery_area" -recoveryAreaSize 20480 \\
   -emConfiguration NONE -memoryMgmtType AUTO_SGA -totalMemory {int(memory_mb)} \\
@@ -1944,7 +1963,7 @@ echo "ZK_DONE=1"
 
 
 def job_newdb(job: Job, sid: str, pdb: str, password: str, charset: str, port: int,
-              memory_mb: int = 2048) -> None:
+              memory_mb: int = 2048, ncharset: str = "AL16UTF16") -> None:
     vol = MASTER / sid
     reason = image_can_create()
     if reason:
@@ -1963,7 +1982,7 @@ def job_newdb(job: Job, sid: str, pdb: str, password: str, charset: str, port: i
         job.log(f"{kind} wird mit dbca angelegt; das dauert typischerweise 15 bis 45 Minuten.")
         p = job.run(["docker", "run", "--rm", "-i", "--name", cname, "--entrypoint", "bash",
                      "-e", f"ORACLE_SID={sid}", "-v", f"{vol}:/opt/oracle/oradata", IMAGE, "-s"],
-                    input=newdb_script(sid, pdb, password, charset, memory_mb), secret=password,
+                    input=newdb_script(sid, pdb, password, charset, memory_mb, ncharset), secret=password,
                     timeout=CREATE_TIMEOUT)
         out = p.stdout
         if "ZK_DONE=1" not in out:
@@ -2723,6 +2742,252 @@ def api_local_import():
         raise UserError(f"Eine Datenbank {src['sid']} gibt es auf diesem Host schon.")
     job = start_job(f"Datenbank {src['sid']} aus {src['path']} importieren", src["sid"], f"import:{src['sid']}",
                     job_local_import, src, port, opts)
+    return jsonify(job=job.as_dict())
+
+
+# --------------------------------------------------------------------------- Übernahme per Data Pump über DB-Link (Quelle läuft weiter)
+RE_SERVICE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+RE_DBUSER = re.compile(r"^[A-Za-z][A-Za-z0-9_$#]{0,127}$")
+RE_SCHEMA = re.compile(r"^[A-Z][A-Z0-9_$#]{0,127}$")
+
+
+def validate_dp_source(data: dict) -> dict:
+    src = dict(host=(data.get("host") or "").strip(), port=int(data.get("port") or 1521),
+               service=(data.get("service") or "").strip(), user=(data.get("user") or "SYSTEM").strip().upper(),
+               password=data.get("password") or "")
+    if not RE_HOST.match(src["host"]):
+        raise UserError("Quell-Host ungültig.")
+    if not 1 <= src["port"] <= 65535:
+        raise UserError("Port der Quelle ungültig.")
+    if not RE_SERVICE.match(src["service"]):
+        raise UserError("Service-Name ungültig.")
+    if not RE_DBUSER.match(src["user"]):
+        raise UserError("Benutzer ungültig.")
+    if not src["password"] or len(src["password"]) > 128 or any(c in src["password"] for c in '"\n\r\x00'):
+        raise UserError("Passwort der Quelle fehlt oder enthält ein Anführungszeichen bzw. einen Zeilenumbruch.")
+    return src
+
+
+def dp_connect_sql(src: dict) -> str:
+    return f'connect {src["user"]}/"{src["password"]}"@//{src["host"]}:{src["port"]}/{src["service"]}'
+
+
+DP_PROBE_SQL = r"""
+set pagesize 0 linesize 1000 feedback off heading off verify off trimspool on tab off
+select 'ZK_VERSION='||version from v$instance;
+select 'ZK_DBNAME='||name||' ZK_CDB='||cdb||' ZK_LOGMODE='||log_mode from v$database;
+select 'ZK_CHARSET='||value from nls_database_parameters where parameter='NLS_CHARACTERSET';
+select 'ZK_NCHARSET='||value from nls_database_parameters where parameter='NLS_NCHAR_CHARACTERSET';
+select 'ZK_BANNER='||banner from v$version where rownum = 1;
+select 'ZK_ROLE='||granted_role from user_role_privs where granted_role in ('DBA','DATAPUMP_EXP_FULL_DATABASE','EXP_FULL_DATABASE');
+select 'ZK_SCHEMA='||u.username||'|'||nvl(sum(s.bytes),0) from dba_users u left join dba_segments s on s.owner = u.username
+ where u.oracle_maintained = 'N' group by u.username order by u.username;
+select 'ZK_TS='||t.tablespace_name||'|'||t.block_size||'|'||t.bigfile||'|'||
+       nvl((select sum(bytes) from dba_data_files f where f.tablespace_name = t.tablespace_name),0)
+  from dba_tablespaces t where t.contents = 'PERMANENT' and t.tablespace_name not in ('SYSTEM','SYSAUX');
+select 'ZK_LONG='||count(*) from dba_tab_columns c join dba_users u on u.username = c.owner
+ where u.oracle_maintained = 'N' and c.data_type in ('LONG','LONG RAW');
+select 'ZK_UNDORET='||value from v$parameter where name = 'undo_retention';
+exit
+"""
+
+
+def run_oracle_client(script: str, secret: str, timeout: int = 180) -> subprocess.CompletedProcess:
+    """sqlplus aus dem Image in einem Wegwerf-Container; das Skript (mit Passwort) kommt über stdin."""
+    return sh(["docker", "run", "--rm", "-i", "--entrypoint", "bash", IMAGE, "-s"],
+              input=script, timeout=timeout, check=False)
+
+
+def probe_dp(src: dict) -> dict:
+    script = "sqlplus -s -L /nolog <<'EOF'\nwhenever sqlerror exit 5\n" + dp_connect_sql(src) + "\n" + DP_PROBE_SQL + "EOF\n"
+    p = run_oracle_client(script, src["password"])
+    out = (p.stdout + p.stderr).replace(src["password"], "***")
+    kv: dict[str, list[str]] = {}
+    for line in out.splitlines():
+        for part in re.findall(r"(ZK_[A-Z]+)=(\S.*?)(?=\s+ZK_[A-Z]+=|$)", line.strip()):
+            kv.setdefault(part[0], []).append(part[1].strip())
+    if "ZK_VERSION" not in kv:
+        ora = sorted(set(re.findall(r"(ORA-\d{5}[^\n]*)", out)))[:2]
+        raise UserError("Verbindung zur Quelle fehlgeschlagen: " + (" | ".join(ora) or out.strip()[-200:] or "keine Antwort"))
+    one = lambda k, d="": (kv.get(k) or [d])[0]  # noqa: E731
+    problems, warnings = [], []
+    roles = kv.get("ZK_ROLE", [])
+    if not roles:
+        problems.append(f"{src['user']} hat weder DBA noch DATAPUMP_EXP_FULL_DATABASE; damit lässt sich die Datenbank nicht übertragen.")
+    schemas = [dict(name=n, bytes=int(b or 0)) for n, _, b in (x.partition("|") for x in kv.get("ZK_SCHEMA", []))]
+    tablespaces = []
+    for x in kv.get("ZK_TS", []):
+        name, block, big, size = (x.split("|") + ["", "", "", "0"])[:4]
+        tablespaces.append(dict(name=name, block_size=int(block or 8192), bigfile=big == "YES", bytes=int(size or 0)))
+    odd = sorted({t["block_size"] for t in tablespaces if t["block_size"] != 8192})
+    if odd:
+        warnings.append(f"Tablespaces mit Blockgröße {', '.join(map(str, odd))}: dafür werden passende Caches gesetzt.")
+    if int(one("ZK_LONG", "0") or 0):
+        warnings.append(f"{one('ZK_LONG')} Spalten vom Typ LONG/LONG RAW: solche Tabellen lassen sich über einen DB-Link nicht "
+                        "übertragen (ORA-31679) und fehlen danach; sie müssen per expdp-Datei nachgeholt werden.")
+    ret = int(one("ZK_UNDORET", "900") or 900)
+    size = sum(s["bytes"] for s in schemas)
+    if size > 50 * 1024 ** 3 and ret < 3600:
+        warnings.append(f"undo_retention der Quelle ist {ret} s; bei {size / 1024 ** 3:.0f} GB und konsistentem Stand "
+                        "droht ORA-01555. Auf der Quelle erhöhen oder „konsistent“ abwählen.")
+    major = vtuple(one("ZK_VERSION"))[:1]
+    img = image_version()
+    if major and major > vtuple(img)[:1]:
+        problems.append(f"Die Quelle ({one('ZK_VERSION')}) ist neuer als das Image ({img}).")
+    if one("ZK_CDB") == "YES" and "." not in src["service"] and src["service"].upper() == one("ZK_DBNAME").upper():
+        warnings.append("Verbunden mit dem Root einer CDB; für die Anwendungsdaten meist den Service der PDB angeben.")
+    if not schemas:
+        problems.append("Keine Anwendungs-Schemas gefunden.")
+    return dict(mode="dp", source={k: v for k, v in src.items() if k != "password"}, version=one("ZK_VERSION"),
+                dbname=one("ZK_DBNAME"), cdb=one("ZK_CDB") == "YES", logmode=one("ZK_LOGMODE"),
+                charset=one("ZK_CHARSET", "AL32UTF8"), ncharset=one("ZK_NCHARSET", "AL16UTF16"),
+                banner=one("ZK_BANNER"), roles=roles, schemas=schemas, tablespaces=tablespaces,
+                size=size, undo_retention=ret, image_version=img, problems=problems, warnings=warnings)
+
+
+def sql_str(v: str) -> str:
+    return "'" + v.replace("'", "''") + "'"
+
+
+def job_dp_import(job: Job, src: dict, tgt: dict) -> None:
+    sid = tgt["sid"]
+    job.log(f"Quelle {src['user']}@{src['host']}:{src['port']}/{src['service']} prüfen")
+    plan = probe_dp(src)
+    if plan["problems"]:
+        raise RuntimeError("Übernahme nicht möglich: " + " ".join(plan["problems"]))
+    for w in plan["warnings"]:
+        job.log("Hinweis: " + w)
+    known = {s["name"] for s in plan["schemas"]}
+    schemas = tgt["schemas"] or sorted(known)
+    unknown = [s for s in schemas if s not in known]
+    if unknown:
+        raise RuntimeError("Unbekannte Schemas: " + ", ".join(unknown))
+    charset = plan["charset"]
+    if charset not in CHARSETS:
+        job.log(f"Zeichensatz der Quelle {charset} wird übernommen")
+    job.log(f"Neue Datenbank {sid} anlegen (Zeichensatz {charset}, national {plan['ncharset']})")
+    job_newdb(job, sid, "", tgt["password"], charset, tgt["port"], tgt["memory_mb"], plan["ncharset"])
+    cname = sid.lower()
+    edition = read_volume_env(MASTER / sid).get("ZK_EDITION", "enterprise")
+    parallel = tgt["parallel"] if edition == "enterprise" else 1
+    try:
+        job.run(["docker", "exec", cname, "mkdir", "-p", "/opt/oracle/oradata/zk_import"])
+        # Tablespaces vorab als OMF-Dateien im Subvolume anlegen (die Pfade der Quelle gibt es hier nicht)
+        caches = sorted({t["block_size"] for t in plan["tablespaces"] if t["block_size"] != 8192})
+        ts_calls = "\n".join(
+            f"  mk({sql_str(t['name'])}, {t['block_size']}, '{'YES' if t['bigfile'] else 'NO'}', {t['bytes']});"
+            for t in plan["tablespaces"])
+        prep = (
+            "whenever sqlerror exit 9\nset feedback off\n"
+            "alter system set db_create_file_dest='/opt/oracle/oradata' scope=both;\n"
+            + "".join(f"alter system set db_{b // 1024}k_cache_size=64M scope=both;\n" for b in caches)
+            + "declare\n  procedure mk(n varchar2, bs number, big varchar2, bytes number) is c number; files number;\n"
+              "  begin\n    select count(*) into c from dba_tablespaces where tablespace_name = n;\n"
+              "    if c = 0 then\n"
+              "      execute immediate 'create '||case when big='YES' then 'bigfile ' end||'tablespace \"'||n||'\" datafile size 100M"
+              " autoextend on next 256M maxsize unlimited'||case when bs <> 8192 then ' blocksize '||bs end;\n"
+              "      if big = 'NO' then\n        files := ceil(bytes / (30 * 1024 * 1024 * 1024));\n"
+              "        for i in 2 .. files loop\n          execute immediate 'alter tablespace \"'||n||'\" add datafile size 100M"
+              " autoextend on next 256M maxsize unlimited';\n        end loop;\n      end if;\n    end if;\n  end;\nbegin\n"
+            + (ts_calls or "  null;") + "\nend;\n/\n"
+            "create or replace directory ZK_IMPORT_DIR as '/opt/oracle/oradata/zk_import';\n"
+            f"create database link ZK_SRC connect to {src['user']} identified by \"{src['password']}\" "
+            f"using '//{src['host']}:{src['port']}/{src['service']}';\n"
+            "select 'ZK_LINK='||dummy from dual@ZK_SRC;\nexit\n")
+        job.log("Tablespaces, Verzeichnis und DB-Link anlegen")
+        p = job.run(["docker", "exec", "-i", cname, "sqlplus", "-s", "/ as sysdba"], input=prep, secret=src["password"],
+                    allow_fail=True)
+        if "ZK_LINK=X" not in p.stdout:
+            raise RuntimeError("DB-Link zur Quelle funktioniert nicht: " +
+                               (" | ".join(sorted(set(re.findall(r"(ORA-\d{5}[^\n]*)", p.stdout))))[:300] or "siehe Protokoll"))
+
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        par = [f"userid=system/{tgt['password']}", "network_link=ZK_SRC", "directory=ZK_IMPORT_DIR",
+               f"logfile=import_{stamp}.log", f"parallel={parallel}", "logtime=all", "metrics=yes"]
+        if tgt["full"]:
+            par += ["full=y", "exclude=tablespace"]
+        else:
+            par.append("schemas=" + ",".join(schemas))
+        if tgt["consistent"]:
+            par.append("flashback_time=systimestamp")
+        script = ("cat > /tmp/zk_import.par <<'ZKPAR'\n" + "\n".join(par) + "\nZKPAR\n"
+                  "impdp parfile=/tmp/zk_import.par\nrc=$?\nrm -f /tmp/zk_import.par\necho \"ZK_RC=$rc\"\n")
+        job.log(f"Import über den DB-Link ({'vollständig' if tgt['full'] else ', '.join(schemas)}, "
+                f"parallel {parallel}{', konsistent zum Startzeitpunkt' if tgt['consistent'] else ''}) – die Quelle läuft weiter")
+        rc, oras = job.stream(["docker", "exec", "-i", cname, "bash", "-s"], input=script, secret=tgt["password"])
+        lines = "\n".join(job.lines[-20:])
+        m = re.search(r"ZK_RC=(\d+)", lines)
+        irc = int(m.group(1)) if m else rc
+        if irc not in (0, 5):
+            raise RuntimeError(f"impdp ist mit Exit-Code {irc} abgebrochen; Protokoll in "
+                               f"/opt/oracle/oradata/zk_import/import_{stamp}.log der neuen DB.")
+        if irc == 5 or oras:
+            job.log(f"impdp fertig mit {len(oras)} Fehlermeldungen (häufig harmlos, z. B. bereits vorhandene Objekte); "
+                    f"Details im Protokoll oben und in zk_import/import_{stamp}.log.")
+
+        owners = ",".join(sql_str(s) for s in schemas)
+        post = (
+            "set pagesize 0 linesize 400 feedback off heading off\n"
+            "@?/rdbms/admin/utlrp.sql\n"
+            "select 'ZK_INVALID='||count(*) from dba_objects where status <> 'VALID' and owner in (" + owners + ");\n"
+            "select 'ZK_DIFF='||s.owner||'|'||s.object_type||'|'||s.cnt||'|'||nvl(t.cnt,0) from\n"
+            " (select owner, object_type, count(*) cnt from dba_objects@ZK_SRC where owner in (" + owners + ") group by owner, object_type) s\n"
+            " left join (select owner, object_type, count(*) cnt from dba_objects where owner in (" + owners + ") group by owner, object_type) t\n"
+            " on t.owner = s.owner and t.object_type = s.object_type where nvl(t.cnt,0) <> s.cnt order by 1;\n"
+            + ("" if tgt["keep_link"] else "drop database link ZK_SRC;\n") + "exit\n")
+        job.log("Objekte neu kompilieren und mit der Quelle vergleichen")
+        p = job.run(["docker", "exec", "-i", cname, "sqlplus", "-s", "/ as sysdba"], input=post, allow_fail=True, quiet=True)
+        inv = (re.search(r"ZK_INVALID=(\d+)", p.stdout) or [None, "?"])[1]
+        diffs = re.findall(r"ZK_DIFF=(\S+)", p.stdout)
+        job.log(f"Ungültige Objekte nach dem Kompilieren: {inv}")
+        if diffs:
+            job.log(f"Abweichende Objektzahlen ({len(diffs)}), Format Schema|Typ|Quelle|neu:")
+            for d in diffs[:40]:
+                job.log("  " + d)
+        else:
+            job.log("Objektzahlen je Schema und Typ stimmen mit der Quelle überein.")
+    except Exception:
+        if not tgt["keep_link"]:
+            sh(["docker", "exec", "-i", cname, "sqlplus", "-s", "/ as sysdba"],
+               input="drop database link ZK_SRC;\nexit\n", check=False)
+        job.log(f"Die neue Datenbank {sid} bleibt zur Analyse bestehen; löschen über „Alle Snapshots“.")
+        raise
+    tl_add(sid, "db-imported", f"Datenbank {sid} per Data Pump von {src['host']}/{src['service']} übernommen"
+           f" ({'vollständig' if tgt['full'] else ', '.join(schemas)})")
+
+
+@bp.post("/api/import/dp/probe")
+def api_dp_probe():
+    return jsonify(probe_dp(validate_dp_source(request.get_json(force=True))))
+
+
+@bp.post("/api/import/dp")
+def api_dp_import():
+    data = request.get_json(force=True)
+    src = validate_dp_source(data)
+    tgt = dict(sid=(data.get("target_sid") or "").strip().upper(), port=int(data.get("target_port") or 0),
+               password=data.get("target_password") or "", memory_mb=int(data.get("memory_mb") or 2048),
+               full=bool(data.get("full")), schemas=[s.strip().upper() for s in data.get("schemas") or [] if s.strip()],
+               parallel=int(data.get("parallel") or 2), consistent=bool(data.get("consistent", True)),
+               keep_link=bool(data.get("keep_link")))
+    if not RE_NEWSID.match(tgt["sid"]):
+        raise UserError("Neue SID: Großbuchstaben und Ziffern, beginnt mit einem Buchstaben, höchstens 8 Zeichen.")
+    if (MASTER / tgt["sid"]).exists():
+        raise UserError(f"Eine Datenbank {tgt['sid']} gibt es auf diesem Host schon.")
+    if not 1024 <= tgt["port"] <= 65535:
+        raise UserError("Port: 1024 bis 65535.")
+    if not RE_DBPWD.match(tgt["password"]):
+        raise UserError("Passwort der neuen DB: 8–30 Zeichen mit Groß- und Kleinbuchstaben und Ziffer; erlaubt sind A–Z, a–z, 0–9, _ # $.")
+    if not 1024 <= tgt["memory_mb"] <= 262144:
+        raise UserError("Speicher: 1024 bis 262144 MB.")
+    if not 1 <= tgt["parallel"] <= 32:
+        raise UserError("Parallelität: 1 bis 32.")
+    if not tgt["full"] and not tgt["schemas"]:
+        raise UserError("Mindestens ein Schema wählen oder „ganze Datenbank“.")
+    if any(not RE_SCHEMA.match(s) for s in tgt["schemas"]):
+        raise UserError("Ungültiger Schema-Name.")
+    job = start_job(f"Datenbank {tgt['sid']} per Data Pump von {src['host']} übernehmen", tgt["sid"],
+                    f"newdb:{tgt['sid']}", job_dp_import, src, tgt)
     return jsonify(job=job.as_dict())
 
 

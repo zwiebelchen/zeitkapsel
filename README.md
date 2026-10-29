@@ -187,6 +187,24 @@ Fehlt die spfile, fragt der Dialog, ob eine neue angelegt werden soll – aus ei
 
 Der Import legt unter `master/<SID>` ein neues Subvolume an (mit Kompression, siehe „Kompression“), kopiert die Dateien hinein, schreibt Netzwerk-Konfiguration, Markierungsdateien und `zeitkapsel.env` (Zusatz-Mounts für Dateien, die in der DB unter anderen Pfaden stehen) und startet die Kopie einmal in einem Wegwerf-Container (`startup`, Abfragen, `shutdown immediate`). Nur wenn sie dabei sauber öffnet, wird sie zur Master-DB und danach per `datapatch` auf den Patch-Stand des Images gebracht; sonst wird das neue Subvolume wieder entfernt und die Oracle-Fehlermeldung angezeigt. Die Quelle wird in keinem Fall verändert.
 
+
+## Übernahme per Data Pump (Quelle läuft weiter)
+
+„Datenbank importieren“ → „Laufende DB per Data Pump“ übernimmt eine Datenbank, ohne sie anzuhalten – auch von älteren Versionen (ab 12c) und von anderen Plattformen.
+
+Schritt 1 verbindet sich mit Host, Port, Service-Name, Benutzer und Passwort der Quelle (aus einem Wegwerf-Container mit dem `sqlplus` des Images) und liest Version, Zeichensätze, Schemas mit Größe, Tablespaces, Rechte und Stolpersteine. Der Benutzer braucht `DBA` oder `DATAPUMP_EXP_FULL_DATABASE`. Ist die Quelle eine CDB, gehört der Service-Name der PDB hinein.
+
+Schritt 2: ganze Datenbank oder ausgewählte Schemas, SID, Port, Speicher und Passwort der neuen DB, Parallelität. Dann:
+
+1. neue Non-CDB wie bei „Neue Datenbank“ anlegen – in einem komprimierten Subvolume, mit demselben Zeichensatz und nationalen Zeichensatz wie die Quelle;
+2. Tablespaces der Quelle vorab als OMF-Dateien im Subvolume anlegen (Pfade der Quelle gibt es hier nicht; große Smallfile-Tablespaces bekommen mehrere Dateien, abweichende Blockgrößen einen passenden Cache), Directory `ZK_IMPORT_DIR` und DB-Link `ZK_SRC` einrichten;
+3. `impdp` mit `NETWORK_LINK` – ohne Dump-Dateien, auf Wunsch mit `FLASHBACK_TIME=SYSTIMESTAMP` konsistent zum Startzeitpunkt; der Fortschritt erscheint live im Vorgangsprotokoll, das vollständige Protokoll liegt in `zk_import/` im Subvolume;
+4. ungültige Objekte neu kompilieren (`utlrp`), Objektzahlen je Schema und Typ mit der Quelle vergleichen und Abweichungen auflisten, DB-Link wieder entfernen.
+
+Exit-Code 5 von impdp („mit Fehlern abgeschlossen“) gilt als fertig, die Meldungen stehen im Protokoll. Scheitert der Import, bleibt die neue DB zur Analyse stehen und lässt sich unter „Alle Snapshots“ löschen. Die Passwörter von Quelle und neuer DB werden per stdin übergeben und erscheinen nicht im Protokoll; das Quell-Passwort liegt nur während des Imports im DB-Link der neuen DB.
+
+Grenzen: Tabellen mit `LONG`/`LONG RAW` lassen sich über einen DB-Link nicht übertragen (ORA-31679) und müssen per expdp-Datei nachgeholt werden – die Prüfung zählt sie vorab. Für einen konsistenten Stand muss die Quelle genug Undo vorhalten (`undo_retention`), sonst droht ORA-01555. Die Übertragung läuft über das Netz und dauert entsprechend; Statistiken werden mit übernommen.
+
 ## Der Baum in der Timeline
 
 Der Stamm zeigt die Releases, die aus der Master-DB entstanden sind, neueste oben. An jedem Release

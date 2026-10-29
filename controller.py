@@ -482,7 +482,7 @@ def api_audit():
 
 
 # --------------------------------------------------------------------------- Weiterleitung an Agenten
-LONG_CALLS = (r"import/probe", r"usage", r"newdb/check", r"schedules/[^/]+/run")
+LONG_CALLS = (r"import/probe", r"import/local/probe", r"import/dp/probe", r"usage", r"newdb/check", r"schedules/[^/]+/run")
 
 
 @bp.route("/api/hosts/<int:hid>/<path:path>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])

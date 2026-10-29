@@ -456,9 +456,10 @@ label.field textarea { min-height: 84px; resize: vertical; }
         <div class="days js-mode">
           <label><input type="radio" name="mode" value="ssh" checked>Anderer Server per SSH</label>
           <label><input type="radio" name="mode" value="local">Verzeichnis auf diesem Host</label>
+          <label><input type="radio" name="mode" value="dp">Laufende DB per Data Pump</label>
         </div>
       </div>
-      <label class="field">SID <input name="sid" required placeholder="z. B. DLHTEST" autocomplete="off"></label>
+      <label class="field"><span class="js-sidlabel">SID</span> <input name="sid" required placeholder="z. B. DLHTEST" autocomplete="off"><small class="js-sidhint"></small></label>
       <div class="js-ssh">
         <p class="lead">Übernimmt eine laufende Oracle-Datenbank von einem anderen Server auf <b class="js-host"></b>: Datendateien, Redo-Logs, Controlfiles, spfile und Passwortdatei. Die Quell-DB muss laufen, damit sie geprüft werden kann.</p>
         <label class="field">Quell-Host <input name="host" placeholder="z. B. db05" autocomplete="off"></label>
@@ -470,6 +471,18 @@ label.field textarea { min-height: 84px; resize: vertical; }
         <div class="field">Öffentlicher SSH-Schlüssel dieses Hosts
           <small>gehört auf der Quelle in ~/.ssh/authorized_keys des SSH-Benutzers</small>
           <div class="keybox js-key">…</div>
+        </div>
+      </div>
+      <div class="js-dp" hidden>
+        <p class="lead">Legt auf <b class="js-host"></b> eine neue, leere Datenbank in einem komprimierten Subvolume an und holt die Daten per Data Pump über einen DB-Link aus der laufenden Quelle. Die Quelle muss nicht angehalten werden; auch ältere Versionen (ab 12c) gehen.</p>
+        <div class="row3">
+          <label class="field">Quell-Host <input name="dp_host" placeholder="z. B. db05" autocomplete="off"></label>
+          <label class="field">Port <input type="number" name="dp_port" value="1521" min="1" max="65535"></label>
+          <label class="field">Service-Name <input name="dp_service" placeholder="z. B. DLHTEST" autocomplete="off"></label>
+        </div>
+        <div class="row2">
+          <label class="field">Benutzer <input name="dp_user" value="SYSTEM" autocomplete="off"><small>mit DBA oder DATAPUMP_EXP_FULL_DATABASE</small></label>
+          <label class="field">Passwort <input type="password" name="dp_password" autocomplete="off"></label>
         </div>
       </div>
       <div class="js-local" hidden>
@@ -1160,7 +1173,38 @@ function renderAccess() {
     </div>`;
 }
 
+function dpPlanHtml(plan, host, freePort) {
+  const schemas = plan.schemas.map(sc => `<label><input type="checkbox" name="schema" value="${esc(sc.name)}" checked> ${esc(sc.name)} <span class="muted-note">${fmtBytes(sc.bytes)}</span></label>`).join("");
+  return `<dl class="facts-list">
+      <dt>Quelle</dt><dd>${esc(plan.source.user)}@${esc(plan.source.host)}:${plan.source.port}/${esc(plan.source.service)} – ${esc(plan.dbname)}${plan.cdb ? " (CDB)" : ""}</dd>
+      <dt>Version</dt><dd>${esc(plan.version)} – Image ${esc(plan.image_version)}</dd>
+      <dt>Zeichensatz</dt><dd>${esc(plan.charset)}, national ${esc(plan.ncharset)} (die neue DB bekommt denselben)</dd>
+      <dt>Daten</dt><dd>${fmtBytes(plan.size)} in ${plan.schemas.length} Schemas, ${plan.tablespaces.length} Tablespaces</dd>
+      <dt>Rechte</dt><dd>${esc(plan.roles.join(", ") || "–")}</dd>
+    </dl>
+    ${plan.problems.length ? `<div><b class="bad">Übernahme nicht möglich</b><ul>${plan.problems.map(p => `<li class="bad">${esc(p)}</li>`).join("")}</ul></div>` : ""}
+    ${plan.warnings.length ? `<div><b>Hinweise</b><ul>${plan.warnings.map(w => `<li class="warn">${esc(w)}</li>`).join("")}</ul></div>` : ""}
+    ${plan.problems.length ? "" : `
+    <div class="needbox">
+      <div class="days js-scope"><label><input type="radio" name="scope" value="full" checked>Ganze Datenbank</label><label><input type="radio" name="scope" value="schemas">Ausgewählte Schemas</label></div>
+      <div class="devpick js-schemas" hidden style="margin-top:8px">${schemas}</div>
+    </div>
+    <div class="row3">
+      <label class="field">Port auf ${esc(host.name)} <input type="number" name="port" min="1024" max="65535" value="${freePort}" required></label>
+      <label class="field">Speicher (MB) <input type="number" name="memory_mb" value="4096" min="1024" step="256"></label>
+      <label class="field">Parallelität <input type="number" name="parallel" value="4" min="1" max="32"></label>
+    </div>
+    <div class="row2">
+      <label class="field">Passwort der neuen DB <input type="password" name="target_password" autocomplete="new-password"><small>für SYS und SYSTEM</small></label>
+      <label class="field">wiederholen <input type="password" name="target_password2" autocomplete="new-password"></label>
+    </div>
+    <label class="check"><input type="checkbox" name="consistent" value="1" checked><span>Konsistent zum Startzeitpunkt <small>flashback_time; braucht ausreichend Undo auf der Quelle</small></span></label>
+    <label class="check"><input type="checkbox" name="keep_link" value="1"><span>DB-Link danach behalten <small>sonst wird er mit den Zugangsdaten der Quelle wieder entfernt</small></span></label>
+    <p class="hint-box">Die neue Datenbank ${esc(plan.source.service)} → <b class="js-newsid"></b> entsteht als Non-CDB in einem komprimierten Subvolume; Tablespaces werden vorab angelegt. Danach holt impdp die Daten über den DB-Link, das Vorgangsprotokoll zeigt den Fortschritt. Am Ende werden Objekte neu kompiliert und die Objektzahlen mit der Quelle verglichen.</p>`}`;
+}
+
 function importPlanHtml(plan, host, freePort) {
+  if (plan.mode === "dp") return dpPlanHtml(plan, host, freePort);
   const local = plan.mode === "local";
   const facts = local ? `
       <dt>Verzeichnis</dt><dd>${esc(plan.data_dir)}</dd>
@@ -1208,14 +1252,18 @@ function importPlanHtml(plan, host, freePort) {
 
 function openImportDialog() {
   let plan = null;
+  let dpSrc = null;
   const host = currentHost();
   openDialog("dlgImport", f => {
     $(".js-host", f).textContent = host.name;
     f.querySelectorAll(".js-host").forEach(x => { x.textContent = host.name; });
     const syncMode = () => {
-      const local = f.querySelector('input[name=mode]:checked').value === "local";
-      $(".js-ssh", f).hidden = local; $(".js-local", f).hidden = !local;
-      f.host.required = !local; f.path.required = local;
+      const mode = f.querySelector('input[name=mode]:checked').value;
+      $(".js-ssh", f).hidden = mode !== "ssh"; $(".js-local", f).hidden = mode !== "local"; $(".js-dp", f).hidden = mode !== "dp";
+      f.host.required = mode === "ssh"; f.path.required = mode === "local";
+      f.dp_host.required = f.dp_service.required = f.dp_password.required = mode === "dp";
+      $(".js-sidlabel", f).textContent = mode === "dp" ? "SID der neuen Datenbank" : "SID";
+      $(".js-sidhint", f).textContent = mode === "dp" ? "höchstens 8 Zeichen; darf wie die Quelle heißen" : "";
     };
     f.querySelectorAll('input[name=mode]').forEach(r => { r.onchange = syncMode; });
     syncMode();
@@ -1237,15 +1285,31 @@ function openImportDialog() {
       const local = v.mode === "local";
       const btn = $(".js-next", f); btn.textContent = "Prüfe …";
       try {
-        plan = local
+        if (v.mode === "dp") {
+          dpSrc = { host: v.dp_host, port: +v.dp_port, service: v.dp_service, user: v.dp_user, password: v.dp_password, target_sid: v.sid.toUpperCase() };
+          plan = await api("POST", "/api/import/dp/probe", dpSrc);
+        } else plan = local
           ? await api("POST", "/api/import/local/probe", { path: v.path, sid: v.sid, spfile: v.spfile, orapw: v.orapw })
           : await api("POST", "/api/import/probe", { host: v.host, user: v.user, sid: v.sid, ssh_port: +v.ssh_port, oracle_home: v.oracle_home });
       } finally { btn.textContent = "Quelle prüfen"; }
       const freePort = 1521 + Math.max(0, ...S.dbs.map(d => (d.master.port || 1521) - 1521)) + 1;
       $(".js-s2", f).innerHTML = importPlanHtml(plan, host, freePort);
+      if (plan.mode === "dp" && !plan.problems.length) {
+        $(".js-newsid", f).textContent = dpSrc.target_sid;
+        f.querySelectorAll("input[name=scope]").forEach(r => { r.onchange = () => { $(".js-schemas", f).hidden = f.querySelector("input[name=scope]:checked").value !== "schemas"; }; });
+      }
       f.dataset.step = "2"; f._show(2);
       $(".js-next", f).disabled = plan.problems.length > 0;
       throw Object.assign(new Error(""), { keepOpen: true });
+    }
+    if (plan.mode === "dp") {
+      if (v.target_password !== v.target_password2) throw new Error("Die Passwörter der neuen DB stimmen nicht überein.");
+      const full = v.scope !== "schemas";
+      const schemas = full ? [] : [...f.querySelectorAll("input[name=schema]:checked")].map(c => c.value);
+      if (!full && !schemas.length) throw new Error("Mindestens ein Schema wählen.");
+      startedJob(await api("POST", "/api/import/dp", { ...dpSrc, target_port: +v.port, target_password: v.target_password,
+        memory_mb: +v.memory_mb, parallel: +v.parallel, full, schemas, consistent: !!v.consistent, keep_link: !!v.keep_link }));
+      return;
     }
     if (plan.mode === "local") {
       const needs = plan.needs || {};
