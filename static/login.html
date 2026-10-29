@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anmelden · zeitkapsel</title>
+<style>
+:root { --paper: #eceeeb; --sheet: #fafbfa; --ink: #14252b; --muted: #586a70; --rule: #c6cfcc; --err: #ad2a20;
+  font-family: ui-sans-serif, system-ui, "Segoe UI", "Noto Sans", "Helvetica Neue", Arial, sans-serif; font-size: 15px; color: var(--ink); background: var(--paper); }
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 20px; }
+main { width: min(380px, 100%); }
+.brand { font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 0 0 6px; }
+h1 { margin: 0 0 22px; font-size: 30px; line-height: 1.15; }
+form { display: grid; gap: 14px; background: var(--sheet); border: 1px solid var(--rule); border-radius: 10px; padding: 22px; }
+label { display: grid; gap: 4px; font-weight: 600; font-size: 14px; }
+input { font: inherit; padding: 8px 10px; border: 1px solid var(--rule); border-radius: 6px; background: #fff; color: var(--ink); }
+input:focus-visible, button:focus-visible { outline: 2px solid #1e5a84; outline-offset: 2px; }
+button { font: inherit; cursor: pointer; padding: 9px 14px; border-radius: 6px; border: 1px solid var(--ink); background: var(--ink); color: #f3f6f5; }
+button:disabled { opacity: .5; cursor: wait; }
+.err { color: var(--err); margin: 0; font-size: 14px; }
+.err:empty { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <p class="brand">zeitkapsel</p>
+  <h1>Oracle-Datenbanken</h1>
+  <form id="f">
+    <label>Benutzername <input name="username" autocomplete="username" required autofocus></label>
+    <label>Passwort <input name="password" type="password" autocomplete="current-password" required></label>
+    <p class="err" id="err" role="alert"></p>
+    <button>Anmelden</button>
+  </form>
+</main>
+<script>
+document.getElementById("f").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const btn = ev.target.querySelector("button"), err = document.getElementById("err");
+  btn.disabled = true; err.textContent = "";
+  try {
+    const r = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(Object.fromEntries(new FormData(ev.target))) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || "Anmeldung fehlgeschlagen.");
+    location.href = "/";
+  } catch (e) { err.textContent = e.message; btn.disabled = false; }
+});
+</script>
+</body>
+</html>

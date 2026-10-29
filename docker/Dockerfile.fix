@@ -1,0 +1,25 @@
+# zeitkapsel – Korrektur-Image für das mit Oracles Patching-Extension gebaute 19c-Image
+#
+# Behebt zwei Fehler des gepatchten Images (siehe Runbook):
+#  1. Binaries wie sqlplus, adrci, rman sind leere Platzhalter (0 Bytes) → "relink all"
+#  2. Wrapper wie dbca verweisen auf /u01/app/oracle aus Oracles Build-Umgebung,
+#     platform_common fehlt (nur platform_common.ouibak) → nötig zum Anlegen neuer DBs
+#
+# Bauen:  docker build -t oracle/database:19.30.0-ee -f docker/Dockerfile.fix .
+# Basis:  BASE_IMAGE anpassen, falls das gepatchte Image anders heißt.
+ARG BASE_IMAGE=oracle/database:19.3.0-ee-ext
+FROM ${BASE_IMAGE}
+USER oracle
+RUN set -e; \
+    cd "$ORACLE_HOME/bin"; \
+    for f in *.ouibak; do o="${f%.ouibak}"; [ -e "$o" ] || cp -p "$f" "$o"; done; \
+    for f in $(grep -Il "/u01/app/oracle" -- * 2>/dev/null | grep -v '\.ouibak$'); do \
+      sed -i "s#/u01/app/oracle/product/19.0.0/dbhome_1#${ORACLE_HOME}#g; s#/u01/app/oracle#${ORACLE_BASE}#g" "$f"; \
+    done; \
+    "$ORACLE_HOME/bin/relink" all; \
+    for b in sqlplus adrci rman expdp impdp tnsping lsnrctl; do \
+      test -s "$ORACLE_HOME/bin/$b" || { echo "FEHLT: $b"; exit 1; }; \
+    done; \
+    test -s "$ORACLE_HOME/bin/platform_common" || { echo "FEHLT: platform_common"; exit 1; }; \
+    if grep -q "/u01/app/oracle" "$ORACLE_HOME/bin/dbca"; then echo "dbca verweist noch auf /u01"; exit 1; fi; \
+    echo "Noch leer:"; find "$ORACLE_HOME/bin" -maxdepth 1 -type f -size 0

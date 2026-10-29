@@ -3,5 +3,7 @@ __pycache__/
 venv/
 .venv/
 *.tmp
-# echte Konfiguration mit Passwort gehört nicht ins Repo
-oradb-ui.env
+*.db
+# echte Konfiguration mit Token gehört nicht ins Repo
+zeitkapsel.env
+!systemd/zeitkapsel.env.example

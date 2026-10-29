@@ -1,0 +1,16 @@
+[Unit]
+Description=zeitkapsel – Oracle-Datenbanken in Docker auf btrfs (Controller und/oder Agent)
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/zeitkapsel.env
+ExecStart=/opt/zeitkapsel/venv/bin/python /opt/zeitkapsel/app.py serve
+Restart=on-failure
+RestartSec=5
+# Der Agent braucht root (btrfs-Snapshots, Docker); ein reiner Controller (ZK_ROLE=controller)
+# kann mit User= unter einem eigenen Konto laufen.
+
+[Install]
+WantedBy=multi-user.target

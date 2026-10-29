@@ -2,73 +2,134 @@
 
 Datenbanken, deren Daten auf einem BTRFS-Snapshot liegen und wo die DB als Docker-Container läuft, in Sekunden snapshotten, branchen, Entwicklungsinstanzen hochziehen und mehr.
 
-Die Weboberfläche (`oradb-ui`) ist eine kleine Flask-Anwendung für die Oracle-Container auf db05-alma10. Sie nutzt dieselbe Ablage
-und dieselben Konventionen wie `startdb.sh`, `golden.sh` und `devdb.sh` aus dem Runbook;
-Oberfläche und Skripte lassen sich parallel verwenden.
+zeitkapsel verwaltet Oracle-Datenbanken, die als Container (Oracle-Image aus `oracle/docker-images`) auf einem oder mehreren Hosts mit btrfs laufen: Releases als schreibgeschützte Snapshots, Entwickler-DBs als beschreibbare Kopien davon, Snapshots dieser Entwickler-DBs, Zeitpläne – über eine Weboberfläche mit Benutzern und Rechten oder über Shell-Skripte.
 
-| Bereich | Was die Oberfläche tut |
+| Bereich | Was zeitkapsel tut |
 | --- | --- |
-| Datenbanken | listet jede Master-DB unter `/srv/oradb/master/<SID>` mit Status, Port und JDBC-URL |
-| Release erstellen | wie `golden.sh`, aber mit frei wählbarem Namen und Beschreibung → `/srv/oradb/golden/<SID>/<name>` |
-| Releases | Beschreibung bearbeiten, löschen, als Entwickler-DB starten, neues Release davon ableiten (wie ein Git-Branch) |
-| Entwickler-DBs | aus einem Release oder einem Entwickler-Snapshot anlegen, starten, stoppen, auf den Ausgangsstand zurücksetzen, löschen |
-| Entwickler-Snapshots | Stand einer laufenden Entwickler-DB festhalten (im Betrieb oder kurz heruntergefahren); darauf zurücksetzen, neue Entwickler-DB daraus anlegen, als Release übernehmen, löschen |
-| Timeline | Baum je Datenbank: Releases der Master-DB auf dem Stamm, daran als Äste abgeleitete Releases, Entwickler-DBs und deren Snapshots; dazu eigene Notizen und auf Wunsch alle Ereignisse |
-| Verwaltung | Zeitpläne (Release erstellen, Snapshot einer Entwickler-DB, Entwickler-DBs stoppen oder zurücksetzen) mit Wochentagen, Uhrzeit und Aufbewahrung; Systemangaben; Aufräumen abgebrochener Release-Vorgänge |
-| Alle Snapshots | alle Subvolumes mit Art, Erstellzeit, Schreibschutz, Container und exklusiver Belegung |
+| Hosts | mehrere DB-Hosts in einer Oberfläche; auf jedem läuft ein Agent |
+| Datenbanken | Master-DBs je Host mit Status, Port und JDBC-URL; starten und stoppen |
+| Neue Datenbank | leere Container-DB (CDB mit PDB) mit eigenem Container anlegen |
+| Import | bestehende DB von einem anderen Server per SSH übernehmen, inklusive spfile und Passwortdatei |
+| Releases | aus der Master-DB, aus einem Entwickler-Snapshot oder von einem Release abgeleitet (wie ein Git-Branch) |
+| Entwickler-DBs | aus einem Release oder Snapshot anlegen, starten, stoppen, zurücksetzen, snapshotten, löschen |
+| Timeline | Baum je Datenbank mit Releases, Entwickler-DBs, Snapshots und Notizen |
+| Zeitpläne | täglich, stündlich, minütlich: Releases, Snapshots, Entwickler-DBs stoppen oder zurücksetzen |
+| Benutzer | Anmeldung, Rollen Administrator und Benutzer, Protokoll aller Änderungen |
+| Skripte | `startdb.sh`, `golden.sh`, `devdb.sh` mit derselben Ablage, parallel zur Oberfläche nutzbar |
 
-Lange Vorgänge (Release erstellen, Entwickler-DB anlegen, starten, zurücksetzen, Snapshot) laufen im
-Hintergrund; ihr Protokoll steht unten rechts unter „Vorgänge“.
+## Aufbau
 
-## Installation (als root auf db05-alma10)
+```
+Browser ──► Controller ──► Agent auf db05-alma10  (btrfs, docker)
+            (Anmeldung,  ├► Agent auf db06-alma10
+             Rechte,     └► …
+             SQLite)
+```
+
+- **Agent** (`agent.py`): läuft auf jedem DB-Host als root, steuert btrfs-Subvolumes und Container, führt Zeitpläne aus. Er nimmt nur Aufrufe mit seinem Token an (`ZK_AGENT_TOKEN`).
+- **Controller** (`controller.py`): Oberfläche, Anmeldung, Benutzer und Hosts in SQLite, Rechteprüfung, Weiterleitung an die Agenten, Protokoll.
+- Beide stecken in derselben Anwendung; `ZK_ROLE` bestimmt, was ein Prozess tut: `all` auf dem ersten Host (Controller und Agent), `agent` auf weiteren Hosts. Im Betrieb `all` trägt sich der eigene Agent beim ersten Start als Host ein.
+
+## Rollen und Rechte
+
+| Aktion | Benutzer | Administrator |
+| --- | --- | --- |
+| Hosts, Datenbanken, Releases, Timeline, Snapshots ansehen | ja | ja |
+| Entwickler-DB anlegen (aus jedem Release oder Snapshot) | ja, für sich | ja, für jeden |
+| eigene Entwickler-DB starten, stoppen, zurücksetzen, snapshotten, löschen | ja | ja (auch fremde) |
+| Snapshots der eigenen Entwickler-DB zurückspielen, beschreiben, löschen | ja | ja |
+| Releases erstellen, ableiten, beschreiben, löschen; Snapshot als Release übernehmen | – | ja |
+| Notizen, Zeitpläne, Aufräumen | – | ja |
+| Master-DB starten und stoppen, neue Datenbank, Import | – | ja |
+| Benutzer, Hosts, Protokoll, Besitzer einer Entwickler-DB ändern | – | ja |
+
+Die Rechte prüft der Controller. Wem eine Entwickler-DB gehört, steht in `meta/<SID>/devdbs/<id>.json` und als Label `devowner` am Container.
+
+## Installation
+
+### Erster Host (Controller und Agent)
+
+Voraussetzungen: AlmaLinux 10.1 oder neuer mit btrfs unter `/srv`, Docker, Python 3.11+, `rsync` und `ssh` für den Import, das Oracle-Image (siehe „Image“).
 
 ```bash
-mkdir -p /opt/oradb-ui
-cp app.py index.html requirements.txt /opt/oradb-ui/
-python3 -m venv /opt/oradb-ui/venv
-/opt/oradb-ui/venv/bin/pip install -r /opt/oradb-ui/requirements.txt
+git clone https://github.com/zwiebelchen/zeitkapsel.git /opt/zeitkapsel
+python3 -m venv /opt/zeitkapsel/venv
+/opt/zeitkapsel/venv/bin/pip install -r /opt/zeitkapsel/requirements.txt
 
-install -m 600 oradb-ui.env.example /etc/oradb-ui.env
-vi /etc/oradb-ui.env                      # Passwort setzen, ggf. ORADB_DB_HOST
+install -m 600 /opt/zeitkapsel/systemd/zeitkapsel.env.example /etc/zeitkapsel.env
+/opt/zeitkapsel/venv/bin/python /opt/zeitkapsel/app.py gen-token     # → ZK_AGENT_TOKEN
+vi /etc/zeitkapsel.env
 
-cp oradb-ui.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now oradb-ui
-journalctl -u oradb-ui -f
+# erstes Administrator-Konto
+set -a; . /etc/zeitkapsel.env; set +a
+/opt/zeitkapsel/venv/bin/python /opt/zeitkapsel/app.py create-user chef --admin
 
+cp /opt/zeitkapsel/systemd/zeitkapsel.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now zeitkapsel
 firewall-cmd --permanent --add-port=8088/tcp && firewall-cmd --reload
 ```
 
-Danach `http://db05-alma10:8088` öffnen und mit Benutzer und Passwort aus `/etc/oradb-ui.env` anmelden.
+Danach `http://<host>:8088` öffnen und anmelden. Weitere Benutzer legst du unter „Benutzer, Hosts, Protokoll“ an.
 
-## Sicherheit
+### Weitere DB-Hosts (nur Agent)
 
-Die Anwendung läuft als root und steuert Docker und btrfs. Deshalb:
+Wie oben, aber in `/etc/zeitkapsel.env` `ZK_ROLE=agent` und ein eigenes Token; kein Benutzer nötig. Dann in der Oberfläche unter „Benutzer, Hosts, Protokoll“ → „Host hinzufügen“ Name, Adresse (`http://db06-alma10:8088`) und Token eintragen; die Verbindung wird beim Speichern geprüft. Den Port des Agenten nur für den Controller-Host öffnen.
 
-- nur im internen Netz erreichbar machen, nie ins Internet;
-- ein eigenes, starkes Passwort in `/etc/oradb-ui.env` (Rechte 600);
-- die Anmeldung läuft per HTTP Basic Auth und überträgt das Passwort ohne TLS lesbar. Für mehr als
-  ein vertrauenswürdiges Admin-Netz gehört ein Reverse Proxy mit TLS davor;
-- ändernde Aufrufe verlangen einen eigenen HTTP-Header, damit fremde Webseiten keine Aktionen
-  im Browser eines angemeldeten Benutzers auslösen können;
-- alle Namen werden gegen enge Muster geprüft; Befehle laufen ohne Shell.
+### Umstieg von oradb-ui
 
-## Ablage und Metadaten
+1. `systemctl disable --now oradb-ui`, zeitkapsel wie oben installieren. Die Ablage unter `/srv/oradb` bleibt unverändert; Releases, Timeline und Zeitpläne werden übernommen. Variablen mit `ORADB_`-Präfix werden weiter gelesen, neue heißen `ZK_…`.
+2. Bestehende Entwickler-DBs tragen im Feld „Besitzer“ den früheren Freitext („Für wen“). Bis ein Administrator über „Besitzer ändern“ einen Benutzer zuweist, kann sie nur ein Administrator bedienen.
+
+## Image
+
+Das Image wird nach dem Runbook gebaut (19.3 mit RU 19.30 über die Patching-Extension). Danach immer das Korrektur-Image bauen:
+
+```bash
+docker build -t oracle/database:19.30.0-ee -f docker/Dockerfile.fix .
+```
+
+Es linkt die leer gebliebenen Binaries (`sqlplus`, `adrci` …) neu und repariert die `/u01`-Pfade in `dbca` und `platform_common`. Ohne Letzteres kann das Image keine neuen Datenbanken anlegen; die Oberfläche prüft das vor jeder Neuanlage.
+
+## Ablage
 
 ```
-/srv/oradb/master/<SID>             Master-DBs (werden weiter mit startdb.sh gestartet)
-/srv/oradb/golden/<SID>/<release>   Releases (schreibgeschützt)
-/srv/oradb/dev/<SID>-<name>         Entwickler-DBs
-/srv/oradb/devdumps/<SID>-<name>    Data-Pump-Verzeichnisse der Entwickler-DBs
+/srv/oradb/master/<SID>                       Master-DB (Subvolume, im Container /opt/oracle/oradata)
+/srv/oradb/golden/<SID>/<release>             Releases (schreibgeschützt)
+/srv/oradb/dev/<SID>-<name>                   Entwickler-DBs
 /srv/oradb/devsnaps/<SID>-<name>/<snapshot>   Snapshots von Entwickler-DBs (schreibgeschützt)
-/srv/oradb/meta/<SID>/              Release- und Snapshot-Beschreibungen (releases/, devsnaps/) und Timeline (timeline.jsonl)
+/srv/oradb/devdumps/<SID>-<name>              Data-Pump-Verzeichnisse der Entwickler-DBs
+/srv/oradb/meta/<SID>/                        db.json (Port), releases/, devdbs/, devsnaps/, timeline.jsonl
+/srv/oradb/meta/schedules.json                Zeitpläne des Hosts
 ```
 
-Entwickler-DB-Container tragen die Labels `devdb`, `devport`, `devsid`, `devrelease`,
-`devbase`, `devowner` und `devcreated`. `devbase` ist der Ausgangsstand (`release:<name>` oder
-`snap:<SID>-<dev>/<snapshot>`), `devrelease` das Release, auf das der Stand zurückgeht. Mit
-`devdb.sh` angelegte DBs erscheinen ebenfalls, nur ohne bekannten Ausgangsstand; „Auf
-Ausgangsstand zurücksetzen“ ist für sie gesperrt.
+Jedes DB-Subvolume enthält die Markierungsdateien, ohne die das Startskript des Oracle-Images eine vorhandene Datenbank löschen würde (`.<SID>.created`, `dbconfig/<SID>/.docker_<edition>`), sowie optional `zeitkapsel.env`:
+
+| Schlüssel | Bedeutung |
+| --- | --- |
+| `ZK_DB_TYPE` | `noncdb` oder `cdb` |
+| `ZK_PDB` | Name der PDB (bei `cdb`) |
+| `ZK_SERVICE` | Service-Name für die JDBC-URL (Standard: PDB bzw. SID) |
+| `ZK_SHM_SIZE` | `--shm-size` für AMM (`memory_target`), z. B. `5g` |
+| `ZK_EDITION` | `enterprise` oder `standard` |
+| `ZK_MOUNTS` | zusätzliche Mounts `<Pfad im Subvolume>:<Pfad im Container>`, Leerzeichen-getrennt |
+
+Weil die Datei im Subvolume liegt, wandert sie mit jedem Release und jeder Entwickler-DB mit; Oberfläche und Skripte setzen die Angaben bei jedem `docker run` um.
+
+## Neue Datenbank
+
+„Verwaltung“ → „Neue Datenbank“ legt eine leere CDB mit einer PDB an: Subvolume (mit `chattr +C`), Anlage per dbca im Oracle-Image (15 bis 45 Minuten), danach wird der Anlage-Container entfernt – er trägt das Passwort in seiner Konfiguration – und die DB als normale Master-DB ohne Passwort-Variable gestartet. Das Passwort gilt für SYS, SYSTEM und PDBADMIN und erscheint nicht im Vorgangsprotokoll.
+
+## Import von einem anderen Server
+
+„Verwaltung“ → „Datenbank importieren“ übernimmt eine laufende Oracle-DB per SSH.
+
+Voraussetzungen auf der Quelle:
+
+- der öffentliche Schlüssel des Agenten (im Dialog angezeigt) in `~/.ssh/authorized_keys` des SSH-Benutzers (meist `oracle`), der die Datendateien lesen und `sqlplus / as sysdba` ausführen darf;
+- `ORACLE_HOME` im Login-Profil oder im Dialog angegeben, `rsync` installiert;
+- Dateisystem statt ASM, spfile statt pfile, dieselbe oder eine ältere Version als das Image.
+
+Ablauf: Schritt 1 liest Version, Dateien, Parameter und plant den Import (Verzeichnisse, Zusatz-Mounts, Shared Memory, Service-Name, Hinweise). Schritt 2 fährt die Quelle sauber herunter, legt das Subvolume an, kopiert genau die Dateien der DB per `rsync`, holt spfile und Passwortdatei, schreibt Netzwerk-Konfiguration und Markierungsdateien und startet die DB als Master-DB. Liegen die Dateien auf der Quelle nicht unter `/opt/oracle/oradata/<SID>`, werden sie im Container zusätzlich unter ihrem alten Pfad eingehängt, sodass spfile und Controlfiles unverändert passen. Mit „Quell-DB nach dem Kopieren wieder starten“ ist es eine Kopie, ohne ist es ein Umzug. Geht etwas schief, wird die Quelle wieder gestartet und das halbfertige Subvolume entfernt. Ist das Image neuer als die Quelle, läuft danach `datapatch`.
 
 ## Der Baum in der Timeline
 
@@ -91,6 +152,20 @@ und stehen deshalb auf dem Stamm.
 
 Ereignisse wie „Entwickler-DB angelegt“ sind standardmäßig ausgeblendet, weil der Baum diese
 Information bereits zeigt; „Ereignisse anzeigen“ blendet sie ein (z. B. um Gelöschtes zu sehen).
+
+## Snapshots von Entwickler-DBs
+
+Ein Snapshot im laufenden Betrieb ist sofort fertig und absturzkonsistent: Alle Dateien der DB
+liegen in einem Subvolume, das btrfs atomar einfriert; Oracle stellt den Stand beim nächsten Start
+per Instance Recovery selbst wieder her. Mit „DB dafür kurz herunterfahren“ entsteht ein sauber
+geschlossener Stand, dafür ist die DB ein bis zwei Minuten nicht erreichbar.
+
+Beim Löschen einer Entwickler-DB werden ihre Snapshots mitgelöscht. Ein Stand, der bleiben soll,
+wird vorher „Als Release übernehmen“; das durchläuft dieselben Schritte wie ein Release aus der
+Master-DB (einmal starten, Entwickler-Einstellungen setzen, sauber herunterfahren, einfrieren).
+Entwickler-DBs, die aus einem gelöschten Snapshot entstanden sind, behalten ihre Daten, lassen sich
+aber nicht mehr auf ihren Ausgangsstand zurücksetzen – wohl aber auf eigene Snapshots. Releases aus `golden.sh`
+erscheinen in der Timeline mit dem Vermerk „extern“.
 
 ## Zeitpläne
 
@@ -133,34 +208,28 @@ stehen. Von Hand erstellte Stände rührt die Aufbewahrung nie an.
 Zeitpläne liegen in `/srv/oradb/meta/schedules.json`. Der Zeitplaner läuft im Dienst selbst; es
 braucht keinen Cronjob.
 
-## Snapshots von Entwickler-DBs
+## Skripte
 
-Ein Snapshot im laufenden Betrieb ist sofort fertig und absturzkonsistent: Alle Dateien der DB
-liegen in einem Subvolume, das btrfs atomar einfriert; Oracle stellt den Stand beim nächsten Start
-per Instance Recovery selbst wieder her. Mit „DB dafür kurz herunterfahren“ entsteht ein sauber
-geschlossener Stand, dafür ist die DB ein bis zwei Minuten nicht erreichbar.
+`scripts/` enthält die Kommandozeilen-Werkzeuge aus dem Runbook, abgestimmt auf dieselbe Ablage, dieselben Labels und `zeitkapsel.env`. Sie lesen `ZK_BASE` und `ZK_IMAGE` aus `/etc/zeitkapsel.env`.
 
-Beim Löschen einer Entwickler-DB werden ihre Snapshots mitgelöscht. Ein Stand, der bleiben soll,
-wird vorher „Als Release übernehmen“; das durchläuft dieselben Schritte wie ein Release aus der
-Master-DB (einmal starten, Entwickler-Einstellungen setzen, sauber herunterfahren, einfrieren).
-Entwickler-DBs, die aus einem gelöschten Snapshot entstanden sind, behalten ihre Daten, lassen sich
-aber nicht mehr auf ihren Ausgangsstand zurücksetzen – wohl aber auf eigene Snapshots. Releases aus `golden.sh`
-erscheinen in der Timeline mit dem Vermerk „extern“.
+| Skript | Zweck |
+| --- | --- |
+| `startdb.sh <SID> [Port]` | Master-DB starten (Port sonst aus `meta/<SID>/db.json`), prüft vorher die Markierungsdateien |
+| `golden.sh <SID> [Name]` | Release vom laufenden Master erstellen |
+| `devdb.sh create <SID> <name> [Release] [Besitzer]` | Entwickler-DB anlegen; Besitzer standardmäßig `$SUDO_USER` |
+| `devdb.sh delete <SID> <name>` / `devdb.sh list` | löschen (mit Snapshots) bzw. auflisten |
 
-## Konfiguration
+## Sicherheit
 
-Alle Einstellungen stehen kommentiert in `oradb-ui.env.example`. Wichtig für das Release-Erstellen:
-Standardmäßig setzt die Oberfläche in der Zwischen-DB `sga_target` und `sga_max_size` auf 1 GB und
-`pga_aggregate_target` auf 300 MB. Arbeitet die Master-DB mit AMM (`memory_target` > 0) oder
-sollen weitere Schritte laufen (Passwörter, Anonymisierung), gehört eigenes SQL in eine Datei, auf
-die `ORADB_RELEASE_SQL_FILE` zeigt. `shutdown immediate` hängt die Oberfläche selbst an.
+- Agenten laufen als root und steuern Docker und btrfs: ihren Port nur für den Controller erreichbar machen, jedes Token geheim halten (`/etc/zeitkapsel.env` mit Rechten 600).
+- Die Oberfläche nur intern betreiben; über fremde Netze einen Reverse Proxy mit TLS davorsetzen und `ZK_COOKIE_SECURE=1`. Auch Agent-Verbindungen über fremde Netze gehören hinter TLS.
+- Passwörter liegen als Hash (werkzeug, scrypt) in SQLite; nach acht Fehlversuchen in fünf Minuten sperrt die Anmeldung für die Adresse kurz.
+- Ändernde Aufrufe brauchen einen eigenen Header (Schutz gegen Cross-Site-Requests); alle Eingaben werden gegen enge Muster geprüft, Befehle laufen ohne Shell.
+- Jede ändernde Aktion steht mit Benutzer, Host und Ergebnis im Protokoll.
 
 ## Grenzen
 
-- Die Master-DBs startet und stoppt die Oberfläche bewusst nicht; dafür bleibt `startdb.sh`.
-- Vorgangsprotokolle liegen nur im Arbeitsspeicher (die letzten 50) und sind nach einem Neustart
-  des Dienstes weg. Die Timeline bleibt erhalten.
-- Ein Neustart des Dienstes während eines laufenden Vorgangs bricht ihn ab. Ein abgebrochenes
-  Release hinterlässt eventuell einen Zwischenstand unter `/srv/oradb/build` und einen Container
-  `release-build-…`; beides ist unter „Alle Snapshots“ bzw. mit `docker ps -a` sichtbar und lässt
-  sich von Hand entfernen.
+- Getestet ist zeitkapsel bisher gegen simulierte `btrfs`-, `docker`-, `ssh`- und `rsync`-Befehle. Vor allem Neuanlage (dbca im Korrektur-Image) und Import sollten zuerst mit einer Test-DB laufen.
+- Der Import unterstützt keine ASM-Ablage und keine Archivlog-Ziele außerhalb der eingehängten Verzeichnisse; Directory-Objekte (Data Pump, UTL_FILE) zeigen danach eventuell auf Pfade, die im Container fehlen.
+- Neue Datenbanken sind immer CDBs mit einer PDB (so legt sie das Oracle-Image an).
+- Vorgangsprotokolle liegen im Arbeitsspeicher des jeweiligen Agenten (die letzten 50); ein Neustart des Dienstes bricht laufende Vorgänge ab.

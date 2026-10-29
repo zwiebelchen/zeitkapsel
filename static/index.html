@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Oracle-Datenbanken</title>
+<title>zeitkapsel</title>
 <style>
 :root {
   --paper: #eceeeb;
@@ -152,6 +152,29 @@ label.toggle { display: inline-flex; gap: 6px; align-items: center; font-size: 1
 label.check { display: flex; gap: 8px; align-items: flex-start; font-size: 14px; }
 label.check input { margin-top: 3px; }
 label.check small { display: block; color: var(--muted); }
+/* Hosts in der Navigation, angemeldeter Benutzer */
+.hostgroup { display: grid; gap: 2px; margin-bottom: 8px; }
+.hostgroup .hostname { font-weight: 600; }
+.hostgroup.here .hostname { color: var(--ink); }
+.hostgroup:not(.here) a:not(.hostname) { padding-top: 4px; padding-bottom: 4px; }
+nav.side a.sub { font-size: 14px; color: var(--muted); }
+nav.side a.sub[aria-current="page"] { color: var(--ink); }
+.nav-empty { padding: 0 10px 0 30px; margin: 0; font-size: 13px; }
+.who { font-size: 13px; color: #e8eeec; white-space: nowrap; }
+.who span { color: #9fb2b0; margin-left: 4px; }
+.tag.mine { border-color: var(--branch); color: var(--branch); }
+.dev-mine { box-shadow: inset 3px 0 0 var(--branch); padding-left: 10px; }
+.by { color: var(--muted); font-size: 12px; border: 1px solid var(--rule); border-radius: 4px; padding: 0 4px; }
+table.snap td .acts { display: flex; flex-wrap: wrap; gap: 2px; margin-left: -8px; }
+.keybox { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 12px; background: #fff; border: 1px solid var(--rule); border-radius: 6px; padding: 8px 10px; word-break: break-all; }
+.probe { display: grid; gap: 10px; }
+.probe dl.facts-list { font-size: 13.5px; }
+.probe ul { margin: 0; padding-left: 18px; font-size: 13.5px; }
+.probe .bad { color: var(--err); }
+.probe .warn { color: #6e4a00; }
+.steps { display: flex; gap: 8px; font-size: 13px; color: var(--muted); }
+.steps b { color: var(--ink); }
+
 /* Verwaltung */
 .admin-grid { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 36px; margin-top: 26px; }
 .sched-list { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--rule); }
@@ -238,10 +261,11 @@ label.field textarea { min-height: 84px; resize: vertical; }
 </head>
 <body>
 <header class="top">
-  <span class="brand">Oracle-Datenbanken</span>
+  <span class="brand">zeitkapsel</span>
   <span class="host" id="host"></span>
   <span class="grow"></span>
-  <div class="meter" id="meter" title="Belegung des Dateisystems unter /srv/oradb"></div>
+  <div class="meter" id="meter" title="Belegung des Dateisystems auf dem gewählten Host"></div>
+  <span class="who" id="who"></span>
 </header>
 <div class="layout">
   <nav class="side" id="nav" aria-label="Datenbanken"></nav>
@@ -285,8 +309,8 @@ label.field textarea { min-height: 84px; resize: vertical; }
     <label class="field">Ausgangsstand
       <select name="source" required></select>
     </label>
-    <label class="field">Für wen <small>optional</small>
-      <input name="owner" maxlength="40" placeholder="z. B. Anna Müller" autocomplete="off">
+    <label class="field js-owner">Für Benutzer
+      <select name="owner"></select>
     </label>
     <p class="form-error"></p>
     <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Entwickler-DB anlegen</button></div>
@@ -393,6 +417,97 @@ label.field textarea { min-height: 84px; resize: vertical; }
   </form>
 </dialog>
 
+<!-- Neue Datenbank -->
+<dialog id="dlgNewDb">
+  <form method="dialog" id="fNewDb">
+    <h2>Neue Datenbank anlegen</h2>
+    <p class="lead">Legt auf <b class="js-host"></b> eine leere Container-Datenbank (CDB) mit einer PDB an. Das Oracle-Image erstellt sie mit dbca; das dauert 15 bis 45 Minuten.</p>
+    <div class="row2">
+      <label class="field">SID <input name="sid" required maxlength="8" pattern="[A-Za-z][A-Za-z0-9]*" placeholder="z. B. KUNDE1" autocomplete="off"><small>höchstens 8 Zeichen</small></label>
+      <label class="field">PDB <input name="pdb" required maxlength="30" pattern="[A-Za-z][A-Za-z0-9_]*" placeholder="z. B. KUNDE1PDB" autocomplete="off"></label>
+    </div>
+    <div class="row2">
+      <label class="field">Port <input type="number" name="port" required min="1024" max="65535" value="1522"></label>
+      <label class="field">Zeichensatz <select name="charset"></select></label>
+    </div>
+    <div class="row2">
+      <label class="field">Passwort <input type="password" name="password" required minlength="8" maxlength="30" autocomplete="new-password"><small>für SYS, SYSTEM und PDBADMIN</small></label>
+      <label class="field">Passwort wiederholen <input type="password" name="password2" required autocomplete="new-password"></label>
+    </div>
+    <p class="hint-box js-imgwarn" hidden></p>
+    <p class="form-error"></p>
+    <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Datenbank anlegen</button></div>
+  </form>
+</dialog>
+
+<!-- Import -->
+<dialog id="dlgImport" style="width:min(640px, calc(100vw - 24px))">
+  <form method="dialog" id="fImport">
+    <h2>Datenbank importieren</h2>
+    <p class="steps"><span class="js-step1"><b>1. Quelle prüfen</b></span><span>→</span><span class="js-step2">2. Übernehmen</span></p>
+    <div class="js-s1">
+      <p class="lead">Übernimmt eine Oracle-Datenbank von einem anderen Server per SSH auf <b class="js-host"></b>: Datendateien, Redo-Logs, Controlfiles, spfile und Passwortdatei. Die Quell-DB muss laufen, damit sie geprüft werden kann.</p>
+      <div class="row2">
+        <label class="field">Quell-Host <input name="host" required placeholder="z. B. db05" autocomplete="off"></label>
+        <label class="field">SID <input name="sid" required placeholder="z. B. DLHTEST" autocomplete="off"></label>
+      </div>
+      <div class="row3">
+        <label class="field">SSH-Benutzer <input name="user" value="oracle" required></label>
+        <label class="field">SSH-Port <input type="number" name="ssh_port" value="22" min="1" max="65535"></label>
+        <label class="field">ORACLE_HOME <input name="oracle_home" placeholder="aus dem Login-Profil"><small>nur falls nicht gesetzt</small></label>
+      </div>
+      <div class="field">Öffentlicher SSH-Schlüssel dieses Hosts
+        <small>gehört auf der Quelle in ~/.ssh/authorized_keys des SSH-Benutzers</small>
+        <div class="keybox js-key">…</div>
+      </div>
+    </div>
+    <div class="js-s2 probe" hidden></div>
+    <p class="form-error"></p>
+    <div class="dlg-actions">
+      <button value="cancel" formnovalidate>Abbrechen</button>
+      <button type="button" class="js-back" hidden>Zurück</button>
+      <button class="primary js-next" value="ok">Quelle prüfen</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Benutzer -->
+<dialog id="dlgUser">
+  <form method="dialog" id="fUser">
+    <h2 class="js-title">Benutzer anlegen</h2>
+    <label class="field">Benutzername <input name="username" required maxlength="32" pattern="[a-z0-9][a-z0-9._\-]+" autocomplete="off"><small>Kleinbuchstaben, Ziffern, . _ -</small></label>
+    <label class="field">Rolle <select name="role"><option value="user">Benutzer – eigene Entwickler-DBs</option><option value="admin">Administrator – alles</option></select></label>
+    <label class="field">Passwort <input type="password" name="password" minlength="10" autocomplete="new-password"><small class="js-pwhint">mindestens 10 Zeichen</small></label>
+    <p class="form-error"></p>
+    <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Speichern</button></div>
+  </form>
+</dialog>
+
+<!-- Host -->
+<dialog id="dlgHost">
+  <form method="dialog" id="fHost">
+    <h2 class="js-title">Host hinzufügen</h2>
+    <p class="lead">Auf dem Host läuft zeitkapsel mit <code>ZK_ROLE=agent</code> und einem eigenen <code>ZK_AGENT_TOKEN</code>. Beim Speichern wird die Verbindung geprüft.</p>
+    <label class="field">Name <input name="name" required maxlength="63" placeholder="z. B. db06-alma10" autocomplete="off"></label>
+    <label class="field">Adresse des Agenten <input name="url" required placeholder="http://db06-alma10:8088" autocomplete="off"></label>
+    <label class="field">Agent-Token <input type="password" name="token" autocomplete="off"><small class="js-tokenhint">ZK_AGENT_TOKEN aus /etc/zeitkapsel.env des Hosts</small></label>
+    <p class="form-error"></p>
+    <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Speichern</button></div>
+  </form>
+</dialog>
+
+<!-- Eigenes Passwort -->
+<dialog id="dlgPw">
+  <form method="dialog" id="fPw">
+    <h2>Passwort ändern</h2>
+    <label class="field">Bisheriges Passwort <input type="password" name="old" required autocomplete="current-password"></label>
+    <label class="field">Neues Passwort <input type="password" name="new" required minlength="10" autocomplete="new-password"><small>mindestens 10 Zeichen</small></label>
+    <label class="field">Neues Passwort wiederholen <input type="password" name="new2" required autocomplete="new-password"></label>
+    <p class="form-error"></p>
+    <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Passwort ändern</button></div>
+  </form>
+</dialog>
+
 <!-- Notiz -->
 <dialog id="dlgNote">
   <form method="dialog" id="fNote">
@@ -444,19 +559,30 @@ function fmtTime(s, withTime = true) {
   return d.toLocaleString("de-DE", o);
 }
 
+const CONTROLLER_PATH = /^\/api\/(overview|me|users|hosts|audit|logout)(\/|\?|$)/;
 async function api(method, url, body) {
+  // Pfade des Agenten (state, db/…, devdbs/…, schedules …) gehen an den gewählten Host
+  if (url.startsWith("/api/") && !CONTROLLER_PATH.test(url)) {
+    if (!view.hid) throw new Error("Kein Host ausgewählt.");
+    url = `/api/hosts/${view.hid}/` + url.slice(5);
+  }
   const r = await fetch(url, {
     method,
-    headers: { "X-Requested-With": "oradb-ui", "Content-Type": "application/json" },
+    headers: { "X-Requested-With": "zeitkapsel", "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
   });
+  if (r.status === 401) { location.href = "/login"; throw new Error("Bitte anmelden."); }
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || `Serverfehler (HTTP ${r.status})`);
   return j;
 }
 
-let S = null;
-let view = { kind: "db", sid: null };
+let S = null;          // Zustand des gewählten Hosts (Agent)
+let O = null;          // Übersicht: angemeldeter Benutzer, Hosts, Benutzerliste
+let view = { kind: "db", hid: null, sid: null };
+let access = null;     // Benutzer, Hosts, Protokoll (Seite „Zugang“)
+const isAdmin = () => O && O.me.role === "admin";
+const canDev = d => isAdmin() || (O && d.owner === O.me.username);
 let openJobs = new Set();
 let jobsHidden = false;
 let snapRows = null;
@@ -465,12 +591,25 @@ let showEvents = false;
 try { showEvents = localStorage.getItem("oradb.showEvents") === "1"; } catch {}
 
 function parseHash() {
-  const h = decodeURIComponent(location.hash.slice(1));
-  if (h === "snapshots") view = { kind: "snapshots" };
-  else if (h === "verwaltung") view = { kind: "admin" };
-  else view = { kind: "db", sid: (h.match(/^db=(.+)$/) || [])[1] || null };
+  const p = new URLSearchParams(location.hash.slice(1));
+  const hid = +p.get("h") || (view.hid || null);
+  if (p.has("zugang")) view = { kind: "access", hid };
+  else if (p.has("snapshots")) view = { kind: "snapshots", hid };
+  else if (p.has("verwaltung")) view = { kind: "admin", hid };
+  else view = { kind: "db", hid, sid: p.get("db") };
 }
-window.addEventListener("hashchange", () => { parseHash(); if (view.kind === "snapshots") loadSnapshots(); if (view.kind === "admin") loadAdmin(); render(); });
+const link = (o) => "#" + new URLSearchParams(o).toString();
+async function onHash() {
+  const before = view.hid;
+  parseHash();
+  if (view.hid !== before) { S = null; snapRows = null; admin = null; }
+  if (view.kind === "snapshots") loadSnapshots();
+  if (view.kind === "admin") loadAdmin();
+  if (view.kind === "access") loadAccess();
+  render();
+  if (view.hid !== before) refresh();
+}
+window.addEventListener("hashchange", onHash);
 
 function toast(msg) {
   const t = $("#toast"); t.textContent = msg; t.hidden = false;
@@ -479,7 +618,12 @@ function toast(msg) {
 
 async function refresh() {
   try {
-    S = await api("GET", "/api/state");
+    O = await api("GET", "/api/overview");
+    if (!O.hosts.some(h => h.id === view.hid)) view.hid = O.hosts.length ? O.hosts[0].id : null;
+    const host = currentHost();
+    if (host && host.ok && view.kind !== "access") {
+      try { S = await api("GET", "/api/state"); } catch (e) { S = null; host.error = e.message; }
+    } else if (!host || !host.ok) S = null;
     $("#offline").hidden = true;
     render();
   } catch (e) {
@@ -488,6 +632,8 @@ async function refresh() {
   }
 }
 
+function currentHost() { return O ? O.hosts.find(h => h.id === view.hid) : null; }
+
 function currentDb() {
   if (!S || !S.dbs.length) return null;
   return S.dbs.find(d => d.sid === view.sid) || S.dbs[0];
@@ -495,38 +641,54 @@ function currentDb() {
 
 /* ------------------------------------------------------------ Rendern */
 function render() {
-  if (!S) return;
-  $("#host").textContent = S.host;
-  const used = 1 - S.disk.free / S.disk.total;
-  $("#meter").className = "meter" + (used > 0.85 ? " tight" : "");
-  $("#meter").innerHTML = `<span>${fmtBytes(S.disk.free)} frei von ${fmtBytes(S.disk.total)}</span>
-    <span class="bar"><span style="width:${(used * 100).toFixed(1)}%"></span></span>`;
+  if (!O) return;
+  const host = currentHost();
+  $("#host").textContent = host ? (host.host || host.name) : "";
+  $("#who").innerHTML = `${esc(O.me.username)} <span>${isAdmin() ? "Administrator" : "Benutzer"}</span>`;
+  if (S && S.disk) {
+    const used = 1 - S.disk.free / S.disk.total;
+    $("#meter").className = "meter" + (used > 0.85 ? " tight" : "");
+    $("#meter").innerHTML = `<span>${fmtBytes(S.disk.free)} frei von ${fmtBytes(S.disk.total)}</span>
+      <span class="bar"><span style="width:${(used * 100).toFixed(1)}%"></span></span>`;
+  } else $("#meter").innerHTML = "";
   renderNav();
-  if (view.kind === "snapshots") renderSnapshots();
-  else if (view.kind === "admin") renderAdmin();
+  if (view.kind === "access") renderAccess();
+  else if (!host) $("#main").innerHTML = `<div class="empty-state"><p>Noch kein Host eingetragen.</p>${isAdmin() ? `<p><a href="${link({ zugang: 1 })}">Host hinzufügen</a></p>` : ""}</div>`;
+  else if (!host.ok || !S) $("#main").innerHTML = `<div class="empty-state"><p><b>${esc(host.name)}</b> ist nicht erreichbar.</p><p>${esc(host.error || "")}</p></div>`;
+  else if (view.kind === "snapshots") renderSnapshots();
+  else if (view.kind === "admin") isAdmin() ? renderAdmin() : (location.hash = link({ h: view.hid }));
   else renderDb(currentDb());
-  renderJobs();
+  if (S) renderJobs(); else $("#jobs").hidden = true;
 }
 
 function renderNav() {
   const db = currentDb();
-  const items = S.dbs.map(d => {
-    const cur = view.kind === "db" && db && d.sid === db.sid;
-    return `<a href="#db=${encodeURIComponent(d.sid)}" ${cur ? 'aria-current="page"' : ""}>
-      <span class="dot ${STATE[d.master.state] || ""}" title="${esc(d.master.state)}"></span>
-      <span>${esc(d.sid)}</span><span class="port">${d.master.port ?? ""}</span></a>`;
+  const cur = (cond) => cond ? 'aria-current="page"' : "";
+  const groups = O.hosts.map(h => {
+    const here = h.id === view.hid;
+    const dbs = h.dbs.map(d => `<a href="${link({ h: h.id, db: d.sid })}" ${cur(here && view.kind === "db" && db && d.sid === db.sid)}>
+        <span class="dot ${STATE[d.state] || ""}" title="${esc(d.state)}"></span>
+        <span>${esc(d.sid)}</span><span class="port">${d.port ?? ""}</span></a>`).join("");
+    return `<div class="hostgroup ${here ? "here" : ""}">
+      <a class="hostname" href="${link({ h: h.id })}"><span class="dot ${h.ok ? "ok" : "err"}" title="${h.ok ? "erreichbar" : esc(h.error || "nicht erreichbar")}"></span><span>${esc(h.name)}</span><span class="port">${h.running_jobs ? h.running_jobs + " ⟳" : ""}</span></a>
+      ${dbs || (h.ok ? '<p class="port nav-empty">noch keine Datenbank</p>' : '<p class="port nav-empty">nicht erreichbar</p>')}
+      ${here && h.ok ? `<a href="${link({ h: h.id, snapshots: 1 })}" ${cur(view.kind === "snapshots")} class="sub"><span></span><span>Alle Snapshots</span><span></span></a>
+        ${isAdmin() ? `<a href="${link({ h: h.id, verwaltung: 1 })}" ${cur(view.kind === "admin")} class="sub"><span></span><span>Verwaltung</span><span></span></a>` : ""}` : ""}
+    </div>`;
   }).join("");
-  $("#nav").innerHTML = `<h2>Datenbanken</h2>${items || '<p class="port" style="padding:0 10px">Keine Master-DB unter /srv/oradb/master</p>'}
+  $("#nav").innerHTML = `<h2>Hosts und Datenbanken</h2>${groups || '<p class="port nav-empty">Keine Hosts</p>'}
     <div class="sep"></div>
-    <a href="#snapshots" ${view.kind === "snapshots" ? 'aria-current="page"' : ""}><span></span><span>Alle Snapshots</span><span></span></a>
-    <a href="#verwaltung" ${view.kind === "admin" ? 'aria-current="page"' : ""}><span></span><span>Verwaltung</span><span></span></a>`;
+    ${isAdmin() ? `<a href="${link({ zugang: 1 })}" ${cur(view.kind === "access")}><span></span><span>Benutzer, Hosts, Protokoll</span><span></span></a>` : ""}
+    <a href="#" data-act="pw-change"><span></span><span>Passwort ändern</span><span></span></a>
+    <a href="#" data-act="logout"><span></span><span>Abmelden</span><span></span></a>`;
 }
 
 function renderDb(db) {
   const main = $("#main");
   if (!db) {
-    main.innerHTML = `<div class="empty-state"><p>Unter <code>/srv/oradb/master</code> liegt noch keine Datenbank.</p>
-      <p>Lege die Master-DB nach Abschnitt 5a des Runbooks als Subvolume an und starte sie mit <code>startdb.sh</code>.</p></div>`;
+    main.innerHTML = `<div class="empty-state"><p>Auf diesem Host gibt es noch keine Datenbank.</p>
+      ${isAdmin() ? `<p>Unter „Verwaltung“ lässt sich eine neue Datenbank anlegen oder eine bestehende von einem anderen Server importieren.</p>
+      <a href="${link({ h: view.hid, verwaltung: 1 })}">Zur Verwaltung</a>` : "<p>Ein Administrator kann hier eine Datenbank anlegen oder importieren.</p>"}</div>`;
     return;
   }
   const m = db.master;
@@ -537,11 +699,15 @@ function renderDb(db) {
       <div class="facts">
         ${pill(m.state)}
         ${m.port ? `<span>Port ${m.port}</span>` : ""}
-        ${m.jdbc ? jdbcField(m.jdbc) : `<span>Master-Container nicht gefunden – mit <code>startdb.sh ${esc(db.sid)} &lt;Port&gt;</code> starten</span>`}
+        ${m.type === "cdb" ? `<span>Container-DB, PDB ${esc(m.pdb)}</span>` : ""}
+        ${m.jdbc ? jdbcField(m.jdbc) : (m.container ? "" : `<span>Master-Container nicht gefunden</span>`)}
       </div>
       <div class="actions">
-        <button data-act="note-add">Notiz hinzufügen</button>
-        <button class="primary" data-act="release-new" ${db.release_busy ? 'disabled title="Ein Release wird gerade erstellt"' : ""}>${db.release_busy ? "Release wird erstellt …" : "Release erstellen"}</button>
+        ${isAdmin() ? `${m.state === "gestoppt" || m.state === "kein Container"
+            ? `<button data-act="master-start" data-port="${m.port || ""}">Master starten</button>`
+            : `<button data-act="master-stop">Master stoppen</button>`}
+          <button data-act="note-add">Notiz hinzufügen</button>
+          <button class="primary" data-act="release-new" ${db.release_busy ? 'disabled title="Ein Release wird gerade erstellt"' : ""}>${db.release_busy ? "Release wird erstellt …" : "Release erstellen"}</button>` : ""}
       </div>
     </section>
     <div class="cols">
@@ -596,10 +762,10 @@ function suggestName(...parts) {
 
 function relActions(db, T, name) {
   const c = T.count("release:" + name);
-  return `<button class="quiet small" data-act="dev-new" data-release="${esc(name)}" data-suggest="${esc(suggestName(name))}">Als Entwickler-DB starten</button>
-    <button class="quiet small" data-act="release-new" data-source="release:${esc(name)}" data-label="${esc(name)}" ${db.release_busy ? "disabled" : ""}>Release ableiten</button>
+  return `<button class="quiet small" data-act="dev-new" data-release="${esc(name)}" data-suggest="${esc(suggestName(O.me.username, name))}">Als Entwickler-DB starten</button>
+    ${isAdmin() ? `<button class="quiet small" data-act="release-new" data-source="release:${esc(name)}" data-label="${esc(name)}" ${db.release_busy ? "disabled" : ""}>Release ableiten</button>
     <button class="quiet small" data-act="desc-edit" data-name="${esc(name)}">Beschreibung bearbeiten</button>
-    <button class="quiet small danger" data-act="release-del" data-name="${esc(name)}" data-releases="${c.releases}" data-devs="${c.devs}">Release löschen</button>`;
+    <button class="quiet small danger" data-act="release-del" data-name="${esc(name)}" data-releases="${c.releases}" data-devs="${c.devs}">Release löschen</button>` : ""}`;
 }
 
 function subtree(db, T, key, depth) {
@@ -626,12 +792,13 @@ function devNode(db, T, d, note, depth) {
   const stopped = d.state === "gestoppt";
   const snaps = (d.snapshots || []).map(n => snapNode(db, T, d, n, depth)).join("");
   return `<li class="tn tn-dev"><span class="tmk dot ${STATE[d.state] || ""}" title="${esc(d.state)}"></span><div class="tn-body">
-    <div class="tn-title"><a href="#db=${encodeURIComponent(db.sid)}" data-act="focus-dev" data-id="${esc(d.id)}">${esc(d.name)}</a>
-      <span class="meta">Entwickler-DB${d.port ? ", Port " + d.port : ""}, ${esc(d.state)}</span>${note ? `<span class="tag">${esc(note)}</span>` : ""}</div>
-    <div class="tn-acts">
+    <div class="tn-title"><a href="${link({ h: view.hid, db: db.sid })}" data-act="focus-dev" data-id="${esc(d.id)}">${esc(d.name)}</a>
+      <span class="meta">${d.owner ? esc(d.owner) + ", " : ""}${d.port ? "Port " + d.port + ", " : ""}${esc(d.state)}</span>${note ? `<span class="tag">${esc(note)}</span>` : ""}
+      ${O && d.owner === O.me.username ? '<span class="tag mine">meine</span>' : ""}</div>
+    ${canDev(d) ? `<div class="tn-acts">
       ${stopped && d.container ? `<button class="quiet small" data-act="dev-start" data-id="${esc(d.id)}" ${d.busy ? "disabled" : ""}>Starten</button>` : ""}
       ${d.container ? `<button class="quiet small" data-act="snap-new" data-id="${esc(d.id)}" ${d.busy ? "disabled" : ""}>Snapshot erstellen</button>` : ""}
-    </div>
+    </div>` : ""}
     ${snaps ? `<ul class="tree">${snaps}</ul>` : ""}</div></li>`;
 }
 
@@ -641,8 +808,8 @@ function snapNode(db, T, d, n, depth) {
       <span class="meta">Snapshot</span><span class="tag">${n.consistent ? "sauber geschlossen" : "im Betrieb"}</span></div>
     ${n.description ? `<p class="tn-desc">${esc(n.description)}</p>` : ""}
     <div class="tn-acts">
-      <button class="quiet small" data-act="dev-new" data-source="${esc(n.source)}" data-suggest="${esc(suggestName(d.name, n.name))}">Als Entwickler-DB starten</button>
-      <button class="quiet small" data-act="release-new" data-source="${esc(n.source)}" data-label="${esc(n.name + " von " + d.name)}" ${db.release_busy ? "disabled" : ""}>Als Release übernehmen</button>
+      <button class="quiet small" data-act="dev-new" data-source="${esc(n.source)}" data-suggest="${esc(suggestName(O.me.username, n.name))}">Als Entwickler-DB starten</button>
+      ${isAdmin() ? `<button class="quiet small" data-act="release-new" data-source="${esc(n.source)}" data-label="${esc(n.name + " von " + d.name)}" ${db.release_busy ? "disabled" : ""}>Als Release übernehmen</button>` : ""}
     </div>
     ${subtree(db, T, n.source, depth + 1)}</div></li>`;
 }
@@ -650,7 +817,7 @@ function snapNode(db, T, d, n, depth) {
 function renderTimeline(db) {
   if (!db.timeline.length) {
     return `<div class="empty-state"><p>Noch keine Releases. Ein Release friert den aktuellen Stand der Master-DB ein; daraus entstehen Entwickler-DBs.</p>
-      <button class="primary" data-act="release-new">Erstes Release erstellen</button></div>`;
+      ${isAdmin() ? '<button class="primary" data-act="release-new">Erstes Release erstellen</button>' : ""}</div>`;
   }
   const T = treeIndex(db);
   const rows = db.timeline.map(e => {
@@ -674,12 +841,12 @@ function renderTimeline(db) {
       return `<li class="tl tl-note"><div class="rail"><span class="mk mk-note"></span></div>
         <div class="body"><div class="tl-head"><time>${fmtTime(e.ts, false)}</time></div>
           <p class="note-text">${esc(e.text)}</p>
-          <div class="acts"><button class="quiet small" data-act="note-edit" data-id="${esc(e.id)}">Bearbeiten</button>
-            <button class="quiet small danger" data-act="note-del" data-id="${esc(e.id)}">Löschen</button></div></div></li>`;
+          ${isAdmin() ? `<div class="acts"><button class="quiet small" data-act="note-edit" data-id="${esc(e.id)}">Bearbeiten</button>
+            <button class="quiet small danger" data-act="note-del" data-id="${esc(e.id)}">Löschen</button></div>` : ""}</div></li>`;
     }
     if (!showEvents) return "";
     return `<li class="tl tl-event"><div class="rail"><span class="mk ${e.kind === "release-deleted" ? "mk-gone" : "mk-event"}"></span></div>
-      <div class="body">${esc(e.text)} <time>${fmtTime(e.ts)}</time></div></li>`;
+      <div class="body">${esc(e.text)} <time>${fmtTime(e.ts)}</time>${e.by && e.by !== "system" ? ` <span class="by">${esc(e.by)}</span>` : ""}</div></li>`;
   }).join("");
   return `<ol class="timeline">${rows}</ol>`;
 }
@@ -689,27 +856,31 @@ function renderDevs(db) {
     return `<div class="empty-state"><p>Keine Entwickler-DBs für ${esc(db.sid)}.</p>
       <p>${db.releases.length ? "Jede Entwickler-DB ist eine eigene Kopie eines Releases mit eigenem Port." : "Erstelle zuerst ein Release; daraus lassen sich Entwickler-DBs anlegen."}</p></div>`;
   }
-  return `<ul class="devlist">${db.devdbs.map(d => {
+  const me = O.me.username;
+  const list = [...db.devdbs].sort((a, b) => (b.owner === me) - (a.owner === me) || a.name.localeCompare(b.name));
+  return `<ul class="devlist">${list.map(d => {
     const running = d.state === "bereit" || d.state === "startet" || d.state === "startet neu";
     const working = d.busy;
     const noCont = !d.container;
-    return `<li class="dev" id="dev-${esc(d.id)}">
-      <div class="dev-top"><h3>${esc(d.name)}</h3>${pill(working ? "Vorgang läuft" : d.state)}</div>
+    const mine = canDev(d);
+    return `<li class="dev ${d.owner === me ? "dev-mine" : ""}" id="dev-${esc(d.id)}">
+      <div class="dev-top"><h3>${esc(d.name)}</h3>${pill(working ? "Vorgang läuft" : d.state)}${d.owner === me ? '<span class="tag mine">meine</span>' : ""}</div>
       <div class="dev-meta">
-        ${d.owner ? `<span>Für ${esc(d.owner)}</span>` : ""}
+        <span>${d.owner ? "gehört " + esc(d.owner) : "Besitzer unbekannt"}</span>
         <span>${d.base_label ? "aus " + esc(d.base_label) : "Ausgangsstand unbekannt"}</span>
         ${d.port ? `<span>Port ${d.port}</span>` : ""}
         ${d.created ? `<span>angelegt ${fmtTime(d.created, false)}</span>` : ""}
       </div>
       ${d.jdbc ? jdbcField(d.jdbc) : ""}
-      <div class="acts">
+      ${mine ? `<div class="acts">
         ${noCont ? "" : running
           ? `<button class="quiet small" data-act="dev-stop" data-id="${esc(d.id)}" ${working ? "disabled" : ""}>Stoppen</button>`
           : `<button class="quiet small" data-act="dev-start" data-id="${esc(d.id)}" ${working ? "disabled" : ""}>Starten</button>`}
         ${noCont ? "" : `<button class="quiet small" data-act="snap-new" data-id="${esc(d.id)}" ${working ? "disabled" : ""}>Snapshot erstellen</button>`}
         ${noCont ? "" : `<button class="quiet small" data-act="dev-reset" data-id="${esc(d.id)}" ${working || !d.base ? "disabled" : ""}>Auf Ausgangsstand zurücksetzen</button>`}
+        ${isAdmin() ? `<button class="quiet small" data-act="dev-owner" data-id="${esc(d.id)}">Besitzer ändern</button>` : ""}
         <button class="quiet small danger" data-act="dev-del" data-id="${esc(d.id)}" ${working ? "disabled" : ""}>Löschen</button>
-      </div>
+      </div>` : ""}
       ${renderDevSnaps(d, working)}</li>`;
   }).join("")}</ul>`;
 }
@@ -721,11 +892,11 @@ function renderDevSnaps(d, working) {
       <span class="tag" title="${n.consistent ? "Bei heruntergefahrener DB erstellt" : "Im laufenden Betrieb erstellt; Oracle stellt beim Start selbst wieder her"}">${n.consistent ? "sauber geschlossen" : "im Betrieb"}</span></div>
     ${n.description ? `<p class="desc">${esc(n.description)}</p>` : ""}
     <div class="acts">
-      ${d.container ? `<button class="quiet small" data-act="snap-restore" data-id="${esc(d.id)}" data-snap="${esc(n.name)}" ${working ? "disabled" : ""}>Darauf zurücksetzen</button>` : ""}
-      <button class="quiet small" data-act="dev-new" data-source="${esc(n.source)}">Neue Entwickler-DB daraus</button>
-      <button class="quiet small" data-act="release-new" data-source="${esc(n.source)}" data-label="${esc(n.name + " von " + d.name)}">Als Release übernehmen</button>
-      <button class="quiet small" data-act="snap-desc" data-id="${esc(d.id)}" data-snap="${esc(n.name)}">Beschreibung bearbeiten</button>
-      <button class="quiet small danger" data-act="snap-del" data-id="${esc(d.id)}" data-snap="${esc(n.name)}" ${working ? "disabled" : ""}>Löschen</button>
+      ${d.container && canDev(d) ? `<button class="quiet small" data-act="snap-restore" data-id="${esc(d.id)}" data-snap="${esc(n.name)}" ${working ? "disabled" : ""}>Darauf zurücksetzen</button>` : ""}
+      <button class="quiet small" data-act="dev-new" data-source="${esc(n.source)}" data-suggest="${esc(suggestName(O.me.username, n.name))}">Neue Entwickler-DB daraus</button>
+      ${isAdmin() ? `<button class="quiet small" data-act="release-new" data-source="${esc(n.source)}" data-label="${esc(n.name + " von " + d.name)}">Als Release übernehmen</button>` : ""}
+      ${canDev(d) ? `<button class="quiet small" data-act="snap-desc" data-id="${esc(d.id)}" data-snap="${esc(n.name)}">Beschreibung bearbeiten</button>
+      <button class="quiet small danger" data-act="snap-del" data-id="${esc(d.id)}" data-snap="${esc(n.name)}" ${working ? "disabled" : ""}>Löschen</button>` : ""}
     </div></li>`).join("");
   return `<div class="snaps-title">Snapshots</div><ul class="snaps">${items}</ul>`;
 }
@@ -794,8 +965,11 @@ function renderAdmin() {
   const nLeft = lo.builds.length + lo.containers.length;
   main.innerHTML = `
     <section class="dbhead"><h1>Verwaltung</h1>
-      <div class="facts"><span>Serverzeit ${fmtTime(admin.server_time)}</span></div>
-      <div class="actions"><button class="primary" data-act="sched-new" ${S.dbs.length ? "" : "disabled"}>Zeitplan anlegen</button></div></section>
+      <div class="facts"><span>${esc(currentHost().name)}</span><span>Serverzeit ${fmtTime(admin.server_time)}</span></div>
+      <div class="actions">
+        <button data-act="newdb">Neue Datenbank</button>
+        <button data-act="import">Datenbank importieren</button>
+        <button class="primary" data-act="sched-new" ${S.dbs.length ? "" : "disabled"}>Zeitplan anlegen</button></div></section>
     <div class="admin-grid">
       <section aria-labelledby="h-sched">
         <div class="section-head"><h2 id="h-sched">Zeitpläne</h2><span class="hint">Zeiten in Serverzeit; war der Dienst zu einem Termin aus, wird nur der jüngste verpasste Termin desselben Tages nachgeholt</span></div>
@@ -913,6 +1087,104 @@ function openSchedDialog(sc) {
   });
 }
 
+/* ------------------------------------------------------------ Zugang: Benutzer, Hosts, Protokoll */
+async function loadAccess(quiet) {
+  try {
+    const [users, hosts, audit] = await Promise.all([api("GET", "/api/users"), api("GET", "/api/hosts"), api("GET", "/api/audit")]);
+    access = { users, hosts, audit };
+    if (!quiet) render(); else if (view.kind === "access") renderAccess();
+  } catch (e) { toast(e.message); }
+}
+
+function renderAccess() {
+  const main = $("#main");
+  if (!isAdmin()) { main.innerHTML = "<p>Nur für Administratoren.</p>"; return; }
+  if (!access) { main.innerHTML = "<p>Lade …</p>"; return; }
+  const status = id => { const h = O.hosts.find(x => x.id === id); return h ? pillPlain(h.ok ? "erreichbar" : "nicht erreichbar", h.ok ? "ok" : "err") : ""; };
+  main.innerHTML = `
+    <section class="dbhead"><h1>Benutzer, Hosts, Protokoll</h1>
+      <div class="facts"><span>${access.users.length} Benutzer</span><span>${access.hosts.length} Hosts</span></div>
+      <div class="actions"><button data-act="host-new">Host hinzufügen</button><button class="primary" data-act="user-new">Benutzer anlegen</button></div></section>
+    <div class="admin-grid">
+      <section aria-labelledby="h-users">
+        <div class="section-head"><h2 id="h-users">Benutzer</h2><span class="hint">Benutzer verwalten nur ihre eigenen Entwickler-DBs; Administratoren dürfen alles</span></div>
+        <div class="table-wrap"><table class="snap"><thead><tr><th>Name</th><th>Rolle</th><th>Status</th><th>Angelegt</th><th></th></tr></thead>
+          <tbody>${access.users.map(u => `<tr>
+            <td><b>${esc(u.username)}</b>${u.username === O.me.username ? ' <span class="tag mine">ich</span>' : ""}</td>
+            <td>${u.role === "admin" ? "Administrator" : "Benutzer"}</td>
+            <td>${u.disabled ? pillPlain("gesperrt", "err") : pillPlain("aktiv", "ok")}</td>
+            <td>${fmtTime(u.created, false)}</td>
+            <td><div class="acts">
+              <button class="quiet small" data-act="user-edit" data-name="${esc(u.username)}">Bearbeiten</button>
+              ${u.username === O.me.username ? "" : `<button class="quiet small" data-act="user-toggle" data-name="${esc(u.username)}">${u.disabled ? "Entsperren" : "Sperren"}</button>
+              <button class="quiet small danger" data-act="user-del" data-name="${esc(u.username)}">Löschen</button>`}</div></td></tr>`).join("")}</tbody></table></div>
+        <div class="section-head" style="margin-top:28px"><h2>Protokoll</h2><span class="hint">die letzten 200 ändernden Aktionen</span></div>
+        <div class="table-wrap"><table class="snap"><thead><tr><th>Zeit</th><th>Benutzer</th><th>Host</th><th>Aktion</th><th class="num">Ergebnis</th></tr></thead>
+          <tbody>${access.audit.map(a => `<tr><td>${fmtTime(a.ts)}</td><td>${esc(a.user)}</td><td>${esc(a.host_name || "–")}</td>
+            <td class="path">${esc(a.method)} ${esc(a.path.replace(/^\/api\/hosts\/\d+\//, ""))}</td>
+            <td class="num">${a.status < 300 ? pillPlain("ok", "ok") : pillPlain(a.status === 403 ? "verweigert" : "Fehler " + a.status, "err")}</td></tr>`).join("") || '<tr><td colspan="5">Noch keine Einträge.</td></tr>'}</tbody></table></div>
+      </section>
+      <section aria-labelledby="h-hosts">
+        <div class="section-head"><h2 id="h-hosts">Hosts</h2></div>
+        <ul class="sched-list">${access.hosts.map(h => `<li class="sched">
+          <div class="sched-top"><h3>${esc(h.name)}</h3>${status(h.id)}</div>
+          <div class="sched-meta"><span>${esc(h.url)}</span><span>seit ${fmtTime(h.created, false)}</span></div>
+          <div class="acts"><button class="quiet small" data-act="host-edit" data-id="${h.id}">Bearbeiten</button>
+            <button class="quiet small danger" data-act="host-del" data-id="${h.id}">Entfernen</button></div></li>`).join("")}</ul>
+        <p style="color:var(--muted);font-size:13.5px">Einen weiteren DB-Host bindest du ein, indem du dort zeitkapsel mit <code>ZK_ROLE=agent</code> und einem Token aus <code>app.py gen-token</code> startest und ihn hier mit Adresse und Token einträgst. Entfernen löscht nur den Eintrag; auf dem Host ändert sich nichts.</p>
+      </section>
+    </div>`;
+}
+
+function openImportDialog() {
+  let plan = null;
+  const host = currentHost();
+  openDialog("dlgImport", f => {
+    $(".js-host", f).textContent = host.name;
+    const show = step => {
+      $(".js-s1", f).hidden = step !== 1; $(".js-s2", f).hidden = step !== 2;
+      $(".js-back", f).hidden = step !== 2;
+      $(".js-next", f).textContent = step === 1 ? "Quelle prüfen" : "Import starten";
+      $(".js-step1", f).innerHTML = step === 1 ? "<b>1. Quelle prüfen</b>" : "1. Quelle prüfen";
+      $(".js-step2", f).innerHTML = step === 2 ? "<b>2. Übernehmen</b>" : "2. Übernehmen";
+      f.querySelectorAll(".js-s1 input").forEach(i => { i.disabled = step !== 1; });
+    };
+    f.dataset.step = "1"; show(1);
+    $(".js-back", f).onclick = () => { f.dataset.step = "1"; show(1); $(".form-error", f).textContent = ""; };
+    api("GET", "/api/sshkey").then(r => { $(".js-key", f).textContent = r.public_key; }).catch(e => { $(".js-key", f).textContent = e.message; });
+    f._show = show;
+  }, async v => {
+    const f = $("#fImport");
+    if (f.dataset.step === "1") {
+      const btn = $(".js-next", f); btn.textContent = "Prüfe …";
+      try { plan = await api("POST", "/api/import/probe", { host: v.host, user: v.user, sid: v.sid, ssh_port: +v.ssh_port, oracle_home: v.oracle_home }); }
+      finally { btn.textContent = "Quelle prüfen"; }
+      const freePort = 1521 + Math.max(0, ...S.dbs.map(d => (d.master.port || 1521) - 1521)) + 1;
+      $(".js-s2", f).innerHTML = `
+        <dl class="facts-list">
+          <dt>Quelle</dt><dd>${esc(plan.source.user)}@${esc(plan.source.host)}, SID ${esc(plan.source.sid)} (${esc(plan.status)})</dd>
+          <dt>Version</dt><dd>${esc(plan.version)} – Image ${esc(plan.image_version)}</dd>
+          <dt>Art</dt><dd>${plan.cdb ? "Container-DB, PDBs: " + esc(plan.pdbs.join(", ")) : "Non-CDB"}, ${esc(plan.edition === "standard" ? "Standard Edition" : "Enterprise Edition")}, ${esc(plan.charset)}</dd>
+          <dt>Größe</dt><dd>${fmtBytes(plan.size)} Datendateien</dd>
+          <dt>Verzeichnisse</dt><dd>${plan.mapping.map(m => `${esc(m.src)} → ${esc(m.rel)}/ (${m.files.length} Dateien)`).join("<br>")}</dd>
+          <dt>spfile</dt><dd>${esc(plan.spfile || "–")}</dd>
+          <dt>Service</dt><dd>${esc(plan.service)}</dd>
+        </dl>
+        ${plan.problems.length ? `<div><b class="bad">Import nicht möglich</b><ul>${plan.problems.map(p => `<li class="bad">${esc(p)}</li>`).join("")}</ul></div>` : ""}
+        ${plan.warnings.length ? `<div><b>Hinweise</b><ul>${plan.warnings.map(w => `<li class="warn">${esc(w)}</li>`).join("")}</ul></div>` : ""}
+        ${plan.problems.length ? "" : `
+        <label class="field">Port auf ${esc(host.name)} <input type="number" name="port" min="1024" max="65535" value="${freePort}" required></label>
+        <p class="hint-box">Die Quell-DB wird für das Kopieren sauber heruntergefahren. Ohne den folgenden Haken bleibt sie danach aus – das ist der Umzug. Mit Haken läuft sie danach wieder – das ist eine Kopie.</p>
+        <label class="check"><input type="checkbox" name="restart_source" value="1"><span>Quell-DB nach dem Kopieren wieder starten</span></label>`}`;
+      f.dataset.step = "2"; f._show(2);
+      $(".js-next", f).disabled = plan.problems.length > 0;
+      throw Object.assign(new Error(""), { keepOpen: true });
+    }
+    startedJob(await api("POST", "/api/import", { host: v.host || plan.source.host, user: plan.source.user, sid: plan.source.sid,
+      ssh_port: plan.source.ssh_port, oracle_home: plan.source.oracle_home, port: +v.port, restart_source: !!v.restart_source }));
+  });
+}
+
 async function loadSnapshots() {
   try { snapRows = await api("GET", "/api/snapshots"); render(); }
   catch (e) { toast(e.message); }
@@ -977,11 +1249,12 @@ function openDialog(id, setup, submit) {
     if (ev.submitter && ev.submitter.value === "cancel") return;
     ev.preventDefault();
     const btn = ev.submitter; btn.disabled = true; err.textContent = "";
+    let keep = false;   // Mehrschritt-Dialoge bleiben offen und setzen den Knopf selbst
     try {
       await submit(Object.fromEntries(new FormData(form)));
       dlg.close(); await refresh();
-    } catch (e) { err.textContent = e.message; }
-    finally { btn.disabled = false; }
+    } catch (e) { keep = !!e.keepOpen; err.textContent = keep ? "" : e.message; }
+    finally { if (!keep) btn.disabled = false; }
   };
   dlg.showModal();
 }
@@ -997,6 +1270,99 @@ document.addEventListener("click", async ev => {
   const act = b.dataset.act;
   try {
     switch (act) {
+      case "logout":
+        ev.preventDefault();
+        await api("POST", "/api/logout"); location.href = "/login";
+        break;
+      case "pw-change":
+        ev.preventDefault();
+        openDialog("dlgPw", null, async v => {
+          if (v.new !== v.new2) throw new Error("Die neuen Passwörter stimmen nicht überein.");
+          await api("POST", "/api/me/password", { old: v.old, new: v.new }); toast("Passwort geändert");
+        });
+        break;
+      case "master-start": {
+        let port = +b.dataset.port || 0;
+        if (!port) { port = +prompt(`Port für die Master-DB ${db.sid}:`, "1521"); if (!port) return; }
+        startedJob(await api("POST", `/api/db/${encodeURIComponent(db.sid)}/master/start`, { port })); await refresh();
+        break;
+      }
+      case "dev-owner": {
+        const d = db.devdbs.find(x => x.id === b.dataset.id);
+        const who = prompt(`Neuer Besitzer von „${d.name}“ (Benutzername):\n${O.users.join(", ")}`, d.owner || "");
+        if (!who) return;
+        if (!O.users.includes(who)) { toast(`Benutzer „${who}“ gibt es nicht.`); return; }
+        await api("PATCH", `/api/devdbs/${encodeURIComponent(d.id)}`, { owner: who }); toast("Besitzer geändert"); await refresh();
+        break;
+      }
+      case "master-stop":
+        if (!confirm(`Master-DB ${db.sid} stoppen?\n\nWer gerade mit ihr arbeitet, verliert die Verbindung. Entwickler-DBs laufen weiter.`)) return;
+        startedJob(await api("POST", `/api/db/${encodeURIComponent(db.sid)}/master/stop`)); await refresh();
+        break;
+      case "newdb": {
+        const chk = await api("GET", "/api/newdb/check");
+        openDialog("dlgNewDb", f => {
+          $(".js-host", f).textContent = currentHost().name;
+          f.charset.innerHTML = chk.charsets.map(c => `<option>${c}</option>`).join("");
+          const used = new Set(S.dbs.map(d => d.master.port));
+          let p = 1522; while (used.has(p)) p++; f.port.value = p;
+          $(".js-imgwarn", f).hidden = chk.ok;
+          $(".js-imgwarn", f).textContent = chk.ok ? "" : `Das Image kann keine neuen Datenbanken anlegen (${chk.reason}). Erst das Korrektur-Image aus docker/Dockerfile.fix bauen.`;
+        }, async v => {
+          if (v.password !== v.password2) throw new Error("Die Passwörter stimmen nicht überein.");
+          startedJob(await api("POST", "/api/newdb", { sid: v.sid.toUpperCase(), pdb: v.pdb.toUpperCase(), password: v.password, charset: v.charset, port: +v.port }));
+        });
+        break;
+      }
+      case "import":
+        openImportDialog();
+        break;
+      case "user-new":
+      case "user-edit": {
+        const u = act === "user-edit" ? access.users.find(x => x.username === b.dataset.name) : null;
+        openDialog("dlgUser", f => {
+          $(".js-title", f).textContent = u ? `Benutzer ${u.username}` : "Benutzer anlegen";
+          f.username.value = u ? u.username : ""; f.username.readOnly = !!u;
+          f.role.value = u ? u.role : "user";
+          f.password.required = !u;
+          $(".js-pwhint", f).textContent = u ? "leer lassen, um es nicht zu ändern" : "mindestens 10 Zeichen";
+        }, async v => {
+          if (u) await api("PATCH", `/api/users/${encodeURIComponent(u.username)}`, { role: v.role, password: v.password || undefined });
+          else await api("POST", "/api/users", { username: v.username, role: v.role, password: v.password });
+          toast("Benutzer gespeichert"); await loadAccess();
+        });
+        break;
+      }
+      case "user-toggle": {
+        const u = access.users.find(x => x.username === b.dataset.name);
+        await api("PATCH", `/api/users/${encodeURIComponent(u.username)}`, { disabled: !u.disabled });
+        toast(u.disabled ? "Benutzer entsperrt" : "Benutzer gesperrt"); await loadAccess();
+        break;
+      }
+      case "user-del":
+        if (!confirm(`Benutzer „${b.dataset.name}“ löschen?\n\nSeine Entwickler-DBs bleiben bestehen; verwalten kann sie danach nur ein Administrator.`)) return;
+        await api("DELETE", `/api/users/${encodeURIComponent(b.dataset.name)}`); toast("Benutzer gelöscht"); await loadAccess();
+        break;
+      case "host-new":
+      case "host-edit": {
+        const h = act === "host-edit" ? access.hosts.find(x => x.id === +b.dataset.id) : null;
+        openDialog("dlgHost", f => {
+          $(".js-title", f).textContent = h ? `Host ${h.name}` : "Host hinzufügen";
+          f.name.value = h ? h.name : ""; f.url.value = h ? h.url : "";
+          f.token.required = !h;
+          $(".js-tokenhint", f).textContent = h ? "leer lassen, um das bisherige Token zu behalten" : "ZK_AGENT_TOKEN aus /etc/zeitkapsel.env des Hosts";
+        }, async v => {
+          if (h) await api("PATCH", `/api/hosts/${h.id}`, v); else await api("POST", "/api/hosts", v);
+          toast("Host gespeichert"); await loadAccess();
+        });
+        break;
+      }
+      case "host-del": {
+        const h = access.hosts.find(x => x.id === +b.dataset.id);
+        if (!confirm(`Host „${h.name}“ aus der Liste entfernen?\n\nAuf dem Host selbst ändert sich nichts.`)) return;
+        await api("DELETE", `/api/hosts/${h.id}`); toast("Host entfernt"); await loadAccess();
+        break;
+      }
       case "sched-new":
         if (!admin) await loadAdmin();
         openSchedDialog(null);
@@ -1063,6 +1429,10 @@ document.addEventListener("click", async ev => {
           if (b.dataset.release) f.source.value = "release:" + b.dataset.release;
           if (b.dataset.source) f.source.value = b.dataset.source;
           if (b.dataset.suggest && !db.devdbs.some(x => x.name === b.dataset.suggest)) f.name.value = b.dataset.suggest;
+          else if (!b.dataset.suggest) f.name.value = suggestName(O.me.username);
+          $(".js-owner", f).hidden = !isAdmin();
+          f.owner.innerHTML = (isAdmin() ? O.users : [O.me.username]).map(u => `<option>${esc(u)}</option>`).join("");
+          f.owner.value = O.me.username;
         }, async v => startedJob(await api("POST", `/api/db/${encodeURIComponent(db.sid)}/devdbs`, v)));
         break;
       case "desc-edit": {
@@ -1164,14 +1534,17 @@ $("#jobsHide").addEventListener("click", () => { jobsHidden = true; renderJobs()
 
 /* ------------------------------------------------------------ Start */
 parseHash();
-if (view.kind === "snapshots") loadSnapshots();
-if (view.kind === "admin") loadAdmin();
-refresh();
+refresh().then(() => {
+  if (view.kind === "snapshots") loadSnapshots();
+  if (view.kind === "admin") loadAdmin();
+  if (view.kind === "access") loadAccess();
+});
 setInterval(async () => {
   if (document.hidden) return;
   if (openJobs.size) await loadJobLogs();
   if (!document.querySelector("dialog[open]")) {
     if (view.kind === "admin") await loadAdmin();
+    if (view.kind === "access") await loadAccess(true);
     await refresh();
   }
 }, 5000);
