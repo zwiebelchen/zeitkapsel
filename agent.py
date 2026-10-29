@@ -2815,6 +2815,11 @@ select 'ZK_LONG='||count(*) from dba_tab_columns c join dba_users u on u.usernam
  where u.oracle_maintained = 'N' and c.data_type in ('LONG','LONG RAW');
 select 'ZK_UNDORET='||value from v$parameter where name = 'undo_retention';
 select 'ZK_TZ='||version from v$timezone_file;
+select 'ZK_TEMPTS='||tablespace_name||'|'||block_size||'|'||bigfile from dba_tablespaces where contents = 'TEMPORARY';
+select 'ZK_DEFTEMP='||property_value from database_properties where property_name = 'DEFAULT_TEMP_TABLESPACE';
+select 'ZK_DEFPERM='||property_value from database_properties where property_name = 'DEFAULT_PERMANENT_TABLESPACE';
+select distinct 'ZK_VERIFYFN='||limit from dba_profiles where resource_name = 'PASSWORD_VERIFY_FUNCTION'
+ and limit not in ('NULL','DEFAULT','UNLIMITED');
 exit
 """
 
@@ -2842,6 +2847,14 @@ def probe_dp(src: dict, target_sid: str = "") -> dict:
     if not roles:
         problems.append(f"{src['user']} hat weder DBA noch DATAPUMP_EXP_FULL_DATABASE; damit lässt sich die Datenbank nicht übertragen.")
     schemas = [dict(name=n, bytes=int(b or 0)) for n, _, b in (x.partition("|") for x in kv.get("ZK_SCHEMA", []))]
+    temp_ts = []
+    for x in kv.get("ZK_TEMPTS", []):
+        name, block, big = (x.split("|") + ["", "8192", "NO"])[:3]
+        temp_ts.append(dict(name=name, block_size=int(block or 8192), bigfile=big == "YES"))
+    verify_fns = sorted(set(kv.get("ZK_VERIFYFN", [])))
+    if verify_fns:
+        warnings.append("Profile mit Passwort-Prüffunktion (" + ", ".join(verify_fns) + "): die Funktionen liegen in SYS, "
+                        "werden von Data Pump nicht übertragen und deshalb vorab aus der Quelle kopiert.")
     tablespaces = []
     for x in kv.get("ZK_TS", []):
         name, block, big, size = (x.split("|") + ["", "", "", "0"])[:4]
@@ -2883,6 +2896,8 @@ def probe_dp(src: dict, target_sid: str = "") -> dict:
                 dbname=one("ZK_DBNAME"), cdb=one("ZK_CDB") == "YES", logmode=one("ZK_LOGMODE"),
                 charset=one("ZK_CHARSET", "AL32UTF8"), ncharset=one("ZK_NCHARSET", "AL16UTF16"),
                 banner=one("ZK_BANNER"), roles=roles, schemas=schemas, tablespaces=tablespaces, tz=src_tz, image_tz=img_tz,
+                temp_tablespaces=temp_ts, default_temp=one("ZK_DEFTEMP"), default_perm=one("ZK_DEFPERM"),
+                verify_functions=verify_fns,
                 size=size, undo_retention=ret, image_version=img, problems=problems, warnings=warnings)
 
 
@@ -2940,6 +2955,20 @@ def job_dp_import(job: Job, src: dict, tgt: dict) -> None:
         c = master_container(sid, containers())
         if not c or not c["running"]:
             job_master_start(job, sid)
+        job.log("Reste des vorigen Versuchs entfernen (Anwendungs-Benutzer mit ihren Objekten, eigene Rollen und Profile)")
+        p = job.run(["docker", "exec", "-i", cname, "sqlplus", "-s", "/ as sysdba"], allow_fail=True, input=(
+            "set serveroutput on feedback off\nbegin\n"
+            "  for u in (select username from dba_users where oracle_maintained = 'N') loop\n"
+            "    execute immediate 'drop user \"'||u.username||'\" cascade';\n  end loop;\n"
+            "  for r in (select role from dba_roles where oracle_maintained = 'N') loop\n"
+            "    execute immediate 'drop role \"'||r.role||'\"';\n  end loop;\n"
+            "  for f in (select distinct profile from dba_profiles where profile <> 'DEFAULT' and common = 'NO'\n"
+            "             and profile not in (select profile from dba_profiles where profile like 'ORA_%')) loop\n"
+            "    begin execute immediate 'drop profile \"'||f.profile||'\" cascade'; exception when others then null; end;\n  end loop;\n"
+            "  dbms_output.put_line('ZK_CLEAN=ok');\nend;\n/\nexit\n"))
+        if "ZK_CLEAN=ok" not in p.stdout:
+            raise RuntimeError("Reste des vorigen Versuchs ließen sich nicht entfernen: " +
+                               " | ".join(dict.fromkeys(re.findall(r"(ORA-\d{5}[^\n]*)", p.stdout)))[:300])
     else:
         job.log(f"Neue Datenbank {sid} anlegen (Zeichensatz {charset}, national {plan['ncharset']})")
         job_newdb(job, sid, "", tgt["password"], charset, tgt["port"], tgt["memory_mb"], plan["ncharset"])
@@ -2954,6 +2983,16 @@ def job_dp_import(job: Job, src: dict, tgt: dict) -> None:
         ts_calls = "\n".join(
             f"  mk({sql_str(t['name'])}, {t['block_size']}, '{'YES' if t['bigfile'] else 'NO'}', {t['bytes']});"
             for t in plan["tablespaces"])
+        temp_calls = "\n".join(f"  mkt({sql_str(t['name'])}, '{'YES' if t['bigfile'] else 'NO'}');"
+                               for t in plan.get("temp_tablespaces", []))
+        fn_calls = "\n".join(f"  copy_fn({sql_str(n)});" for n in plan.get("verify_functions", []))
+        defaults = ""
+        if plan.get("default_temp"):
+            defaults += (f"begin execute immediate 'alter database default temporary tablespace \"'||{sql_str(plan['default_temp'])}||'\"';"
+                         " exception when others then null; end;\n/\n")
+        if plan.get("default_perm") and plan["default_perm"] not in ("SYSTEM", "SYSAUX"):
+            defaults += (f"begin execute immediate 'alter database default tablespace \"'||{sql_str(plan['default_perm'])}||'\"';"
+                         " exception when others then null; end;\n/\n")
         prep = (
             "whenever sqlerror exit 9\nset feedback off\n"
             "alter system set db_create_file_dest='/opt/oracle/oradata' scope=both;\n"
@@ -2967,14 +3006,31 @@ def job_dp_import(job: Job, src: dict, tgt: dict) -> None:
               "        for i in 2 .. files loop\n          execute immediate 'alter tablespace \"'||n||'\" add datafile size 100M"
               " autoextend on next 256M maxsize unlimited';\n        end loop;\n      end if;\n    end if;\n  end;\nbegin\n"
             + (ts_calls or "  null;") + "\nend;\n/\n"
+            "declare\n  procedure mkt(n varchar2, big varchar2) is c number;\n"
+            "  begin\n    select count(*) into c from dba_tablespaces where tablespace_name = n;\n"
+            "    if c = 0 then\n      execute immediate 'create '||case when big='YES' then 'bigfile ' end||'temporary tablespace \"'||n||'\""
+            " tempfile size 100M autoextend on next 256M maxsize unlimited';\n    end if;\n  end;\nbegin\n"
+            + (temp_calls or "  null;") + "\nend;\n/\n"
+            + defaults +
             "select 'ZK_STEP=ts' from dual;\n"
             "create or replace directory ZK_IMPORT_DIR as '/opt/oracle/oradata/zk_import';\n"
             "begin execute immediate 'drop database link ZK_SRC'; exception when others then null; end;\n/\n"
             "select 'ZK_STEP=dir' from dual;\n"
             f"create database link ZK_SRC connect to {src['user']} identified by \"{src['password']}\" "
             f"using '//{src['host']}:{src['port']}/{src['service']}';\n"
-            "select 'ZK_LINK='||dummy from dual@ZK_SRC;\nexit\n")
-        job.log("Tablespaces, Verzeichnis und DB-Link anlegen")
+            "select 'ZK_LINK='||dummy from dual@ZK_SRC;\n"
+            # Passwort-Prüffunktionen der Profile aus SYS der Quelle kopieren (Data Pump überträgt SYS nicht)
+            "set serveroutput on\n"
+            "declare\n  procedure copy_fn(n varchar2) is c clob; cnt number;\n  begin\n"
+            "    select count(*) into cnt from dba_objects where owner = 'SYS' and object_name = n and object_type = 'FUNCTION';\n"
+            "    if cnt > 0 then return; end if;\n"
+            "    for r in (select text from dba_source@ZK_SRC where owner = 'SYS' and name = n and type = 'FUNCTION' order by line) loop\n"
+            "      c := c || r.text;\n    end loop;\n"
+            "    if c is null then dbms_output.put_line('ZK_FNMISSING='||n); return; end if;\n"
+            "    execute immediate 'create or replace '||c;\n    dbms_output.put_line('ZK_FNCOPIED='||n);\n"
+            "  exception when others then dbms_output.put_line('ZK_FNFAILED='||n||' '||sqlerrm);\n  end;\nbegin\n"
+            + (fn_calls or "  null;") + "\nend;\n/\nexit\n")
+        job.log("Tablespaces (permanent und temporär), Verzeichnis, DB-Link und Passwort-Prüffunktionen anlegen")
         p = job.run(["docker", "exec", "-i", cname, "sqlplus", "-s", "/ as sysdba"], input=prep, secret=src["password"],
                     allow_fail=True)
         if "ZK_LINK=X" not in p.stdout:
@@ -2982,6 +3038,10 @@ def job_dp_import(job: Job, src: dict, tgt: dict) -> None:
                     "Verzeichnis ZK_IMPORT_DIR" if "ZK_STEP=ts" in p.stdout else "Anlegen der Tablespaces")
             ora = " | ".join(dict.fromkeys(re.findall(r"(ORA-\d{5}[^\n]*)", p.stdout)))[:300]
             raise RuntimeError(f"Vorbereitung in der neuen DB fehlgeschlagen ({step}): {ora or 'siehe Protokoll'}")
+        for kind, label in (("ZK_FNCOPIED", "Prüffunktion kopiert"), ("ZK_FNMISSING", "Prüffunktion in der Quelle nicht lesbar"),
+                            ("ZK_FNFAILED", "Prüffunktion ließ sich nicht anlegen")):
+            for m in re.findall(kind + r"=(.*)", p.stdout):
+                job.log(f"{label}: {m.strip()}")
 
         stamp = time.strftime("%Y%m%d-%H%M%S")
         par = ['userid="/ as sysdba"', "network_link=ZK_SRC", "directory=ZK_IMPORT_DIR",
