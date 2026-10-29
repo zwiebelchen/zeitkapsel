@@ -2798,7 +2798,7 @@ def run_oracle_client(script: str, secret: str, timeout: int = 180) -> subproces
               input=script, timeout=timeout, check=False)
 
 
-def probe_dp(src: dict) -> dict:
+def probe_dp(src: dict, target_sid: str = "") -> dict:
     script = "sqlplus -s -L /nolog <<'EOF'\nwhenever sqlerror exit 5\n" + dp_connect_sql(src) + "\n" + DP_PROBE_SQL + "EOF\n"
     p = run_oracle_client(script, src["password"])
     out = (p.stdout + p.stderr).replace(src["password"], "***")
@@ -2838,7 +2838,15 @@ def probe_dp(src: dict) -> dict:
         warnings.append("Verbunden mit dem Root einer CDB; für die Anwendungsdaten meist den Service der PDB angeben.")
     if not schemas:
         problems.append("Keine Anwendungs-Schemas gefunden.")
-    return dict(mode="dp", source={k: v for k, v in src.items() if k != "password"}, version=one("ZK_VERSION"),
+    target = dict(sid=target_sid, exists=False, resume=False)
+    if target_sid and RE_SID.match(target_sid) and (MASTER / target_sid).exists():
+        target.update(exists=True, resume=bool(db_meta(target_sid).get("dp_pending")))
+        if target["resume"]:
+            warnings.append(f"Die Datenbank {target_sid} stammt aus einem abgebrochenen Versuch und wird weiterverwendet; "
+                            "Port, Speicher und Passwort gelten dann nicht.")
+        else:
+            problems.append(f"Eine Datenbank {target_sid} gibt es auf diesem Host schon.")
+    return dict(mode="dp", target=target, source={k: v for k, v in src.items() if k != "password"}, version=one("ZK_VERSION"),
                 dbname=one("ZK_DBNAME"), cdb=one("ZK_CDB") == "YES", logmode=one("ZK_LOGMODE"),
                 charset=one("ZK_CHARSET", "AL32UTF8"), ncharset=one("ZK_NCHARSET", "AL16UTF16"),
                 banner=one("ZK_BANNER"), roles=roles, schemas=schemas, tablespaces=tablespaces,
@@ -2865,9 +2873,18 @@ def job_dp_import(job: Job, src: dict, tgt: dict) -> None:
     charset = plan["charset"]
     if charset not in CHARSETS:
         job.log(f"Zeichensatz der Quelle {charset} wird übernommen")
-    job.log(f"Neue Datenbank {sid} anlegen (Zeichensatz {charset}, national {plan['ncharset']})")
-    job_newdb(job, sid, "", tgt["password"], charset, tgt["port"], tgt["memory_mb"], plan["ncharset"])
     cname = sid.lower()
+    if (MASTER / sid).exists():
+        if not db_meta(sid).get("dp_pending"):
+            raise RuntimeError(f"Eine Datenbank {sid} gibt es schon und stammt nicht aus einem abgebrochenen Data-Pump-Versuch.")
+        job.log(f"Datenbank {sid} aus dem abgebrochenen Versuch wird weiterverwendet (keine Neuanlage)")
+        c = master_container(sid, containers())
+        if not c or not c["running"]:
+            job_master_start(job, sid)
+    else:
+        job.log(f"Neue Datenbank {sid} anlegen (Zeichensatz {charset}, national {plan['ncharset']})")
+        job_newdb(job, sid, "", tgt["password"], charset, tgt["port"], tgt["memory_mb"], plan["ncharset"])
+        db_meta_update(sid, dp_pending=True, dp_source=f"{src['host']}:{src['port']}/{src['service']}")
     edition = read_volume_env(MASTER / sid).get("ZK_EDITION", "enterprise")
     parallel = tgt["parallel"] if edition == "enterprise" else 1
     try:
@@ -2886,11 +2903,14 @@ def job_dp_import(job: Job, src: dict, tgt: dict) -> None:
               "    if c = 0 then\n"
               "      execute immediate 'create '||case when big='YES' then 'bigfile ' end||'tablespace \"'||n||'\" datafile size 100M"
               " autoextend on next 256M maxsize unlimited'||case when bs <> 8192 then ' blocksize '||bs end;\n"
-              "      if big = 'NO' then\n        files := ceil(bytes / (30 * 1024 * 1024 * 1024));\n"
+              "      if big = 'NO' then\n        files := ceil(bytes / 32212254720);  -- 30 GB je Datei\n"
               "        for i in 2 .. files loop\n          execute immediate 'alter tablespace \"'||n||'\" add datafile size 100M"
               " autoextend on next 256M maxsize unlimited';\n        end loop;\n      end if;\n    end if;\n  end;\nbegin\n"
             + (ts_calls or "  null;") + "\nend;\n/\n"
+            "select 'ZK_STEP=ts' from dual;\n"
             "create or replace directory ZK_IMPORT_DIR as '/opt/oracle/oradata/zk_import';\n"
+            "begin execute immediate 'drop database link ZK_SRC'; exception when others then null; end;\n/\n"
+            "select 'ZK_STEP=dir' from dual;\n"
             f"create database link ZK_SRC connect to {src['user']} identified by \"{src['password']}\" "
             f"using '//{src['host']}:{src['port']}/{src['service']}';\n"
             "select 'ZK_LINK='||dummy from dual@ZK_SRC;\nexit\n")
@@ -2898,11 +2918,13 @@ def job_dp_import(job: Job, src: dict, tgt: dict) -> None:
         p = job.run(["docker", "exec", "-i", cname, "sqlplus", "-s", "/ as sysdba"], input=prep, secret=src["password"],
                     allow_fail=True)
         if "ZK_LINK=X" not in p.stdout:
-            raise RuntimeError("DB-Link zur Quelle funktioniert nicht: " +
-                               (" | ".join(sorted(set(re.findall(r"(ORA-\d{5}[^\n]*)", p.stdout))))[:300] or "siehe Protokoll"))
+            step = ("DB-Link zur Quelle" if "ZK_STEP=dir" in p.stdout else
+                    "Verzeichnis ZK_IMPORT_DIR" if "ZK_STEP=ts" in p.stdout else "Anlegen der Tablespaces")
+            ora = " | ".join(dict.fromkeys(re.findall(r"(ORA-\d{5}[^\n]*)", p.stdout)))[:300]
+            raise RuntimeError(f"Vorbereitung in der neuen DB fehlgeschlagen ({step}): {ora or 'siehe Protokoll'}")
 
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        par = [f"userid=system/{tgt['password']}", "network_link=ZK_SRC", "directory=ZK_IMPORT_DIR",
+        par = ['userid="/ as sysdba"', "network_link=ZK_SRC", "directory=ZK_IMPORT_DIR",
                f"logfile=import_{stamp}.log", f"parallel={parallel}", "logtime=all", "metrics=yes"]
         if tgt["full"]:
             par += ["full=y", "exclude=tablespace"]
@@ -2914,7 +2936,7 @@ def job_dp_import(job: Job, src: dict, tgt: dict) -> None:
                   "impdp parfile=/tmp/zk_import.par\nrc=$?\nrm -f /tmp/zk_import.par\necho \"ZK_RC=$rc\"\n")
         job.log(f"Import über den DB-Link ({'vollständig' if tgt['full'] else ', '.join(schemas)}, "
                 f"parallel {parallel}{', konsistent zum Startzeitpunkt' if tgt['consistent'] else ''}) – die Quelle läuft weiter")
-        rc, oras = job.stream(["docker", "exec", "-i", cname, "bash", "-s"], input=script, secret=tgt["password"])
+        rc, oras = job.stream(["docker", "exec", "-i", cname, "bash", "-s"], input=script)
         lines = "\n".join(job.lines[-20:])
         m = re.search(r"ZK_RC=(\d+)", lines)
         irc = int(m.group(1)) if m else rc
@@ -2952,13 +2974,15 @@ def job_dp_import(job: Job, src: dict, tgt: dict) -> None:
                input="drop database link ZK_SRC;\nexit\n", check=False)
         job.log(f"Die neue Datenbank {sid} bleibt zur Analyse bestehen; löschen über „Alle Snapshots“.")
         raise
+    db_meta_update(sid, dp_pending=False, origin=f"per Data Pump von {src['host']}/{src['service']}")
     tl_add(sid, "db-imported", f"Datenbank {sid} per Data Pump von {src['host']}/{src['service']} übernommen"
            f" ({'vollständig' if tgt['full'] else ', '.join(schemas)})")
 
 
 @bp.post("/api/import/dp/probe")
 def api_dp_probe():
-    return jsonify(probe_dp(validate_dp_source(request.get_json(force=True))))
+    data = request.get_json(force=True)
+    return jsonify(probe_dp(validate_dp_source(data), (data.get("target_sid") or "").strip().upper()))
 
 
 @bp.post("/api/import/dp")
@@ -2972,11 +2996,12 @@ def api_dp_import():
                keep_link=bool(data.get("keep_link")))
     if not RE_NEWSID.match(tgt["sid"]):
         raise UserError("Neue SID: Großbuchstaben und Ziffern, beginnt mit einem Buchstaben, höchstens 8 Zeichen.")
-    if (MASTER / tgt["sid"]).exists():
+    resume = (MASTER / tgt["sid"]).exists()
+    if resume and not db_meta(tgt["sid"]).get("dp_pending"):
         raise UserError(f"Eine Datenbank {tgt['sid']} gibt es auf diesem Host schon.")
-    if not 1024 <= tgt["port"] <= 65535:
+    if not resume and not 1024 <= tgt["port"] <= 65535:
         raise UserError("Port: 1024 bis 65535.")
-    if not RE_DBPWD.match(tgt["password"]):
+    if not resume and not RE_DBPWD.match(tgt["password"]):
         raise UserError("Passwort der neuen DB: 8–30 Zeichen mit Groß- und Kleinbuchstaben und Ziffer; erlaubt sind A–Z, a–z, 0–9, _ # $.")
     if not 1024 <= tgt["memory_mb"] <= 262144:
         raise UserError("Speicher: 1024 bis 262144 MB.")

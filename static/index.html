@@ -1189,6 +1189,8 @@ function dpPlanHtml(plan, host, freePort) {
       <div class="days js-scope"><label><input type="radio" name="scope" value="full" checked>Ganze Datenbank</label><label><input type="radio" name="scope" value="schemas">Ausgewählte Schemas</label></div>
       <div class="devpick js-schemas" hidden style="margin-top:8px">${schemas}</div>
     </div>
+    ${plan.target && plan.target.resume ? `
+    <label class="field">Parallelität <input type="number" name="parallel" value="4" min="1" max="32"></label>` : `
     <div class="row3">
       <label class="field">Port auf ${esc(host.name)} <input type="number" name="port" min="1024" max="65535" value="${freePort}" required></label>
       <label class="field">Speicher (MB) <input type="number" name="memory_mb" value="4096" min="1024" step="256"></label>
@@ -1197,7 +1199,7 @@ function dpPlanHtml(plan, host, freePort) {
     <div class="row2">
       <label class="field">Passwort der neuen DB <input type="password" name="target_password" autocomplete="new-password"><small>für SYS und SYSTEM</small></label>
       <label class="field">wiederholen <input type="password" name="target_password2" autocomplete="new-password"></label>
-    </div>
+    </div>`}
     <label class="check"><input type="checkbox" name="consistent" value="1" checked><span>Konsistent zum Startzeitpunkt <small>flashback_time; braucht ausreichend Undo auf der Quelle</small></span></label>
     <label class="check"><input type="checkbox" name="keep_link" value="1"><span>DB-Link danach behalten <small>sonst wird er mit den Zugangsdaten der Quelle wieder entfernt</small></span></label>
     <p class="hint-box">Die neue Datenbank ${esc(plan.source.service)} → <b class="js-newsid"></b> entsteht als Non-CDB in einem komprimierten Subvolume; Tablespaces werden vorab angelegt. Danach holt impdp die Daten über den DB-Link, das Vorgangsprotokoll zeigt den Fortschritt. Am Ende werden Objekte neu kompiliert und die Objektzahlen mit der Quelle verglichen.</p>`}`;
@@ -1303,11 +1305,11 @@ function openImportDialog() {
       throw Object.assign(new Error(""), { keepOpen: true });
     }
     if (plan.mode === "dp") {
-      if (v.target_password !== v.target_password2) throw new Error("Die Passwörter der neuen DB stimmen nicht überein.");
+      if (!plan.target.resume && v.target_password !== v.target_password2) throw new Error("Die Passwörter der neuen DB stimmen nicht überein.");
       const full = v.scope !== "schemas";
       const schemas = full ? [] : [...f.querySelectorAll("input[name=schema]:checked")].map(c => c.value);
       if (!full && !schemas.length) throw new Error("Mindestens ein Schema wählen.");
-      startedJob(await api("POST", "/api/import/dp", { ...dpSrc, target_port: +v.port, target_password: v.target_password,
+      startedJob(await api("POST", "/api/import/dp", { ...dpSrc, target_port: +v.port || 0, target_password: v.target_password || "",
         memory_mb: +v.memory_mb, parallel: +v.parallel, full, schemas, consistent: !!v.consistent, keep_link: !!v.keep_link }));
       return;
     }
