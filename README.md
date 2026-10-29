@@ -152,7 +152,9 @@ Releases und Entwickler-DBs aus der Zeit davor bleiben unkomprimiert, bis sie du
 
 ## Neue Datenbank
 
-„Verwaltung“ → „Neue Datenbank“ legt eine leere CDB mit einer PDB an: Subvolume, Anlage per dbca im Oracle-Image (15 bis 45 Minuten), danach wird der Anlage-Container entfernt – er trägt das Passwort in seiner Konfiguration – und die DB als normale Master-DB ohne Passwort-Variable gestartet. Das Passwort gilt für SYS, SYSTEM und PDBADMIN und erscheint nicht im Vorgangsprotokoll.
+„Verwaltung“ → „Neue Datenbank“ legt eine leere Datenbank mit eigenem Container an. Ohne PDB-Namen entsteht eine klassische Non-CDB in derselben Form wie eine migrierte (Datendateien, Controlfiles und Redo-Logs unter `<SID>/`, spfile und Passwortdatei unter `dbconfig/<SID>/`); mit PDB-Namen eine CDB mit dieser einen PDB.
+
+zeitkapsel ruft dafür dbca selbst im Oracle-Image auf (General_Purpose-Vorlage, Dateisystem, automatische SGA mit der angegebenen Speichergröße, Recovery Area in `fast_recovery_area/` innerhalb des Subvolumes) und startet die DB danach als normale Master-DB. Das dauert 15 bis 45 Minuten. Das Passwort gilt für SYS und SYSTEM (bei einer CDB auch PDBADMIN), wird per stdin übergeben und erscheint weder in der Container-Konfiguration noch im Vorgangsprotokoll. Voraussetzung ist das Korrektur-Image (siehe „Image“); die Oberfläche prüft das vorher.
 
 ## Import von einem anderen Server
 
@@ -266,5 +268,4 @@ braucht keinen Cronjob.
 
 - Getestet ist zeitkapsel bisher gegen simulierte `btrfs`-, `docker`-, `ssh`- und `rsync`-Befehle. Vor allem Neuanlage (dbca im Korrektur-Image) und Import sollten zuerst mit einer Test-DB laufen.
 - Der Import unterstützt keine ASM-Ablage und keine Archivlog-Ziele außerhalb der eingehängten Verzeichnisse; Directory-Objekte (Data Pump, UTL_FILE) zeigen danach eventuell auf Pfade, die im Container fehlen.
-- Neue Datenbanken sind immer CDBs mit einer PDB (so legt sie das Oracle-Image an).
 - Vorgangsprotokolle liegen im Arbeitsspeicher des jeweiligen Agenten (die letzten 50); ein Neustart des Dienstes bricht laufende Vorgänge ab.

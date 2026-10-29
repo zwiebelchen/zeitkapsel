@@ -1547,7 +1547,10 @@ def api_snapshots():
                          readonly=info["readonly"], container=by_mount.get(os.path.realpath(p))))
 
     for p in sorted(MASTER.glob("*")):
-        add("Master-DB", p.name, p.name, p)
+        if RE_SID.match(p.name):
+            add("Master-DB", p.name, p.name, p)
+        else:   # z. B. DLHTEST.neu/.alt beim Umkopieren: keine Datenbank, nur ein Subvolume
+            add("Sonstiges Subvolume", p.name.split(".")[0], p.name, p)
     for p in sorted(GOLDEN.glob("*/*")):
         add("Release", p.parent.name, p.name, p)
     for p in sorted(DEV.glob("*")):
@@ -1679,7 +1682,53 @@ def image_can_create() -> str | None:
             13: "sqlplus ist leer"}.get(p.returncode, (p.stderr or p.stdout).strip()[-300:] or "unbekannt")
 
 
-def job_newdb(job: Job, sid: str, pdb: str, password: str, charset: str, port: int) -> None:
+def newdb_script(sid: str, pdb: str, password: str, charset: str, memory_mb: int) -> str:
+    """Bash-Skript, das im Image per dbca eine Datenbank in der Ablage von zeitkapsel anlegt.
+
+    Wird über stdin übergeben, damit das Passwort weder in der Container-Konfiguration noch im
+    Vorgangsprotokoll landet. Ergebnis: /opt/oracle/oradata/<SID>/ mit Datendateien, Controlfiles
+    und Redo-Logs (wie bei einer migrierten DB), spfile und Passwortdatei unter dbconfig/<SID>/.
+    """
+    q = shlex.quote
+    cdb_args = (f"-createAsContainerDatabase true -numberOfPDBs 1 -pdbName {q(pdb)} -pdbAdminPassword \"$PW\""
+                if pdb else "-createAsContainerDatabase false")
+    save_state = f"alter pluggable database {pdb} save state;" if pdb else ""
+    return f"""set -uo pipefail
+PW={q(password)}
+SID={q(sid)}
+export ORACLE_SID="$SID"
+D=/opt/oracle/oradata
+mkdir -p "$D/fast_recovery_area" "$ORACLE_BASE/admin/$SID/adump"
+dbca -silent -createDatabase -templateName General_Purpose.dbc \\
+  -gdbName "$SID" -sid "$SID" {cdb_args} \\
+  -sysPassword "$PW" -systemPassword "$PW" \\
+  -characterSet {q(charset)} -nationalCharacterSet AL16UTF16 \\
+  -storageType FS -datafileDestination "$D" -useOMF false \\
+  -recoveryAreaDestination "$D/fast_recovery_area" -recoveryAreaSize 20480 \\
+  -emConfiguration NONE -memoryMgmtType AUTO_SGA -totalMemory {int(memory_mb)} \\
+  -redoLogFileSize 200 -databaseType MULTIPURPOSE -ignorePreReqs
+rc=$?
+if [ $rc -ne 0 ] || [ ! -s "$ORACLE_HOME/dbs/spfile$SID.ora" ]; then
+  echo "ZKERR=dbca ist fehlgeschlagen (Exit $rc)"
+  tail -n 40 "$ORACLE_BASE"/cfgtoollogs/dbca/"$SID"/*.log 2>/dev/null
+  exit 1
+fi
+sqlplus -s / as sysdba <<'EOF'
+set heading off feedback off pagesize 0 linesize 300
+select 'ZK_BANNER='||banner from v$version where rownum = 1;
+select 'ZK_CDB='||cdb from v$database;
+{save_state}
+shutdown immediate
+exit
+EOF
+mkdir -p "$D/dbconfig/$SID"
+cp "$ORACLE_HOME/dbs/spfile$SID.ora" "$ORACLE_HOME/dbs/orapw$SID" "$D/dbconfig/$SID/" || exit 1
+echo "ZK_DONE=1"
+"""
+
+
+def job_newdb(job: Job, sid: str, pdb: str, password: str, charset: str, port: int,
+              memory_mb: int = 2048) -> None:
     vol = MASTER / sid
     reason = image_can_create()
     if reason:
@@ -1687,34 +1736,36 @@ def job_newdb(job: Job, sid: str, pdb: str, password: str, charset: str, port: i
                            "Bitte das Korrektur-Image aus docker/Dockerfile.fix bauen.")
     if vol.exists():
         raise RuntimeError(f"{vol} gibt es schon.")
-    cs = containers()
-    if port_in_use(port, cs):
+    if port_in_use(port, containers()):
         raise RuntimeError(f"Port {port} ist belegt.")
     cname = f"zk-create-{sid.lower()}"
     job.run(["btrfs", "subvolume", "create", str(vol)])
     try:
         prepare_new_volume(job, vol)
         job.run(["chown", f"{ORACLE_UID}:{ORACLE_UID}", str(vol)])
-        t0 = time.time()
-        job.log("Datenbank wird mit dbca angelegt; das dauert typischerweise 15 bis 45 Minuten.")
-        job.run(["docker", "run", "-d", "--name", cname, "--init",
-                 "-e", f"ORACLE_SID={sid}", "-e", f"ORACLE_PDB={pdb}", "-e", f"ORACLE_PWD={password}",
-                 "-e", f"ORACLE_CHARACTERSET={charset}",
-                 "-v", f"{vol}:/opt/oracle/oradata", IMAGE], secret=password)
-        wait_ready(job, cname, t0, timeout=CREATE_TIMEOUT)
-        job.log("Anlage-Container sauber beenden (er enthält das Passwort in seiner Konfiguration)")
-        job.run(["docker", "stop", "-t", "600", cname], timeout=700)
-        job.run(["docker", "rm", cname])
+        kind = f"Container-DB mit PDB {pdb}" if pdb else "Non-CDB"
+        job.log(f"{kind} wird mit dbca angelegt; das dauert typischerweise 15 bis 45 Minuten.")
+        p = job.run(["docker", "run", "--rm", "-i", "--name", cname, "--entrypoint", "bash",
+                     "-e", f"ORACLE_SID={sid}", "-v", f"{vol}:/opt/oracle/oradata", IMAGE, "-s"],
+                    input=newdb_script(sid, pdb, password, charset, memory_mb), secret=password,
+                    timeout=CREATE_TIMEOUT)
+        out = p.stdout
+        if "ZK_DONE=1" not in out:
+            raise RuntimeError("Anlage unvollständig: " + (re.search(r"ZKERR=(.*)", out) or [None, "siehe Protokoll"])[1])
+        banner = (re.search(r"ZK_BANNER=(.*)", out) or [None, ""])[1]
+        edition = "standard" if "Standard" in banner else "enterprise"
+        write_dbconfig(vol, sid, edition, "", pdb or sid)
+        write_volume_env(vol, dict(ZK_DB_TYPE="cdb" if pdb else "noncdb", ZK_PDB=pdb,
+                                   ZK_SERVICE=pdb or sid, ZK_EDITION=edition))
+        job.run(["chown", "-R", f"{ORACLE_UID}:{ORACLE_UID}", str(vol)])
         check_volume(vol, sid)
-        write_volume_env(vol, dict(ZK_DB_TYPE="cdb", ZK_PDB=pdb, ZK_SERVICE=pdb))
-        sh(["chown", f"{ORACLE_UID}:{ORACLE_UID}", str(vol / VOLUME_ENV)])
     except Exception:
         sh(["docker", "rm", "-f", cname], check=False)
         sh(["btrfs", "subvolume", "delete", str(vol)], check=False)
         sv_forget(vol)
         raise
     db_meta_update(sid, port=port, origin="neu angelegt", created=now_iso())
-    tl_add(sid, "db-created", f"Datenbank {sid} (PDB {pdb}) neu angelegt")
+    tl_add(sid, "db-created", f"Datenbank {sid} neu angelegt" + (f" (PDB {pdb})" if pdb else " (Non-CDB)"))
     job_master_start(job, sid, port)
 
 
@@ -2054,8 +2105,14 @@ def api_newdb():
     port = int(data.get("port") or 0)
     if not RE_NEWSID.match(sid):
         raise UserError("SID: Großbuchstaben und Ziffern, beginnt mit einem Buchstaben, höchstens 8 Zeichen.")
-    if not RE_PDBNAME.match(pdb) or pdb == sid:
-        raise UserError("PDB-Name: Großbuchstaben, Ziffern, Unterstrich; anders als die SID.")
+    if pdb and (not RE_PDBNAME.match(pdb) or pdb == sid):
+        raise UserError("PDB-Name: Großbuchstaben, Ziffern, Unterstrich; anders als die SID – oder leer für eine Non-CDB.")
+    try:
+        memory_mb = int(data.get("memory_mb") or 2048)
+    except ValueError:
+        raise UserError("Speicher: Zahl in MB.") from None
+    if not 1024 <= memory_mb <= 262144:
+        raise UserError("Speicher: 1024 bis 262144 MB.")
     if not RE_DBPWD.match(pwd):
         raise UserError("Passwort: 8–30 Zeichen mit Groß- und Kleinbuchstaben und Ziffer; erlaubt sind A–Z, a–z, 0–9, _ # $.")
     if charset not in CHARSETS:
@@ -2064,7 +2121,8 @@ def api_newdb():
         raise UserError("Port: 1024 bis 65535.")
     if (MASTER / sid).exists():
         raise UserError(f"Eine Datenbank {sid} gibt es auf diesem Host schon.")
-    job = start_job(f"Neue Datenbank {sid} anlegen", sid, f"newdb:{sid}", job_newdb, sid, pdb, pwd, charset, port)
+    job = start_job(f"Neue Datenbank {sid} anlegen", sid, f"newdb:{sid}", job_newdb, sid, pdb, pwd, charset, port,
+                    memory_mb)
     return jsonify(job=job.as_dict())
 
 

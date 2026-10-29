@@ -421,17 +421,18 @@ label.field textarea { min-height: 84px; resize: vertical; }
 <dialog id="dlgNewDb">
   <form method="dialog" id="fNewDb">
     <h2>Neue Datenbank anlegen</h2>
-    <p class="lead">Legt auf <b class="js-host"></b> eine leere Container-Datenbank (CDB) mit einer PDB an. Das Oracle-Image erstellt sie mit dbca; das dauert 15 bis 45 Minuten.</p>
+    <p class="lead">Legt auf <b class="js-host"></b> eine leere Datenbank mit eigenem Container an – als klassische Non-CDB wie die bisherigen, oder mit PDB, wenn du einen PDB-Namen angibst. dbca braucht dafür 15 bis 45 Minuten.</p>
     <div class="row2">
       <label class="field">SID <input name="sid" required maxlength="8" pattern="[A-Za-z][A-Za-z0-9]*" placeholder="z. B. KUNDE1" autocomplete="off"><small>höchstens 8 Zeichen</small></label>
-      <label class="field">PDB <input name="pdb" required maxlength="30" pattern="[A-Za-z][A-Za-z0-9_]*" placeholder="z. B. KUNDE1PDB" autocomplete="off"></label>
+      <label class="field">PDB <small>optional</small> <input name="pdb" maxlength="30" pattern="[A-Za-z][A-Za-z0-9_]*" placeholder="leer lassen = Non-CDB" autocomplete="off"><small>nur für eine Container-DB mit PDB</small></label>
     </div>
-    <div class="row2">
+    <div class="row3">
       <label class="field">Port <input type="number" name="port" required min="1024" max="65535" value="1522"></label>
+      <label class="field">Speicher (MB) <input type="number" name="memory_mb" required min="1024" max="262144" step="256" value="2048"><small>SGA + PGA</small></label>
       <label class="field">Zeichensatz <select name="charset"></select></label>
     </div>
     <div class="row2">
-      <label class="field">Passwort <input type="password" name="password" required minlength="8" maxlength="30" autocomplete="new-password"><small>für SYS, SYSTEM und PDBADMIN</small></label>
+      <label class="field">Passwort <input type="password" name="password" required minlength="8" maxlength="30" autocomplete="new-password"><small>für SYS und SYSTEM (und PDBADMIN)</small></label>
       <label class="field">Passwort wiederholen <input type="password" name="password2" required autocomplete="new-password"></label>
     </div>
     <p class="hint-box js-imgwarn" hidden></p>
@@ -1196,7 +1197,7 @@ async function loadSnapshots() {
 function renderSnapshots() {
   const main = $("#main");
   if (!snapRows) { main.innerHTML = "<p>Lade Snapshots …</p>"; return; }
-  const kinds = ["Master-DB", "Release", "Entwickler-DB", "Entwickler-Snapshot", "Zwischenstand"];
+  const kinds = ["Master-DB", "Release", "Entwickler-DB", "Entwickler-Snapshot", "Zwischenstand", "Sonstiges Subvolume"];
   const rows = [...snapRows].sort((a, b) => kinds.indexOf(a.kind) - kinds.indexOf(b.kind) || a.sid.localeCompare(b.sid) || (b.created || "").localeCompare(a.created || ""));
   main.innerHTML = `
     <section class="dbhead"><h1>Alle Snapshots</h1>
@@ -1211,6 +1212,7 @@ function renderSnapshots() {
         <td class="num" data-usage="${esc(r.path)}">${r.usage ? fmtBytes(r.usage.exclusive) : `<button class="quiet small" data-act="usage" data-path="${esc(r.path)}">ermitteln</button>`}</td>
         <td class="path">${esc(r.path)}</td></tr>`).join("")}</tbody>
     </table></div>
+    ${rows.some(r => r.kind === "Sonstiges Subvolume") ? `<p style="color:var(--muted)">„Sonstiges Subvolume“: liegt unter <code>master/</code>, hat aber keinen gültigen SID-Namen (z. B. <code>DLHTEST.neu</code> oder <code>.alt</code> beim Umkopieren für die Kompression). Daraus entsteht keine Datenbank; nach dem Umbenennen bzw. Löschen verschwindet der Eintrag.</p>` : ""}
     ${rows.some(r => r.kind === "Zwischenstand") ? `<p style="color:var(--muted)">Zwischenstände bleiben nur zurück, wenn ein Release-Vorgang hart abgebrochen wurde. Löschen mit <code>btrfs subvolume delete &lt;Pfad&gt;</code>, sobald kein Vorgang mehr läuft.</p>` : ""}`;
 }
 
@@ -1313,7 +1315,7 @@ document.addEventListener("click", async ev => {
           $(".js-imgwarn", f).textContent = chk.ok ? "" : `Das Image kann keine neuen Datenbanken anlegen (${chk.reason}). Erst das Korrektur-Image aus docker/Dockerfile.fix bauen.`;
         }, async v => {
           if (v.password !== v.password2) throw new Error("Die Passwörter stimmen nicht überein.");
-          startedJob(await api("POST", "/api/newdb", { sid: v.sid.toUpperCase(), pdb: v.pdb.toUpperCase(), password: v.password, charset: v.charset, port: +v.port }));
+          startedJob(await api("POST", "/api/newdb", { sid: v.sid.toUpperCase(), pdb: (v.pdb || "").trim().toUpperCase(), password: v.password, charset: v.charset, port: +v.port, memory_mb: +v.memory_mb }));
         });
         break;
       }
