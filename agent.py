@@ -294,6 +294,8 @@ def containers() -> list[dict]:
             port=port, mount=os.path.realpath(mount) if mount else None,
             running=bool(st.get("Running")), restarting=bool(st.get("Restarting")),
             started=st.get("StartedAt"),
+            mem_limit=int(c["HostConfig"].get("Memory") or 0), nano_cpus=int(c["HostConfig"].get("NanoCpus") or 0),
+            shm_size=int(c["HostConfig"].get("ShmSize") or 0),
         ))
     return out
 
@@ -860,7 +862,8 @@ def dev_run_cmd(did: str, sid: str, port: int, release: str, owner: str, created
             "--label", f"devcreated={created}",
             "-p", f"{port}:1521", "-e", f"ORACLE_SID={sid}",
             "-v", f"{DEV / did}:/opt/oracle/oradata",
-            "-v", f"{DEVDUMPS / did}:/oracle/dumps", *docker_extra(DEV / did), IMAGE]
+            "-v", f"{DEVDUMPS / did}:/oracle/dumps", *docker_extra(DEV / did),
+            *settings_args(dev_settings(sid, did)), IMAGE]
 
 
 def prepare_dumps(did: str, sid: str) -> None:
@@ -2328,7 +2331,7 @@ def master_run_cmd(sid: str, port: int) -> list[str]:
            "-v", f"{vol}:/opt/oracle/oradata"]
     if MASTER_DUMPS.is_dir():
         cmd += ["-v", f"{MASTER_DUMPS}:/oracle/dumps"]
-    return cmd + docker_extra(vol) + [IMAGE]
+    return cmd + docker_extra(vol) + settings_args(db_meta(sid).get("container") or {}) + [IMAGE]
 
 
 def job_master_start(job: Job, sid: str, port: int | None = None) -> None:
@@ -2365,6 +2368,208 @@ def job_master_stop(job: Job, sid: str) -> None:
         return
     job.run(["docker", "stop", "-t", "600", c["name"]], timeout=700)
     tl_add(sid, "master", f"Master-DB {sid} gestoppt")
+
+
+# --------------------------------------------------------------------------- Einstellungen: Container-Limits und Oracle-Speicher
+def settings_args(cs: dict) -> list[str]:
+    """docker-run-Argumente aus gespeicherten Einstellungen (leer = kein Limit bzw. Vorgabe)."""
+    args: list[str] = []
+    if cs.get("memory_mb"):
+        args += ["--memory", f"{int(cs['memory_mb'])}m", "--memory-swap", f"{int(cs['memory_mb'])}m"]
+    if cs.get("cpus"):
+        args += ["--cpus", str(cs["cpus"])]
+    if cs.get("shm_mb"):
+        args += ["--shm-size", f"{int(cs['shm_mb'])}m"]   # steht hinter zeitkapsel.env und gewinnt
+    return args
+
+
+def dev_settings(sid: str, did: str) -> dict:
+    try:
+        return json.loads(dev_meta_file(sid, did).read_text()).get("container") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+ORACLE_MEM_PARAMS = ("sga_target", "sga_max_size", "pga_aggregate_target", "pga_aggregate_limit",
+                     "memory_target", "memory_max_target", "processes")
+
+
+def oracle_params(cname: str) -> dict:
+    p = sh(["docker", "exec", "-i", cname, "sqlplus", "-s", "/ as sysdba"], check=False, timeout=60,
+           input="set heading off feedback off pagesize 0 linesize 200\n"
+                 "select 'ZK_P_'||name||'='||value from v$parameter where name in ("
+                 + ",".join(f"'{n}'" for n in ORACLE_MEM_PARAMS) + ");\nexit\n")
+    out = {}
+    for k, v in re.findall(r"ZK_P_(\w+)=(\d+)", p.stdout):
+        out[k] = int(v)
+    return out
+
+
+def settings_target(kind: str, ident: str) -> tuple[str, dict | None, dict, Path]:
+    """(sid, Container, gespeicherte Einstellungen, Ablagedatei) für eine Master- oder Entwickler-DB."""
+    cs = containers()
+    if kind == "master":
+        need_sid(ident)
+        return ident, master_container(ident, cs), db_meta(ident).get("container") or {}, db_meta_file(ident)
+    dev = find_dev(ident)
+    c = next((x for x in cs if x["name"] == dev["container"]), None)
+    return dev["sid"], c, dev_settings(dev["sid"], ident), dev_meta_file(dev["sid"], ident)
+
+
+def settings_view(kind: str, ident: str) -> dict:
+    sid, c, saved, _ = settings_target(kind, ident)
+    running = bool(c and c["running"])
+    ora = oracle_params(c["name"]) if running else {}
+    env_shm = read_volume_env((MASTER / sid) if kind == "master" else (DEV / ident)).get("ZK_SHM_SIZE", "")
+    return dict(kind=kind, id=ident, sid=sid, container=c["name"] if c else None, running=running,
+                saved=saved, env_shm=env_shm,
+                actual=dict(memory=c["mem_limit"], cpus=c["nano_cpus"] / 1e9 if c else 0, shm=c["shm_size"]) if c else None,
+                oracle=ora, amm=bool(ora.get("memory_target")), host_mem=os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"),
+                host_cpus=os.cpu_count())
+
+
+def validate_settings(data: dict, view: dict) -> tuple[dict, dict]:
+    def num(key, lo, hi, cast=int):
+        v = data.get(key)
+        if v in (None, "", 0, "0"):
+            return None
+        try:
+            v = cast(v)
+        except (TypeError, ValueError):
+            raise UserError(f"{key}: Zahl erwartet.") from None
+        if not lo <= v <= hi:
+            raise UserError(f"{key}: {lo} bis {hi}.")
+        return v
+    host_mb = view["host_mem"] // 1024 ** 2
+    cont = dict(memory_mb=num("memory_mb", 512, host_mb), cpus=num("cpus", 0.1, float(view["host_cpus"] or 64), float),
+                shm_mb=num("shm_mb", 64, host_mb))
+    ora = dict(sga_mb=num("sga_mb", 256, host_mb), pga_mb=num("pga_mb", 64, host_mb),
+               memory_target_mb=num("memory_target_mb", 512, host_mb))
+    if ora["memory_target_mb"] and (ora["sga_mb"] or ora["pga_mb"]):
+        raise UserError("Entweder memory_target (AMM) oder SGA/PGA angeben, nicht beides.")
+    if ora["memory_target_mb"] and not view["amm"]:
+        raise UserError("Die DB nutzt kein AMM; SGA und PGA einstellen.")
+    if view["amm"] and (ora["sga_mb"] or ora["pga_mb"]):
+        raise UserError("Die DB nutzt AMM (memory_target); dort memory_target einstellen.")
+    # Plausibilität: Oracle braucht SGA + PGA + Prozesse; /dev/shm muss bei AMM memory_target fassen
+    o = view["oracle"]
+    sga = ora["sga_mb"] or o.get("sga_target", 0) // 1024 ** 2
+    pga = ora["pga_mb"] or o.get("pga_aggregate_target", 0) // 1024 ** 2
+    mt = ora["memory_target_mb"] or o.get("memory_target", 0) // 1024 ** 2
+    need = (mt or (sga + pga)) + 512
+    if cont["memory_mb"] and cont["memory_mb"] < need:
+        raise UserError(f"RAM-Limit {cont['memory_mb']} MB ist zu knapp; die DB braucht mindestens etwa {need} MB "
+                        "(SGA + PGA bzw. memory_target plus 512 MB für Prozesse).")
+    if mt and cont["shm_mb"] and cont["shm_mb"] < mt * 1.05:
+        raise UserError(f"/dev/shm muss bei AMM mindestens memory_target ({mt} MB) fassen.")
+    return cont, ora
+
+
+def job_apply_settings(job: Job, kind: str, ident: str, cont: dict, ora: dict, restart: bool) -> None:
+    sid, c, saved, meta_file = settings_target(kind, ident)
+    view = settings_view(kind, ident)
+    new = {k: v for k, v in cont.items() if v}
+    removed = [k for k in ("memory_mb", "cpus") if saved.get(k) and not new.get(k)]
+    shm_changed = (saved.get("shm_mb") or None) != (new.get("shm_mb") or None)
+    recreate = bool(c) and (shm_changed or bool(removed))
+    # 1. Oracle-Parameter in die spfile (die DB muss dafür laufen)
+    sql = []
+    o = view["oracle"]
+    if ora.get("memory_target_mb"):
+        mt = ora["memory_target_mb"]
+        if mt * 1024 ** 2 > o.get("memory_max_target", 0):
+            sql.append(f"alter system set memory_max_target={mt}M scope=spfile;")
+        sql.append(f"alter system set memory_target={mt}M scope=spfile;")
+    if ora.get("sga_mb"):
+        if ora["sga_mb"] * 1024 ** 2 > o.get("sga_max_size", 0):
+            sql.append(f"alter system set sga_max_size={ora['sga_mb']}M scope=spfile;")
+        sql.append(f"alter system set sga_target={ora['sga_mb']}M scope=spfile;")
+    if ora.get("pga_mb"):
+        sql.append(f"alter system set pga_aggregate_target={ora['pga_mb']}M scope=spfile;")
+        if o.get("pga_aggregate_limit") and o["pga_aggregate_limit"] < 2 * ora["pga_mb"] * 1024 ** 2:
+            sql.append(f"alter system set pga_aggregate_limit={2 * ora['pga_mb']}M scope=spfile;")
+    if sql:
+        if not (c and c["running"]):
+            raise RuntimeError("Für Oracle-Parameter muss die Datenbank laufen.")
+        job.log("Oracle-Speicherparameter in die spfile schreiben (wirken nach dem Neustart)")
+        p = job.run(["docker", "exec", "-i", c["name"], "sqlplus", "-s", "/ as sysdba"],
+                    input="whenever sqlerror exit 3\n" + "\n".join(sql) + "\nexit\n", allow_fail=True)
+        if p.returncode:
+            raise RuntimeError("Oracle hat die Werte abgelehnt: " + " | ".join(dict.fromkeys(re.findall(r"(ORA-\d{5}[^\n]*)", p.stdout))))
+    # 2. Einstellungen sichern (gelten auch für künftig erzeugte Container)
+    try:
+        meta = json.loads(meta_file.read_text())
+    except (OSError, ValueError):
+        meta = {}
+    meta["container"] = new
+    write_json(meta_file, meta)
+    tl_add(sid, "settings", f"Einstellungen von {c['name'] if c else ident} geändert: "
+           + (", ".join(f"{k}={v}" for k, v in {**new, **{k: v for k, v in ora.items() if v}}.items()) or "keine Limits"),
+           ref=ident)
+    if not c:
+        job.log("Kein Container vorhanden; die Einstellungen gelten beim nächsten Start.")
+        return
+    # 3. Container anpassen
+    if recreate:
+        job.log("/dev/shm geändert oder Limit entfernt: Container wird mit den neuen Einstellungen neu erzeugt")
+        if c["running"]:
+            job.run(["docker", "stop", "-t", "600", c["name"]], timeout=700)
+        job.run(["docker", "rm", c["name"]])
+        t0 = time.time()
+        if kind == "master":
+            job.run(master_run_cmd(sid, c["port"] or db_meta(sid).get("port")))
+        else:
+            dev = find_dev(ident)
+            job.run(dev_run_cmd(ident, sid, c["port"], dev["release"], dev["owner"], dev["created"] or now_iso(), dev["base"]))
+        wait_ready(job, c["name"], t0)
+        return
+    if new.get("memory_mb") or new.get("cpus"):
+        upd = ["docker", "update"]
+        if new.get("memory_mb"):
+            upd += ["--memory", f"{new['memory_mb']}m", "--memory-swap", f"{new['memory_mb']}m"]
+        if new.get("cpus"):
+            upd += ["--cpus", str(new["cpus"])]
+        job.log("Limits ohne Neustart setzen (docker update)")
+        job.run(upd + [c["name"]])
+    if sql:
+        if restart and c["running"]:
+            job.log("Datenbank neu starten, damit die Oracle-Parameter greifen")
+            t0 = time.time()
+            job.run(["docker", "restart", "-t", "600", c["name"]], timeout=900)
+            wait_ready(job, c["name"], t0)
+        else:
+            job.log("Die Oracle-Parameter wirken beim nächsten Neustart der Datenbank.")
+
+
+@bp.get("/api/db/<sid>/settings")
+def api_master_settings(sid):
+    return jsonify(settings_view("master", sid))
+
+
+@bp.get("/api/devdbs/<did>/settings")
+def api_dev_settings(did):
+    return jsonify(settings_view("dev", did))
+
+
+def start_settings_job(kind: str, ident: str):
+    data = request.get_json(force=True) or {}
+    view = settings_view(kind, ident)
+    cont, ora = validate_settings(data, view)
+    label = f"Master-DB {ident}" if kind == "master" else f"Entwickler-DB {ident.partition('-')[2]}"
+    key = f"master:{ident}" if kind == "master" else f"dev:{ident}"
+    job = start_job(f"Einstellungen der {label} ändern", view["sid"], key, job_apply_settings,
+                    kind, ident, cont, ora, bool(data.get("restart")))
+    return jsonify(job=job.as_dict())
+
+
+@bp.post("/api/db/<sid>/settings")
+def api_master_settings_set(sid):
+    return start_settings_job("master", sid)
+
+
+@bp.post("/api/devdbs/<did>/settings")
+def api_dev_settings_set(did):
+    return start_settings_job("dev", did)
 
 
 # --------------------------------------------------------------------------- Port ändern

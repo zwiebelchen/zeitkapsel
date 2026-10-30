@@ -266,6 +266,11 @@ dialog.wide { width: min(1100px, calc(100vw - 24px)); }
 .tile.capacity { border-color: var(--ink); }
 .host-charts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 @media (max-width: 1100px) { .host-charts { grid-template-columns: minmax(0, 1fr); } }
+fieldset.setbox { border: 1px solid var(--rule); border-radius: 8px; padding: 10px 12px 12px; margin: 0; display: grid; gap: 8px; min-width: 0; }
+fieldset.setbox .row3 { align-items: start; }
+fieldset.setbox input { width: 100%; min-width: 0; }
+fieldset.setbox legend { font-weight: 600; font-size: 14px; padding: 0 4px; }
+#dlgSettings { width: min(620px, calc(100vw - 24px)); }
 .load-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin: 22px 0 10px; }
 .load-head h2 { font-size: 18px; font-weight: 650; }
 .load-head select { font-size: 13px; padding: 3px 6px; border: 1px solid var(--rule); border-radius: 5px; background: #fff; }
@@ -602,6 +607,35 @@ label.field textarea { min-height: 84px; resize: vertical; }
   </div>
 </dialog>
 
+<!-- Einstellungen einer Datenbank -->
+<dialog id="dlgSettings">
+  <form method="dialog" id="fSettings">
+    <h2>Einstellungen <span class="js-name"></span></h2>
+    <p class="lead js-lead"></p>
+    <fieldset class="setbox"><legend>Container</legend>
+      <div class="row3">
+        <label class="field">CPU-Kerne <input type="number" name="cpus" min="0.1" step="any" placeholder="unbegrenzt"><small class="js-cur-cpus"></small></label>
+        <label class="field">RAM-Limit (MB) <input type="number" name="memory_mb" min="512" step="any" placeholder="unbegrenzt"><small class="js-cur-mem"></small></label>
+        <label class="field">/dev/shm (MB) <input type="number" name="shm_mb" min="64" step="any" placeholder="Vorgabe"><small class="js-cur-shm"></small></label>
+      </div>
+      <small class="muted-note">Leer = kein Limit bzw. Vorgabe. CPU und RAM gelten sofort; /dev/shm oder ein entferntes Limit erzeugt den Container neu (sauberes Herunterfahren, Daten bleiben).</small>
+    </fieldset>
+    <fieldset class="setbox js-ora"><legend>Oracle-Speicher</legend>
+      <div class="row3 js-ora-asmm">
+        <label class="field">SGA (MB) <input type="number" name="sga_mb" min="256" step="any"><small class="js-cur-sga"></small></label>
+        <label class="field">PGA (MB) <input type="number" name="pga_mb" min="64" step="any"><small class="js-cur-pga"></small></label>
+      </div>
+      <div class="js-ora-amm" hidden>
+        <label class="field">memory_target (MB) <input type="number" name="memory_target_mb" min="512" step="any"><small class="js-cur-mt"></small></label>
+      </div>
+      <label class="check" style="margin-top:8px"><input type="checkbox" name="restart" value="1"><span>Datenbank danach neu starten <small>Oracle übernimmt geänderte Werte erst beim nächsten Start; ohne Haken wirken sie beim nächsten Neustart.</small></span></label>
+    </fieldset>
+    <p class="hint-box js-ora-off" hidden>Die Datenbank läuft nicht; Oracle-Parameter lassen sich nur bei laufender DB ändern. Die Container-Einstellungen gelten beim nächsten Start.</p>
+    <p class="form-error"></p>
+    <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Übernehmen</button></div>
+  </form>
+</dialog>
+
 <!-- Vorgang erneut ausführen -->
 <dialog id="dlgRetry">
   <form method="dialog" id="fRetry">
@@ -823,6 +857,7 @@ function renderDb(db) {
             ? `<button data-act="master-start" data-port="${m.port || ""}">Master starten</button>`
             : `<button data-act="master-stop">Master stoppen</button>`}
           <button data-act="master-port" data-sid="${esc(db.sid)}" data-port="${m.port || ""}">Port ändern</button>
+          <button data-act="settings" data-kind="master" data-id="${esc(db.sid)}">Einstellungen</button>
           <button data-act="note-add">Notiz hinzufügen</button>
           <button class="primary" data-act="release-new" ${db.release_busy ? 'disabled title="Ein Release wird gerade erstellt"' : ""}>${db.release_busy ? "Release wird erstellt …" : "Release erstellen"}</button>` : ""}
       </div>
@@ -997,6 +1032,7 @@ function renderDevs(db) {
         ${noCont ? "" : `<button class="quiet small" data-act="snap-new" data-id="${esc(d.id)}" ${working ? "disabled" : ""}>Snapshot erstellen</button>`}
         ${noCont ? "" : `<button class="quiet small" data-act="dev-reset" data-id="${esc(d.id)}" ${working || !d.base ? "disabled" : ""}>Auf Ausgangsstand zurücksetzen</button>`}
         <button class="quiet small" data-act="dev-port" data-id="${esc(d.id)}" data-port="${d.port || ""}" ${working ? "disabled" : ""}>Port ändern</button>
+        <button class="quiet small" data-act="settings" data-kind="dev" data-id="${esc(d.id)}" ${working ? "disabled" : ""}>Einstellungen</button>
         ${isAdmin() ? `<button class="quiet small" data-act="dev-owner" data-id="${esc(d.id)}">Besitzer ändern</button>` : ""}
         <button class="quiet small danger" data-act="dev-del" data-id="${esc(d.id)}" ${working ? "disabled" : ""}>Löschen</button>
       </div>` : ""}
@@ -2104,6 +2140,36 @@ document.addEventListener("click", async ev => {
       case "ct-logs":
         openLogs(b.dataset.name);
         break;
+      case "settings": {
+        const kind = b.dataset.kind, id = b.dataset.id;
+        const base = kind === "master" ? `/api/db/${encodeURIComponent(id)}/settings` : `/api/devdbs/${encodeURIComponent(id)}/settings`;
+        const st = await api("GET", base);
+        const MB = v => v ? Math.round(v / 1024 / 1024) : "";
+        const o = st.oracle || {};
+        openDialog("dlgSettings", f => {
+          $(".js-name", f).textContent = kind === "master" ? id : id.split("-").slice(1).join("-");
+          $(".js-lead", f).textContent = `${kind === "master" ? "Master-DB" : "Entwickler-DB"} ${st.container ? "im Container " + st.container + (st.running ? " (läuft)" : " (gestoppt)") : "ohne Container"}. Host: ${st.host_cpus} Kerne, ${fmtBytes(st.host_mem)} RAM.`;
+          const sv = st.saved || {}, a = st.actual || {};
+          f.cpus.value = sv.cpus || ""; f.memory_mb.value = sv.memory_mb || ""; f.shm_mb.value = sv.shm_mb || "";
+          $(".js-cur-cpus", f).textContent = a.cpus ? `aktuell ${a.cpus.toLocaleString("de-DE")}` : "aktuell unbegrenzt";
+          $(".js-cur-mem", f).textContent = a.memory ? `aktuell ${fmtBytes(a.memory)}` : "aktuell unbegrenzt";
+          $(".js-cur-shm", f).textContent = a.shm ? `aktuell ${fmtBytes(a.shm)}${st.env_shm ? ", aus zeitkapsel.env " + st.env_shm : ""}` : "";
+          const hasOra = st.running && Object.keys(o).length;
+          $(".js-ora", f).hidden = !hasOra; $(".js-ora-off", f).hidden = !!hasOra;
+          $(".js-ora-amm", f).hidden = !st.amm; $(".js-ora-asmm", f).hidden = !!st.amm;
+          f.sga_mb.value = MB(o.sga_target); f.pga_mb.value = MB(o.pga_aggregate_target); f.memory_target_mb.value = MB(o.memory_target);
+          $(".js-cur-sga", f).textContent = o.sga_target ? `aktuell ${MB(o.sga_target)} MB, max. ${MB(o.sga_max_size)} MB` : "";
+          $(".js-cur-pga", f).textContent = o.pga_aggregate_target ? `aktuell ${MB(o.pga_aggregate_target)} MB` : "";
+          $(".js-cur-mt", f).textContent = o.memory_target ? `aktuell ${MB(o.memory_target)} MB` : "";
+        }, async v => {
+          const changed = (val, cur) => (+val && +val !== MB(cur)) ? +val : null;
+          const body = { cpus: v.cpus ? +v.cpus : null, memory_mb: v.memory_mb ? +v.memory_mb : null, shm_mb: v.shm_mb ? +v.shm_mb : null,
+            sga_mb: st.amm ? null : changed(v.sga_mb, o.sga_target), pga_mb: st.amm ? null : changed(v.pga_mb, o.pga_aggregate_target),
+            memory_target_mb: st.amm ? changed(v.memory_target_mb, o.memory_target) : null, restart: !!v.restart };
+          startedJob(await api("POST", base, body));
+        });
+        break;
+      }
       case "host-range":
         hostLoad.range = +b.value; await loadLoadPage(true);
         break;

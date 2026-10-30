@@ -115,6 +115,19 @@ Jedes DB-Subvolume enthält die Markierungsdateien, ohne die das Startskript des
 
 Weil die Datei im Subvolume liegt, wandert sie mit jedem Release und jeder Entwickler-DB mit; Oberfläche und Skripte setzen die Angaben bei jedem `docker run` um.
 
+## Einstellungen: CPU, RAM, /dev/shm, Oracle-Speicher
+
+„Einstellungen“ (im Kopf jeder Datenbank und bei jeder Entwickler-DB) zeigt die aktuellen Werte und ändert sie:
+
+| Einstellung | Wirkung |
+| --- | --- |
+| CPU-Kerne | `--cpus`; sofort per `docker update` |
+| RAM-Limit (MB) | `--memory` und `--memory-swap` (kein Auslagern innerhalb des Limits); sofort per `docker update` |
+| /dev/shm (MB) | `--shm-size`, nötig bei AMM (`memory_target`); der Container wird dafür neu erzeugt |
+| SGA / PGA (MB) bzw. memory_target | `alter system … scope=spfile` (bei Bedarf auch `sga_max_size`, `pga_aggregate_limit`, `memory_max_target`); wirkt nach einem Neustart der DB, auf Wunsch sofort |
+
+Leere Felder heißen kein Limit bzw. Vorgabe; ein entferntes Limit erzeugt den Container ebenfalls neu (sauberes Herunterfahren, die Daten bleiben). Die Container-Einstellungen werden gespeichert (Master: `meta/<SID>/db.json`, Entwickler-DB: `meta/<SID>/devdbs/<id>.json`) und gelten auch für jeden später erzeugten Container – nach „Port ändern“, „Zurücksetzen“ oder einem neuen Start. Vor dem Übernehmen wird geprüft, ob das RAM-Limit SGA + PGA (bzw. memory_target) plus etwa 512 MB für die Prozesse fasst und ob /dev/shm bei AMM groß genug ist. Master-DBs stellen Administratoren ein, Entwickler-DBs auch ihre Besitzer.
+
 ## Port ändern
 
 Docker kann die Portzuordnung eines bestehenden Containers nicht ändern. „Port ändern“ (beim Kopf einer Datenbank, bei jeder Entwickler-DB und auf der Seite „Vorgänge und Container“) fährt den Container deshalb sauber herunter, entfernt ihn und erzeugt ihn mit dem neuen Port neu; die Daten im Subvolume bleiben unverändert. Das geht auch für eine Master-DB ohne Container, etwa wenn ihr gespeicherter Port inzwischen belegt ist. Der Dialog schlägt einen freien Port vor; Entwickler-DBs bleiben im Bereich `ZK_DEV_PORT_START` bis `ZK_DEV_PORT_END`. Master-Ports ändern Administratoren, Entwickler-DB-Ports auch ihre Besitzer.
