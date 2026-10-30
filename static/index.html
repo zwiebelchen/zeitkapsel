@@ -286,6 +286,12 @@ label.field { display: grid; gap: 4px; font-size: 14px; font-weight: 600; }
 label.field small { font-weight: 400; color: var(--muted); }
 label.field input, label.field select, label.field textarea { font-weight: 400; padding: 7px 9px; border: 1px solid var(--rule); border-radius: 6px; background: #fff; }
 label.field textarea { min-height: 84px; resize: vertical; }
+form.hset { display: grid; gap: 12px; background: var(--sheet); border: 1px solid var(--rule); border-radius: 8px; padding: 14px 16px; }
+form.hset textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+section:has(> form.hset) { min-width: 0; }
+form.hset .row2, form.hset .row3 { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
+form.hset label.field { min-width: 0; }
+form.hset label.field input, form.hset label.field textarea { width: 100%; box-sizing: border-box; min-width: 0; }
 .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
 .form-error { color: var(--err); font-size: 14px; margin: 0; }
 .form-error:empty { display: none; }
@@ -445,7 +451,7 @@ label.field textarea { min-height: 84px; resize: vertical; }
     <small class="js-tz" style="color:var(--muted)"></small>
     <p class="hint-box js-busy-hint" hidden>Ein Release braucht einige Minuten. Fällt ein Termin in einen noch laufenden Vorgang, wird er übersprungen.</p>
     <div class="row2 js-naming">
-      <label class="field">Namensmuster
+      <label class="field js-tpl">Namensmuster
         <input name="template" maxlength="36" placeholder="nightly-{datum}" autocomplete="off">
         <small>Platzhalter: {datum}, {zeit}, {wochentag}</small>
       </label>
@@ -455,7 +461,7 @@ label.field textarea { min-height: 84px; resize: vertical; }
       </label>
     </div>
     <label class="check js-consistent"><input type="checkbox" name="consistent" value="1">
-      <span>DB dafür kurz herunterfahren <small>Sauber geschlossener Stand; ohne Haken entsteht der Snapshot im laufenden Betrieb.</small></span>
+      <span class="js-consistent-text">DB dafür kurz herunterfahren <small>Sauber geschlossener Stand; ohne Haken entsteht der Snapshot im laufenden Betrieb.</small></span>
     </label>
     <label class="check"><input type="checkbox" name="enabled" value="1" checked>
       <span>Aktiv</span>
@@ -500,9 +506,15 @@ label.field textarea { min-height: 84px; resize: vertical; }
           <label><input type="radio" name="mode" value="ssh" checked>Anderer Server per SSH</label>
           <label><input type="radio" name="mode" value="local">Verzeichnis auf diesem Host</label>
           <label><input type="radio" name="mode" value="dp">Laufende DB per Data Pump</label>
+          <label><input type="radio" name="mode" value="dump">Aus Sicherung (impdp)</label>
         </div>
       </div>
-      <label class="field"><span class="js-sidlabel">SID</span> <input name="sid" required placeholder="z. B. DLHTEST" autocomplete="off"><small class="js-sidhint"></small></label>
+      <div class="js-dump" hidden>
+        <p class="lead">Spielt einen Data-Pump-Export ein – eine Sicherung von zeitkapsel oder beliebige .dmp-Dateien in einem Verzeichnis auf <b class="js-host"></b>. Ziel ist wahlweise eine neue Datenbank oder eine vorhandene, deren Inhalt ersetzt wird.</p>
+        <label class="field">Sicherung <select name="backup"><option value="">– Verzeichnis angeben –</option></select></label>
+        <label class="field js-dumppath">oder Verzeichnis mit .dmp-Dateien <input name="dump_path" placeholder="z. B. /srv/oradumps/kunde1" autocomplete="off"></label>
+      </div>
+      <label class="field js-sidrow"><span class="js-sidlabel">SID</span> <input name="sid" required placeholder="z. B. DLHTEST" autocomplete="off"><small class="js-sidhint"></small></label>
       <div class="js-ssh">
         <p class="lead">Übernimmt eine laufende Oracle-Datenbank von einem anderen Server auf <b class="js-host"></b>: Datendateien, Redo-Logs, Controlfiles, spfile und Passwortdatei. Die Quell-DB muss laufen, damit sie geprüft werden kann.</p>
         <label class="field">Quell-Host <input name="host" placeholder="z. B. db05" autocomplete="off"></label>
@@ -636,6 +648,19 @@ label.field textarea { min-height: 84px; resize: vertical; }
   </form>
 </dialog>
 
+<!-- Datenbank sichern -->
+<dialog id="dlgBackup">
+  <form method="dialog" id="fBackup">
+    <h2>Sichern: <span class="js-name"></span></h2>
+    <p class="lead">Exportiert die laufende Datenbank mit expdp nach <code class="js-dir"></code>. Die Datenbank läuft dabei weiter.</p>
+    <div class="days js-scope"><label><input type="radio" name="scope" value="full" checked>Ganze Datenbank</label><label><input type="radio" name="scope" value="schemas">Nur Schemas</label></div>
+    <label class="field js-schemas" hidden>Schemas <input name="schemas" placeholder="z. B. APP, REPORTING" autocomplete="off"><small>durch Komma getrennt</small></label>
+    <label class="check"><input type="checkbox" name="consistent" value="1" checked><span>Konsistent zum Startzeitpunkt <small>flashback_time; braucht ausreichend Undo</small></span></label>
+    <p class="form-error"></p>
+    <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Sicherung starten</button></div>
+  </form>
+</dialog>
+
 <!-- Vorgang erneut ausführen -->
 <dialog id="dlgRetry">
   <form method="dialog" id="fRetry">
@@ -726,6 +751,7 @@ let openJobs = new Set();
 let jobsHidden = false;
 let snapRows = null;
 let jobsPage = null;          // { jobs, containers } der Seite „Vorgänge“
+let backupsPage = null;       // { backups, dir, free } der Seite „Sicherungen“
 let jobsFilter = "alle";
 const openPageLogs = new Set();
 let admin = null;
@@ -738,6 +764,7 @@ function parseHash() {
   if (p.has("zugang")) view = { kind: "access", hid };
   else if (p.has("snapshots")) view = { kind: "snapshots", hid };
   else if (p.has("vorgaenge")) view = { kind: "jobs", hid };
+  else if (p.has("sicherungen")) view = { kind: "backups", hid };
   else if (p.has("auslastung")) view = { kind: "load", hid };
   else if (p.has("verwaltung")) view = { kind: "admin", hid };
   else view = { kind: "db", hid, sid: p.get("db") };
@@ -752,6 +779,7 @@ async function onHash() {
   if (view.kind === "admin") loadAdmin();
   if (view.kind === "access") loadAccess();
   if (view.kind === "load") loadLoadPage(true);
+  if (view.kind === "backups") loadBackupsPage();
   render();
   if (view.hid !== before) refresh();
 }
@@ -804,6 +832,7 @@ function render() {
   else if (view.kind === "snapshots") renderSnapshots();
   else if (view.kind === "jobs") renderJobsPage();
   else if (view.kind === "load") renderLoadPage();
+  else if (view.kind === "backups") renderBackupsPage();
   else if (view.kind === "admin") isAdmin() ? renderAdmin() : (location.hash = link({ h: view.hid }));
   else renderDb(currentDb());
   if (S) renderJobs(); else $("#jobs").hidden = true;
@@ -823,6 +852,7 @@ function renderNav() {
       ${here && h.ok ? `<a href="${link({ h: h.id, snapshots: 1 })}" ${cur(view.kind === "snapshots")} class="sub"><span></span><span>Alle Snapshots</span><span></span></a>
         <a href="${link({ h: h.id, vorgaenge: 1 })}" ${cur(view.kind === "jobs")} class="sub"><span></span><span>Vorgänge und Container</span><span></span></a>
         <a href="${link({ h: h.id, auslastung: 1 })}" ${cur(view.kind === "load")} class="sub"><span></span><span>Auslastung des Hosts</span><span></span></a>
+        <a href="${link({ h: h.id, sicherungen: 1 })}" ${cur(view.kind === "backups")} class="sub"><span></span><span>Sicherungen</span><span></span></a>
         ${isAdmin() ? `<a href="${link({ h: h.id, verwaltung: 1 })}" ${cur(view.kind === "admin")} class="sub"><span></span><span>Verwaltung</span><span></span></a>` : ""}` : ""}
     </div>`;
   }).join("");
@@ -858,6 +888,7 @@ function renderDb(db) {
             : `<button data-act="master-stop">Master stoppen</button>`}
           <button data-act="master-port" data-sid="${esc(db.sid)}" data-port="${m.port || ""}">Port ändern</button>
           <button data-act="settings" data-kind="master" data-id="${esc(db.sid)}">Einstellungen</button>
+          ${m.state === "bereit" ? `<button data-act="backup" data-kind="master" data-id="${esc(db.sid)}" data-label="Master-DB ${esc(db.sid)}">Sichern</button>` : ""}
           <button data-act="note-add">Notiz hinzufügen</button>
           <button class="primary" data-act="release-new" ${db.release_busy ? 'disabled title="Ein Release wird gerade erstellt"' : ""}>${db.release_busy ? "Release wird erstellt …" : "Release erstellen"}</button>` : ""}
       </div>
@@ -1033,6 +1064,7 @@ function renderDevs(db) {
         ${noCont ? "" : `<button class="quiet small" data-act="dev-reset" data-id="${esc(d.id)}" ${working || !d.base ? "disabled" : ""}>Auf Ausgangsstand zurücksetzen</button>`}
         <button class="quiet small" data-act="dev-port" data-id="${esc(d.id)}" data-port="${d.port || ""}" ${working ? "disabled" : ""}>Port ändern</button>
         <button class="quiet small" data-act="settings" data-kind="dev" data-id="${esc(d.id)}" ${working ? "disabled" : ""}>Einstellungen</button>
+        ${d.state === "bereit" ? `<button class="quiet small" data-act="backup" data-kind="dev" data-id="${esc(d.id)}" data-label="Entwickler-DB ${esc(d.name)}" ${working ? "disabled" : ""}>Sichern</button>` : ""}
         ${isAdmin() ? `<button class="quiet small" data-act="dev-owner" data-id="${esc(d.id)}">Besitzer ändern</button>` : ""}
         <button class="quiet small danger" data-act="dev-del" data-id="${esc(d.id)}" ${working ? "disabled" : ""}>Löschen</button>
       </div>` : ""}
@@ -1062,8 +1094,8 @@ function allSnapshots(db) {
 
 async function loadAdmin() {
   try {
-    const [sch, sys] = await Promise.all([api("GET", "/api/schedules"), api("GET", "/api/admin")]);
-    admin = { ...sch, sys };
+    const [sch, sys, hset] = await Promise.all([api("GET", "/api/schedules"), api("GET", "/api/admin"), api("GET", "/api/host-settings")]);
+    admin = { ...sch, sys, hset };
     render();
   } catch (e) { toast(e.message); }
 }
@@ -1133,7 +1165,8 @@ function renderAdmin() {
           <button class="primary" data-act="sched-new" ${S.dbs.length ? "" : "disabled"}>Ersten Zeitplan anlegen</button></div>`}
       </section>
       <section aria-labelledby="h-sys">
-        <div class="section-head"><h2 id="h-sys">System</h2></div>
+        ${hostSettingsHtml(admin.hset)}
+        <div class="section-head" style="margin-top:26px"><h2 id="h-sys">System</h2></div>
         <dl class="facts-list">
           <dt>Host</dt><dd>${esc(sys.host)}</dd>
           <dt>Image</dt><dd>${esc(sys.image)}</dd>
@@ -1175,7 +1208,11 @@ function openSchedDialog(sc) {
     const sync = () => {
       const a = f.action.value;
       $(".js-dev", f).hidden = a !== "devsnap";
-      $(".js-consistent", f).hidden = a !== "devsnap";
+      $(".js-consistent", f).hidden = a !== "devsnap" && a !== "backup";
+      $(".js-consistent-text", f).innerHTML = a === "backup"
+        ? "Konsistent zum Startzeitpunkt <small>flashback_time; die DB läuft dabei weiter</small>"
+        : "DB dafür kurz herunterfahren <small>Sauber geschlossener Stand; ohne Haken entsteht der Snapshot im laufenden Betrieb.</small>";
+      $(".js-tpl", f).hidden = a === "backup";
       const fq = f.freq.value;
       $(".js-f-daily", f).hidden = fq !== "daily";
       $(".js-f-every", f).hidden = fq === "daily";
@@ -1187,6 +1224,7 @@ function openSchedDialog(sc) {
       f.time.required = fq === "daily";
       $(".js-busy-hint", f).hidden = !(a === "release" && fq === "minutes" && +f.every.value < 60);
       $(".js-naming", f).hidden = a === "stopdevs" || a === "resetdevs";
+      if (a === "backup" && !sc && f.consistent.dataset.init !== "1") { f.consistent.checked = true; f.consistent.dataset.init = "1"; }
       $(".js-devs", f).hidden = a !== "resetdevs";
       $(".js-reset", f).hidden = a !== "resetdevs";
       if (!sc && (!f.template.value || f.template.dataset.auto === "1")) {
@@ -1326,7 +1364,51 @@ function dpPlanHtml(plan, host, freePort) {
     <p class="hint-box">Die neue Datenbank ${esc(plan.source.service)} → <b class="js-newsid"></b> entsteht als Non-CDB in einem komprimierten Subvolume; Tablespaces werden vorab angelegt. Danach holt impdp die Daten über den DB-Link, das Vorgangsprotokoll zeigt den Fortschritt. Am Ende werden Objekte neu kompiliert und die Objektzahlen mit der Quelle verglichen.</p>`}`;
 }
 
+function dumpPlanHtml(plan, host, freePort) {
+  const m = plan.meta || {};
+  const targets = [];
+  for (const db of S.dbs) {
+    targets.push([`master:${db.sid}`, `Master-DB ${db.sid}`]);
+    for (const d of db.devdbs) targets.push([`dev:${d.id}`, `Entwickler-DB ${d.name} (${db.sid}, ${d.owner || "–"})`]);
+  }
+  const sidGuess = m.sid && !S.dbs.some(d => d.sid === m.sid) ? m.sid : "";
+  return `<dl class="facts-list">
+      <dt>Quelle</dt><dd>${esc(plan.source.backup ? "Sicherung " + plan.source.backup : plan.source.dir)}</dd>
+      <dt>Dateien</dt><dd>${plan.files.length} Dumps, ${fmtBytes(plan.size)}</dd>
+      ${m.version ? `<dt>Stammt aus</dt><dd>${esc(m.source || m.sid)} – Oracle ${esc(m.version)}, ${fmtTime(m.created)}</dd>
+      <dt>Umfang</dt><dd>${m.full ? "ganze Datenbank" : "Schemas " + esc((m.schemas || []).join(", "))}${m.consistent ? ", konsistent" : ""}</dd>
+      <dt>Zeichensatz</dt><dd>${esc(m.charset)}, national ${esc(m.ncharset)}; Zeitzonendatei ${esc(String(m.tz || "?"))}</dd>` : ""}
+      <dt>Image</dt><dd>${esc(plan.image_version)}</dd>
+    </dl>
+    ${plan.problems.length ? `<div><b class="bad">Import nicht möglich</b><ul>${plan.problems.map(p => `<li class="bad">${esc(p)}</li>`).join("")}</ul></div>` : ""}
+    ${plan.warnings.length ? `<div><b>Hinweise</b><ul>${plan.warnings.map(w => `<li class="warn">${esc(w)}</li>`).join("")}</ul></div>` : ""}
+    ${plan.problems.length ? "" : `
+    <div class="days"><label><input type="radio" name="target_mode" value="new" checked>Neue Datenbank</label><label><input type="radio" name="target_mode" value="overwrite">Vorhandene überschreiben</label></div>
+    <div class="js-t-new">
+      <div class="row3">
+        <label class="field">SID <input name="target_sid" maxlength="8" value="${esc(sidGuess)}" placeholder="z. B. KUNDE1" autocomplete="off"></label>
+        <label class="field">Port <input type="number" name="port" min="1024" max="65535" value="${freePort}"></label>
+        <label class="field">Speicher (MB) <input type="number" name="memory_mb" value="4096" min="1024" step="any"></label>
+      </div>
+      <div class="row2">
+        <label class="field">Zeichensatz <input name="charset" value="${esc(m.charset || "AL32UTF8")}"><small>${m.charset ? "aus der Sicherung" : "muss zur Quelle passen"}</small></label>
+        <label class="field">Nationaler Zeichensatz <input name="ncharset" value="${esc(m.ncharset || "AL16UTF16")}"></label>
+      </div>
+      <div class="row2">
+        <label class="field">Passwort der neuen DB <input type="password" name="target_password" autocomplete="new-password"><small>für SYS und SYSTEM</small></label>
+        <label class="field">wiederholen <input type="password" name="target_password2" autocomplete="new-password"></label>
+      </div>
+    </div>
+    <div class="js-t-over" hidden>
+      <label class="field">Ziel <select name="target_db">${targets.map(([v, l]) => `<option value="${esc(v)}" ${v === `${m.kind}:${m.ident}` ? "selected" : ""}>${esc(l)}</option>`).join("")}</select></label>
+      <p class="hint-box">Alle Anwendungs-Benutzer des Ziels werden <b>mit ihren Objekten gelöscht</b> und durch den Inhalt der Sicherung ersetzt; eigene Rollen ebenso. Tablespaces bleiben und werden bei Bedarf ergänzt.</p>
+      <label class="check"><input type="checkbox" name="snapshot_before" value="1" checked><span>Vorher den aktuellen Stand festhalten <small>als Release bzw. Snapshot „vor-import-…“, im laufenden Betrieb</small></span></label>
+      <label class="field"><span>Zur Bestätigung „<b class="js-confirm-name"></b>“ eingeben</span><input name="confirm" autocomplete="off"></label>
+    </div>`}`;
+}
+
 function importPlanHtml(plan, host, freePort) {
+  if (plan.mode === "dump") return dumpPlanHtml(plan, host, freePort);
   if (plan.mode === "dp") return dpPlanHtml(plan, host, freePort);
   const local = plan.mode === "local";
   const facts = local ? `
@@ -1373,9 +1455,10 @@ function importPlanHtml(plan, host, freePort) {
       <label class="check"><input type="checkbox" name="restart_source" value="1"><span>Quell-DB nach dem Kopieren wieder starten</span></label>`}`}`;
 }
 
-function openImportDialog() {
+function openImportDialog(preset = {}) {
   let plan = null;
   let dpSrc = null;
+  let dumpSrc = null;
   const host = currentHost();
   openDialog("dlgImport", f => {
     $(".js-host", f).textContent = host.name;
@@ -1383,13 +1466,23 @@ function openImportDialog() {
     const syncMode = () => {
       const mode = f.querySelector('input[name=mode]:checked').value;
       $(".js-ssh", f).hidden = mode !== "ssh"; $(".js-local", f).hidden = mode !== "local"; $(".js-dp", f).hidden = mode !== "dp";
+      $(".js-dump", f).hidden = mode !== "dump"; $(".js-sidrow", f).hidden = mode === "dump"; f.sid.required = mode !== "dump";
+      $(".js-dumppath", f).hidden = !!f.backup.value;
       f.host.required = mode === "ssh"; f.path.required = mode === "local";
       f.dp_host.required = f.dp_service.required = f.dp_password.required = mode === "dp";
       $(".js-sidlabel", f).textContent = mode === "dp" ? "SID der neuen Datenbank" : "SID";
       $(".js-sidhint", f).textContent = mode === "dp" ? "höchstens 8 Zeichen; darf wie die Quelle heißen" : "";
     };
     f.querySelectorAll('input[name=mode]').forEach(r => { r.onchange = syncMode; });
+    f.backup.onchange = syncMode;
+    if (preset.mode) f.querySelector(`input[name=mode][value=${preset.mode}]`).checked = true;
     syncMode();
+    api("GET", "/api/backups").then(r => {
+      f.backup.innerHTML = '<option value="">– Verzeichnis angeben –</option>' + r.backups.map(b =>
+        `<option value="${esc(b.id)}">${esc(b.sid)} – ${fmtTime(b.created)} – ${b.full ? "ganze DB" : esc((b.schemas || []).join(", "))} – ${fmtBytes(b.size)}</option>`).join("");
+      if (preset.backup) f.backup.value = preset.backup;
+      syncMode();
+    }).catch(() => {});
     const show = step => {
       $(".js-s1", f).hidden = step !== 1; $(".js-s2", f).hidden = step !== 2;
       $(".js-back", f).hidden = step !== 2;
@@ -1408,7 +1501,11 @@ function openImportDialog() {
       const local = v.mode === "local";
       const btn = $(".js-next", f); btn.textContent = "Prüfe …";
       try {
-        if (v.mode === "dp") {
+        if (v.mode === "dump") {
+          dumpSrc = v.backup ? { backup: v.backup } : { path: (v.dump_path || "").trim() };
+          if (!dumpSrc.backup && !dumpSrc.path) throw new Error("Sicherung wählen oder Verzeichnis angeben.");
+          plan = await api("POST", "/api/import/dump/probe", dumpSrc);
+        } else if (v.mode === "dp") {
           dpSrc = { host: v.dp_host, port: +v.dp_port, service: v.dp_service, user: v.dp_user, password: v.dp_password, target_sid: v.sid.toUpperCase() };
           plan = await api("POST", "/api/import/dp/probe", dpSrc);
         } else plan = local
@@ -1417,6 +1514,16 @@ function openImportDialog() {
       } finally { btn.textContent = "Quelle prüfen"; }
       const freePort = 1521 + Math.max(0, ...S.dbs.map(d => (d.master.port || 1521) - 1521)) + 1;
       $(".js-s2", f).innerHTML = importPlanHtml(plan, host, freePort);
+      if (plan.mode === "dump" && !plan.problems.length) {
+        const syncT = () => {
+          const t = f.querySelector("input[name=target_mode]:checked").value;
+          $(".js-t-new", f).hidden = t !== "new"; $(".js-t-over", f).hidden = t !== "overwrite";
+          const sel = f.target_db.value || "";
+          $(".js-confirm-name", f).textContent = sel.startsWith("dev:") ? sel.slice(4).split("-").slice(1).join("-") : sel.slice(7);
+        };
+        f.querySelectorAll("input[name=target_mode]").forEach(r => { r.onchange = syncT; });
+        f.target_db.onchange = syncT; syncT();
+      }
       if (plan.mode === "dp" && !plan.problems.length) {
         $(".js-newsid", f).textContent = dpSrc.target_sid;
         f.querySelectorAll("input[name=scope]").forEach(r => { r.onchange = () => { $(".js-schemas", f).hidden = f.querySelector("input[name=scope]:checked").value !== "schemas"; }; });
@@ -1424,6 +1531,19 @@ function openImportDialog() {
       f.dataset.step = "2"; f._show(2);
       $(".js-next", f).disabled = plan.problems.length > 0;
       throw Object.assign(new Error(""), { keepOpen: true });
+    }
+    if (plan.mode === "dump") {
+      if (v.target_mode === "new") {
+        if (v.target_password !== v.target_password2) throw new Error("Die Passwörter der neuen DB stimmen nicht überein.");
+        startedJob(await api("POST", "/api/import/dump", { ...dumpSrc, target_mode: "new", target_sid: (v.target_sid || "").toUpperCase(),
+          target_port: +v.port, target_password: v.target_password, memory_mb: +v.memory_mb, charset: v.charset, ncharset: v.ncharset }));
+      } else {
+        const sel = v.target_db || "";
+        const [kind, ...rest] = sel.split(":");
+        startedJob(await api("POST", "/api/import/dump", { ...dumpSrc, target_mode: "overwrite", target_kind: kind, target_ident: rest.join(":"),
+          confirm: (v.confirm || "").trim(), snapshot_before: !!v.snapshot_before }));
+      }
+      return;
     }
     if (plan.mode === "dp") {
       if (!plan.target.resume && v.target_password !== v.target_password2) throw new Error("Die Passwörter der neuen DB stimmen nicht überein.");
@@ -1760,6 +1880,74 @@ function renderLoadPage() {
     <section style="margin-top:28px"><div class="section-head"><h2>Datenbanken auf diesem Host</h2><span class="hint">aktuelle Werte je laufendem Container, sortiert nach Arbeitsspeicher; CPU 100 % entspricht einem Kern</span></div>
       <div class="table-wrap"><table class="snap"><thead><tr><th>Container</th><th>Art</th><th>Datenbank</th><th class="num">CPU</th><th class="num">RAM</th><th class="num">Lesen</th><th class="num">Schreiben</th><th></th></tr></thead>
         <tbody>${rows || '<tr><td colspan="8">Keine laufenden Container.</td></tr>'}</tbody></table></div></section>`;
+}
+
+/* ------------------------------------------------------------ Vorgaben für Entwickler-DBs (Verwaltung) */
+function hostSettingsHtml(h) {
+  if (!h) return "";
+  const s = h.settings, n = v => v ? String(v) : "";
+  return `<div class="section-head"><h2>Vorgaben für Entwickler-DBs</h2></div>
+    <form id="fHset" class="hset" onsubmit="return false">
+      <p class="muted-note" style="margin:0">Gelten für neue Releases bzw. neu angelegte Entwickler-DBs; bestehende ändert man über „Einstellungen“ der jeweiligen DB.</p>
+      <div class="row2">
+        <label class="field">SGA im Release (MB) <input type="number" name="release_sga_mb" min="256" step="any" value="${s.release_sga_mb}"></label>
+        <label class="field">PGA im Release (MB) <input type="number" name="release_pga_mb" min="64" step="any" value="${s.release_pga_mb}"></label>
+      </div>
+      <label class="field">Zusätzliches SQL beim Release-Erstellen <small>z. B. Passwörter zurücksetzen, Jobs abschalten, Daten anonymisieren; läuft als SYSDBA vor dem Herunterfahren</small>
+        <textarea name="release_extra_sql" rows="4" placeholder="alter user app identified by Entwickler1;" ${h.release_sql_file ? "disabled" : ""}>${esc(s.release_extra_sql || "")}</textarea>
+        ${h.release_sql_file ? `<small class="bad">ZK_RELEASE_SQL_FILE (${esc(h.release_sql_file)}) ist gesetzt und hat Vorrang; SGA, PGA und dieses Feld wirken dann nicht.</small>` : ""}</label>
+      <div class="row3">
+        <label class="field">CPU-Kerne <input type="number" name="dev_cpus" min="0" step="any" placeholder="unbegrenzt" value="${n(s.dev_cpus)}"></label>
+        <label class="field">RAM-Limit (MB) <input type="number" name="dev_memory_mb" min="0" step="any" placeholder="unbegrenzt" value="${n(s.dev_memory_mb)}"></label>
+        <label class="field">/dev/shm (MB) <input type="number" name="dev_shm_mb" min="0" step="any" placeholder="Vorgabe" value="${n(s.dev_shm_mb)}"></label>
+      </div>
+      <div class="row3">
+        <label class="field">Ports von <input type="number" name="dev_port_start" min="1024" max="65535" value="${s.dev_port_start}"></label>
+        <label class="field">bis <input type="number" name="dev_port_end" min="1024" max="65535" value="${s.dev_port_end}"></label>
+        <label class="field">Bedarf je DB (MB) <input type="number" name="dev_db_mb" min="0" step="any" placeholder="${h.computed_dev_db_mb} (berechnet)" value="${n(s.dev_db_mb)}"><small>für die Kapazitätsanzeige</small></label>
+      </div>
+      <p class="form-error"></p>
+      <div><button class="primary" type="button" data-act="hset-save">Vorgaben speichern</button></div>
+    </form>`;
+}
+
+/* ------------------------------------------------------------ Seite „Sicherungen“ */
+async function loadBackupsPage() {
+  try { backupsPage = await api("GET", "/api/backups"); if (view.kind === "backups") renderBackupsPage(); }
+  catch (e) { toast(e.message); }
+}
+
+function renderBackupsPage() {
+  const main = $("#main"), d = backupsPage;
+  if (!d) { main.innerHTML = "<p>Lade Sicherungen …</p>"; return; }
+  const total = d.backups.reduce((a, b) => a + (b.size || 0), 0);
+  const rows = d.backups.map(b => `<tr>
+      <td class="nw"><b>${esc(b.sid)}</b></td><td class="nw">${fmtTime(b.created)}</td><td>${esc(b.source || "")}</td>
+      <td>${b.full ? "ganze Datenbank" : esc((b.schemas || []).join(", "))}${b.consistent ? "" : ' <span class="tag">nicht konsistent</span>'}</td>
+      <td class="num nw">${fmtBytes(b.size)}</td><td class="nw">${esc(b.version || "–")}</td>
+      <td class="nw">${esc(b.by || "–")}${b.schedule ? ' <span class="tag">Zeitplan</span>' : ""}${b.warnings ? ` <span class="tag" title="Meldungen im Protokoll">${b.warnings} Meldungen</span>` : ""}</td>
+      <td><div class="acts">
+        ${isAdmin() ? `<button class="quiet small" data-act="backup-restore" data-id="${esc(b.id)}">Wiederherstellen …</button>` : ""}
+        ${b.has_log ? `<button class="quiet small" data-act="backup-log" data-id="${esc(b.id)}">Protokoll</button>` : ""}
+        ${isAdmin() ? `<button class="quiet small danger" data-act="backup-del" data-id="${esc(b.id)}">Löschen</button>` : ""}</div></td></tr>`).join("");
+  main.innerHTML = `
+    <section class="dbhead"><h1>Sicherungen</h1>
+      <div class="facts"><span>${esc(currentHost().name)}</span><span>${d.backups.length} Sicherungen, ${fmtBytes(total)}</span>${d.free != null ? `<span>${fmtBytes(d.free)} frei</span>` : ""}</div></section>
+    <p class="muted-note" style="max-width:80ch;margin-top:14px">Sicherungen sind Data-Pump-Exporte (expdp) mit Angaben zu Version, Zeichensatz, Tablespaces und Passwort-Prüffunktionen. Sie liegen unter <code>${esc(d.dir)}/&lt;SID&gt;/&lt;Zeitpunkt&gt;/</code>. Neue Sicherungen startest du mit „Sichern“ bei der Datenbank oder regelmäßig über einen Zeitplan unter „Verwaltung“; „Wiederherstellen“ öffnet den Import-Assistenten.</p>
+    <div class="table-wrap" style="margin-top:12px"><table class="snap"><thead><tr><th>Datenbank</th><th>Zeitpunkt</th><th>Quelle</th><th>Umfang</th><th class="num">Größe</th><th>Version</th><th>Von</th><th></th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="8">Noch keine Sicherungen.</td></tr>'}</tbody></table></div>`;
+}
+
+function openTextLog(title, loader) {
+  const dlg = $("#dlgLogs");
+  $(".js-name", dlg).textContent = title;
+  const pre = $(".js-log", dlg);
+  pre.textContent = "Lade …";
+  $(".js-refresh", dlg).onclick = async () => { try { pre.textContent = (await loader()).join("\n") || "(leer)"; } catch (e) { pre.textContent = e.message; } };
+  $(".js-close", dlg).onclick = () => dlg.close();
+  clearInterval(logsTimer); logsTimer = null;
+  dlg.showModal();
+  $(".js-refresh", dlg).onclick().then(() => { pre.scrollTop = pre.scrollHeight; });
 }
 
 /* ------------------------------------------------------------ Seite „Vorgänge und Container“ */
@@ -2170,6 +2358,47 @@ document.addEventListener("click", async ev => {
         });
         break;
       }
+      case "backup": {
+        const kind = b.dataset.kind, id = b.dataset.id;
+        let dir = "/srv/oradb/backups";
+        try { dir = (await api("GET", "/api/backups")).dir; } catch {}
+        openDialog("dlgBackup", f => {
+          $(".js-name", f).textContent = b.dataset.label;
+          $(".js-dir", f).textContent = `${dir}/${kind === "master" ? id : id.split("-")[0]}/<Zeitpunkt>/`;
+          f.querySelectorAll("input[name=scope]").forEach(r => { r.onchange = () => { $(".js-schemas", f).hidden = f.querySelector("input[name=scope]:checked").value !== "schemas"; }; });
+          $(".js-schemas", f).hidden = true;
+        }, async v => {
+          const full = v.scope !== "schemas";
+          const url = kind === "master" ? `/api/db/${encodeURIComponent(id)}/backup` : `/api/devdbs/${encodeURIComponent(id)}/backup`;
+          startedJob(await api("POST", url, { full, schemas: full ? [] : (v.schemas || "").split(",").map(x => x.trim().toUpperCase()).filter(Boolean), consistent: !!v.consistent }));
+        });
+        break;
+      }
+      case "backup-del": {
+        if (!confirm(`Sicherung ${b.dataset.id} endgültig löschen?`)) return;
+        const [sid, stamp] = b.dataset.id.split("/");
+        await api("DELETE", `/api/backups/${encodeURIComponent(sid)}/${encodeURIComponent(stamp)}`);
+        toast("Sicherung gelöscht"); await loadBackupsPage();
+        break;
+      }
+      case "backup-log": {
+        const [sid, stamp] = b.dataset.id.split("/");
+        openTextLog(`Protokoll der Sicherung ${b.dataset.id}`, async () => (await api("GET", `/api/backups/${encodeURIComponent(sid)}/${encodeURIComponent(stamp)}/log`)).lines);
+        break;
+      }
+      case "backup-restore":
+        openImportDialog({ mode: "dump", backup: b.dataset.id });
+        break;
+      case "hset-save": {
+        const f = $("#fHset");
+        const val = n => f.elements[n].value;
+        const body = { release_sga_mb: +val("release_sga_mb"), release_pga_mb: +val("release_pga_mb"), release_extra_sql: val("release_extra_sql"),
+          dev_cpus: +val("dev_cpus") || 0, dev_memory_mb: +val("dev_memory_mb") || 0, dev_shm_mb: +val("dev_shm_mb") || 0,
+          dev_db_mb: +val("dev_db_mb") || 0, dev_port_start: +val("dev_port_start"), dev_port_end: +val("dev_port_end") };
+        try { await api("PUT", "/api/host-settings", body); toast("Vorgaben gespeichert"); await loadAdmin(); }
+        catch (e) { $("#fHset .form-error").textContent = e.message; }
+        break;
+      }
       case "host-range":
         hostLoad.range = +b.value; await loadLoadPage(true);
         break;
@@ -2291,6 +2520,7 @@ refresh().then(() => {
   if (view.kind === "access") loadAccess();
   if (view.kind === "jobs") loadJobsPage();
   if (view.kind === "load") loadLoadPage(true);
+  if (view.kind === "backups") loadBackupsPage();
 });
 setInterval(async () => {
   if (document.hidden) return;
@@ -2300,6 +2530,7 @@ setInterval(async () => {
     if (view.kind === "access") await loadAccess(true);
     if (view.kind === "jobs") await loadJobsPage();
     if (view.kind === "load" && Date.now() - hostLoad.fetched > 25000) await loadLoadPage();
+    if (view.kind === "backups") await loadBackupsPage();
     if (view.kind === "snapshots" && snapRows && snapRows.some(r => r.usage_pending)) await loadSnapshots();
     await refresh();
   }

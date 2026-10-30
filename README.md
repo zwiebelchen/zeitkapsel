@@ -115,6 +115,28 @@ Jedes DB-Subvolume enthält die Markierungsdateien, ohne die das Startskript des
 
 Weil die Datei im Subvolume liegt, wandert sie mit jedem Release und jeder Entwickler-DB mit; Oberfläche und Skripte setzen die Angaben bei jedem `docker run` um.
 
+## Vorgaben für Entwickler-DBs
+
+Unter „Verwaltung“ → „Vorgaben für Entwickler-DBs“ (nur Administratoren, je Host, gespeichert in `meta/settings.json`):
+
+- **SGA und PGA im Release** – werden beim Erstellen eines Releases in dessen spfile geschrieben und gelten damit für jede Entwickler-DB daraus;
+- **zusätzliches SQL beim Release-Erstellen** – läuft als SYSDBA vor dem Herunterfahren, etwa um Passwörter zurückzusetzen, Jobs abzuschalten oder Daten zu anonymisieren (`shutdown`, `startup`, `exit` und `host` sind nicht erlaubt);
+- **Standard-Limits** (CPU, RAM, /dev/shm) für neu angelegte Entwickler-DBs; bestehende ändert man über ihre „Einstellungen“;
+- **Portbereich** der Entwickler-DBs und der **Bedarf je DB** für die Kapazitätsanzeige (leer = SGA + PGA + 512 MB).
+
+Ist `ZK_RELEASE_SQL_FILE` gesetzt, hat die Datei Vorrang vor SGA, PGA und dem zusätzlichen SQL.
+
+## Sicherungen (expdp) und Wiederherstellen (impdp)
+
+„Sichern“ bei einer Master- oder Entwickler-DB exportiert die laufende Datenbank mit expdp – vollständig oder einzelne Schemas, auf Wunsch konsistent zum Startzeitpunkt (`flashback_time`). expdp schreibt in ein Verzeichnis im Subvolume der DB; die fertigen Dumps werden danach nach `ZK_BACKUP_DIR` (Standard `/srv/oradb/backups`) in `<SID>/<Zeitpunkt>/` übernommen – auf demselben btrfs per Reflink, also ohne Kopierzeit und doppelten Platz. Daneben liegt `backup.json` mit Version, Zeichensätzen, Zeitzonendatei, Schemas, Tablespaces und dem Quelltext eigener Passwort-Prüffunktionen. Ein Zeitplan mit der Aktion „Datenbank sichern“ sichert regelmäßig und behält die neuesten n.
+
+Die Seite „Sicherungen“ listet alle Sicherungen eines Hosts mit Größe, Umfang und Protokoll. „Wiederherstellen“ öffnet den Import-Assistenten mit der Quelle „Aus Sicherung (impdp)“, die auch beliebige `.dmp`-Dateien aus einem Verzeichnis annimmt. Ziel ist wahlweise
+
+- eine **neue Datenbank** (Non-CDB mit dem Zeichensatz der Sicherung bzw. dem gewählten), oder
+- eine **vorhandene** Master- oder Entwickler-DB, deren Anwendungs-Benutzer mit allen Objekten und eigene Rollen vorher gelöscht werden. Dafür muss man den Namen der DB eintippen; standardmäßig wird der Stand vorher als Release bzw. Snapshot `vor-import-<Zeitpunkt>` festgehalten.
+
+Der Import bringt die Zeitzonendatei bei Bedarf auf den Stand der Sicherung, legt fehlende Tablespaces (aus `backup.json` oder per `impdp sqlfile` aus dem Dump gelesen) als OMF-Dateien im Subvolume an, stellt Passwort-Prüffunktionen wieder her, importiert mit `full=y exclude=tablespace` und kompiliert danach neu. Die Dumps werden dafür per Reflink in das Subvolume gelegt und danach entfernt.
+
 ## Einstellungen: CPU, RAM, /dev/shm, Oracle-Speicher
 
 „Einstellungen“ (im Kopf jeder Datenbank und bei jeder Entwickler-DB) zeigt die aktuellen Werte und ändert sie:

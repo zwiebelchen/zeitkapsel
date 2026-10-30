@@ -317,9 +317,61 @@ def db_state(c: dict | None) -> str:
     return state
 
 
+HOST_SETTINGS_FILE = META / "settings.json"
+HOST_SETTINGS = {   # Schlüssel: (Typ, Vorgabe, Bereich)
+    "release_sga_mb": (int, 1024, (256, 1048576)),
+    "release_pga_mb": (int, 300, (64, 1048576)),
+    "release_extra_sql": (str, "", None),
+    "dev_cpus": (float, 0, (0, 1024)),
+    "dev_memory_mb": (int, 0, (0, 1048576)),
+    "dev_shm_mb": (int, 0, (0, 1048576)),
+    "dev_db_mb": (int, 0, (0, 1048576)),            # 0 = aus SGA + PGA + 512 MB berechnen
+    "dev_port_start": (int, DEV_PORT_START, (1024, 65535)),
+    "dev_port_end": (int, DEV_PORT_END, (1024, 65535)),
+}
+
+
+def host_settings() -> dict:
+    try:
+        stored = json.loads(HOST_SETTINGS_FILE.read_text())
+    except (OSError, ValueError):
+        stored = {}
+    out = {}
+    for k, (typ, default, _) in HOST_SETTINGS.items():
+        v = stored.get(k, default)
+        try:
+            out[k] = typ(v) if v not in (None, "") else (typ(default) if typ is not str else default)
+        except (TypeError, ValueError):
+            out[k] = default
+    if env("DEV_DB_MB") and not stored.get("dev_db_mb"):
+        out["dev_db_mb"] = int(env("DEV_DB_MB"))
+    return out
+
+
+def hs(key: str):
+    return host_settings()[key]
+
+
+def dev_db_mb() -> int:
+    h = host_settings()
+    return h["dev_db_mb"] or (h["release_sga_mb"] + h["release_pga_mb"] + 512)
+
+
+def release_sql() -> str:
+    if RELEASE_SQL_FILE:
+        return Path(RELEASE_SQL_FILE).read_text()
+    h = host_settings()
+    sql = (f"alter system set sga_target={h['release_sga_mb']}M scope=spfile;\n"
+           f"alter system set sga_max_size={h['release_sga_mb']}M scope=spfile;\n"
+           f"alter system set pga_aggregate_target={h['release_pga_mb']}M scope=spfile;\n")
+    extra = (h["release_extra_sql"] or "").strip()
+    return sql + (extra + "\n" if extra else "")
+
+
 def next_port(cs: list[dict]) -> int:
     used = {c["port"] for c in cs if c["port"]}
-    for port in range(DEV_PORT_START, DEV_PORT_END + 1):
+    start, end = hs("dev_port_start"), hs("dev_port_end")
+    for port in range(start, end + 1):
         if port in used:
             continue
         with socket.socket() as s:
@@ -329,7 +381,7 @@ def next_port(cs: list[dict]) -> int:
             except OSError:
                 continue
         return port
-    raise RuntimeError(f"Kein freier Port zwischen {DEV_PORT_START} und {DEV_PORT_END}.")
+    raise RuntimeError(f"Kein freier Port zwischen {start} und {end}.")
 
 
 # --------------------------------------------------------------------------- Jobs
@@ -821,7 +873,7 @@ def job_release(job: Job, sid: str, name: str, description: str,
         job.run(["docker", "run", "-d", "--name", bname, "--init", "-e", f"ORACLE_SID={sid}",
                  "-v", f"{tmp}:/opt/oracle/oradata", *docker_extra(tmp), IMAGE])
         wait_ready(job, bname, t0)
-        sql = Path(RELEASE_SQL_FILE).read_text() if RELEASE_SQL_FILE else DEFAULT_RELEASE_SQL
+        sql = release_sql()
         job.log("Einstellungen für Entwickler-DBs setzen, sauber herunterfahren")
         job.run(["docker", "exec", "-i", bname, "sqlplus", "-s", "/ as sysdba"],
                 input="whenever sqlerror exit failure\n" + sql + "\nshutdown immediate\nexit\n",
@@ -879,7 +931,9 @@ def job_dev_create(job: Job, sid: str, name: str, source: str, owner: str) -> No
     src, label, release = resolve_source(sid, source)
     did = f"{sid}-{name}"
     # Besitz auch ohne Container festhalten (z. B. wenn der Start scheitert)
-    write_json(dev_meta_file(sid, did), dict(owner=owner, base=source, created=now_iso()))
+    h = host_settings()
+    defaults = {k: v for k, v in (("cpus", h["dev_cpus"]), ("memory_mb", h["dev_memory_mb"]), ("shm_mb", h["dev_shm_mb"])) if v}
+    write_json(dev_meta_file(sid, did), dict(owner=owner, base=source, created=now_iso(), container=defaults))
     vol = DEV / did
     DEV.mkdir(parents=True, exist_ok=True)
     job.run(["btrfs", "subvolume", "snapshot", str(src), str(vol)])
@@ -997,6 +1051,7 @@ ACTIONS = {
     "devsnap": "Snapshot einer Entwickler-DB erstellen",
     "stopdevs": "Entwickler-DBs stoppen",
     "resetdevs": "Entwickler-DBs zurücksetzen",
+    "backup": "Datenbank sichern (expdp)",
 }
 RESET_TARGETS = {"base": "auf ihren Ausgangsstand", "latest": "auf das neueste Release"}
 RE_TIME = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
@@ -1050,6 +1105,11 @@ def validate_schedule(data: dict) -> dict:
         raise UserError("Mindestens einen Wochentag wählen.")
     out = dict(action=action, sid=sid, label=label, days=days, enabled=bool(data.get("enabled", True)))
     out.update(validate_timing(data))
+    if action == "backup":
+        keep = int(data.get("keep") or 0)
+        if keep < 0 or keep > 999:
+            raise UserError("Aufbewahren: 0 (alle behalten) bis 999.")
+        out.update(keep=keep, consistent=bool(data.get("consistent", True)))
     if action in ("release", "devsnap"):
         tpl = (data.get("template") or "").strip()
         sample = expand_name(tpl, dt.datetime(2026, 12, 31, 23, 59))
@@ -1232,6 +1292,9 @@ def job_scheduled(job: Job, sc: dict, when: dt.datetime) -> None:
                 job.run(["docker", "stop", "-t", "600", d["container"]], timeout=700)
                 stopped += 1
             job.log(f"{stopped} Entwickler-DB(s) gestoppt")
+        elif sc["action"] == "backup":
+            job_backup(job, "master", sid, True, [], sc.get("consistent", True), schedule=sc["id"])
+            retention_backups(job, sid, sc["id"], sc.get("keep", 0))
         elif sc["action"] == "resetdevs":
             failed = reset_devs(job, sid, sc["devs"], sc["target"], sc.get("keep_stopped", True))
             if failed:
@@ -1286,7 +1349,8 @@ def reset_devs(job: Job, sid: str, ids: list[str], target: str, keep_stopped: bo
 
 def busy_key_for(sc: dict) -> str:
     return {"release": f"release:{sc['sid']}", "devsnap": f"dev:{sc.get('dev')}",
-            "stopdevs": f"stopdevs:{sc['sid']}", "resetdevs": f"resetdevs:{sc['id']}"}[sc["action"]]
+            "stopdevs": f"stopdevs:{sc['sid']}", "resetdevs": f"resetdevs:{sc['id']}",
+            "backup": f"backup:{sc['sid']}"}[sc["action"]]
 
 
 def fire_schedule(sc: dict, when: dt.datetime) -> None:
@@ -1618,7 +1682,8 @@ def host_capacity(p: dict) -> dict:
     """Wie viele weitere Entwickler-DBs passen ungefähr noch in den verfügbaren Arbeitsspeicher?"""
     reserve = max(2 * 1024 ** 3, p["mem_total"] // 10)
     free_for_dbs = max(0, p["mem_avail"] - reserve)
-    return dict(dev_db_mb=DEV_DB_MB, reserve=reserve, fits=int(free_for_dbs // (DEV_DB_MB * 1024 ** 2)),
+    mb = dev_db_mb()
+    return dict(dev_db_mb=mb, reserve=reserve, fits=int(free_for_dbs // (mb * 1024 ** 2)),
                 swapping=p["swap_used"] > 256 * 1024 ** 2)
 
 
@@ -2004,7 +2069,7 @@ def api_admin():
     du = shutil.disk_usage(BASE)
     return jsonify(host=DB_HOST, image=IMAGE, base=str(BASE), server_time=now_iso(),
                    disk=dict(total=du.total, used=du.used, free=du.free),
-                   ports=f"{DEV_PORT_START}–{DEV_PORT_END}", ready_timeout=READY_TIMEOUT,
+                   ports=f"{hs('dev_port_start')}–{hs('dev_port_end')}", ready_timeout=READY_TIMEOUT,
                    release_sql=RELEASE_SQL_FILE or "(eingebaut)", leftovers=leftovers(),
                    storage=storage_info())
 
@@ -2541,6 +2606,44 @@ def job_apply_settings(job: Job, kind: str, ident: str, cont: dict, ora: dict, r
             job.log("Die Oracle-Parameter wirken beim nächsten Neustart der Datenbank.")
 
 
+@bp.get("/api/host-settings")
+def api_host_settings():
+    return jsonify(settings=host_settings(), release_sql_file=RELEASE_SQL_FILE, computed_dev_db_mb=dev_db_mb(),
+                   host_mem=os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"), host_cpus=os.cpu_count())
+
+
+@bp.put("/api/host-settings")
+def api_host_settings_set():
+    data = request.get_json(force=True) or {}
+    out = {}
+    for k, (typ, default, rng) in HOST_SETTINGS.items():
+        if k not in data:
+            continue
+        v = data[k]
+        if typ is str:
+            v = str(v or "")
+            if len(v) > 20000:
+                raise UserError(f"{k}: zu lang.")
+            if re.search(r"(?im)^\s*(shutdown|startup|exit|quit|host|!)", v):
+                raise UserError("Eigenes SQL darf kein shutdown, startup, exit oder host enthalten; das erledigt zeitkapsel.")
+        else:
+            try:
+                v = typ(v or 0)
+            except (TypeError, ValueError):
+                raise UserError(f"{k}: Zahl erwartet.") from None
+            if rng and not (rng[0] <= v <= rng[1]):
+                raise UserError(f"{k}: {rng[0]} bis {rng[1]}.")
+        out[k] = v
+    merged = {**host_settings(), **out}
+    if merged["dev_port_start"] > merged["dev_port_end"]:
+        raise UserError("Portbereich: Anfang muss vor dem Ende liegen.")
+    if merged["dev_memory_mb"] and merged["dev_memory_mb"] < merged["release_sga_mb"] + merged["release_pga_mb"] + 512:
+        raise UserError("Das Standard-RAM-Limit muss SGA + PGA + 512 MB fassen.")
+    write_json(HOST_SETTINGS_FILE, merged)
+    log.info("Vorgaben für Entwickler-DBs geändert von %s", actor())
+    return jsonify(settings=merged)
+
+
 @bp.get("/api/db/<sid>/settings")
 def api_master_settings(sid):
     return jsonify(settings_view("master", sid))
@@ -2640,8 +2743,8 @@ def api_dev_port(did):
     port = int((request.get_json(force=True) or {}).get("port") or 0)
     if dev["port"] == port:
         raise UserError(f"Die Entwickler-DB läuft bereits auf Port {port}.")
-    if not (DEV_PORT_START <= port <= DEV_PORT_END):
-        raise UserError(f"Entwickler-DBs nutzen Ports von {DEV_PORT_START} bis {DEV_PORT_END}.")
+    if not (hs("dev_port_start") <= port <= hs("dev_port_end")):
+        raise UserError(f"Entwickler-DBs nutzen Ports von {hs('dev_port_start')} bis {hs('dev_port_end')}.")
     check_new_port(port, dev["container"])
     job = start_job(f"Port der Entwickler-DB {dev['name']} auf {port} ändern", dev["sid"], f"dev:{did}",
                     job_dev_port, dev, port)
@@ -3899,6 +4002,495 @@ def api_dp_import():
     return jsonify(job=job.as_dict())
 
 
+# --------------------------------------------------------------------------- Sicherungen per expdp, Import per impdp
+BACKUPS = Path(env("BACKUP_DIR", str(BASE / "backups")))
+RE_STAMP = re.compile(r"^\d{8}-\d{6}$")
+
+DB_INFO_SQL = r"""
+set pagesize 0 linesize 4000 feedback off heading off verify off trimspool on tab off
+select 'ZK_VERSION='||version_full from v$instance;
+select 'ZK_DBNAME='||name from v$database;
+select 'ZK_CHARSET='||value from nls_database_parameters where parameter = 'NLS_CHARACTERSET';
+select 'ZK_NCHARSET='||value from nls_database_parameters where parameter = 'NLS_NCHAR_CHARACTERSET';
+select 'ZK_TZ='||version from v$timezone_file;
+select 'ZK_BANNER='||banner from v$version where rownum = 1;
+select 'ZK_SCHEMA='||u.username||'|'||nvl(sum(s.bytes),0) from dba_users u left join dba_segments s on s.owner = u.username
+ where u.oracle_maintained = 'N' group by u.username order by 1;
+select 'ZK_TS='||t.tablespace_name||'|'||t.block_size||'|'||t.bigfile||'|'||t.contents||'|'||
+       nvl((select sum(bytes) from dba_data_files f where f.tablespace_name = t.tablespace_name),0)
+  from dba_tablespaces t where t.tablespace_name not in ('SYSTEM','SYSAUX') and t.contents <> 'UNDO';
+select distinct 'ZK_VERIFYFN='||limit from dba_profiles where resource_name = 'PASSWORD_VERIFY_FUNCTION'
+ and limit not in ('NULL','DEFAULT','UNLIMITED');
+exit
+"""
+
+
+def db_target(kind: str, ident: str) -> tuple[str, dict | None, Path, str]:
+    """(SID, Container, Subvolume, Bezeichnung) einer Master- oder Entwickler-DB."""
+    cs = containers()
+    if kind == "master":
+        need_sid(ident)
+        return ident, master_container(ident, cs), MASTER / ident, f"Master-DB {ident}"
+    dev = find_dev(ident)
+    c = next((x for x in cs if x["name"] == dev["container"]), None)
+    return dev["sid"], c, DEV / ident, f"Entwickler-DB {dev['name']}"
+
+
+def sqlplus_in(cname: str, sql: str, timeout: int = 300) -> subprocess.CompletedProcess:
+    return sh(["docker", "exec", "-i", cname, "sqlplus", "-s", "/ as sysdba"], input=sql, check=False, timeout=timeout)
+
+
+def read_db_info(cname: str) -> dict:
+    out = sqlplus_in(cname, DB_INFO_SQL).stdout
+    kv: dict[str, list[str]] = {}
+    for line in out.splitlines():
+        if line.startswith("ZK_") and "=" in line:
+            k, _, v = line.partition("=")
+            kv.setdefault(k, []).append(v.strip())
+    one = lambda k, d="": (kv.get(k) or [d])[0]  # noqa: E731
+    ts = []
+    for x in kv.get("ZK_TS", []):
+        name, block, big, contents, size = (x.split("|") + ["", "8192", "NO", "PERMANENT", "0"])[:5]
+        ts.append(dict(name=name, block_size=int(block or 8192), bigfile=big == "YES",
+                       temporary=contents == "TEMPORARY", bytes=int(size or 0)))
+    fns = sorted(set(kv.get("ZK_VERIFYFN", [])))
+    sources = {}
+    if fns:
+        names = ",".join(f"'{n}'" for n in fns if re.match(r"^[A-Z0-9_$#]+$", n))
+        src = sqlplus_in(cname, "set pagesize 0 linesize 4000 feedback off heading off trimspool on long 100000\n"
+                         f"select 'ZK_SRC|'||name||'|'||text from dba_source where owner = 'SYS' and type = 'FUNCTION' "
+                         f"and name in ({names}) order by name, line;\nexit\n").stdout
+        for line in src.splitlines():
+            if line.startswith("ZK_SRC|"):
+                _, n, text = line.split("|", 2)
+                sources.setdefault(n, []).append(text)
+        sources = {n: "\n".join(lines) for n, lines in sources.items()}
+    return dict(version=one("ZK_VERSION"), db_name=one("ZK_DBNAME"), charset=one("ZK_CHARSET", "AL32UTF8"),
+                ncharset=one("ZK_NCHARSET", "AL16UTF16"), tz=int(one("ZK_TZ", "0") or 0), banner=one("ZK_BANNER"),
+                schemas=[dict(name=n, bytes=int(b or 0)) for n, _, b in (x.partition("|") for x in kv.get("ZK_SCHEMA", []))],
+                tablespaces=ts, verify_functions=sources)
+
+
+def dp_run(job: Job, cname: str, tool: str, par: list[str], tag: str) -> tuple[int, list[str]]:
+    """expdp/impdp mit parfile im Container; Ausgabe live ins Protokoll; Abbruch beendet den Data-Pump-Job."""
+    jobname = f"ZK_{tag}"[:30].upper().replace("-", "_")
+    par = par + [f"job_name={jobname}"]
+    job.on_cancel(lambda: sqlplus_in(cname, f"declare h number; begin h := dbms_datapump.attach('{jobname}', 'SYS'); "
+                                            "dbms_datapump.stop_job(h, 1, 0); end;\n/\nexit\n", timeout=120))
+    script = (f"cat > /tmp/{jobname}.par <<'ZKPAR'\n" + "\n".join(par) + "\nZKPAR\n"
+              f"{tool} parfile=/tmp/{jobname}.par\nrc=$?\nrm -f /tmp/{jobname}.par\necho \"ZK_RC=$rc\"\n")
+    rc, oras = job.stream(["docker", "exec", "-i", cname, "bash", "-s"], input=script)
+    m = re.search(r"ZK_RC=(\d+)", "\n".join(job.lines[-10:]))
+    return (int(m.group(1)) if m else rc), oras
+
+
+def dp_parallel(vol: Path) -> int:
+    if read_volume_env(vol).get("ZK_EDITION", "enterprise") != "enterprise":
+        return 1
+    return max(1, min(4, os.cpu_count() or 1))
+
+
+def job_backup(job: Job, kind: str, ident: str, full: bool, schemas: list[str], consistent: bool,
+               schedule: str = "") -> None:
+    sid, c, vol, label = db_target(kind, ident)
+    if not c or not c["running"]:
+        raise RuntimeError(f"Die {label} läuft nicht; gesichert wird aus der laufenden Datenbank.")
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    job.log(f"Angaben zur Datenbank lesen ({label})")
+    info = read_db_info(c["name"])
+    if not info.get("version"):
+        raise RuntimeError("Die Datenbank antwortet nicht.")
+    known = {s["name"] for s in info["schemas"]}
+    if not full:
+        unknown = [x for x in schemas if x not in known]
+        if unknown or not schemas:
+            raise RuntimeError("Unbekannte oder keine Schemas: " + ", ".join(unknown or ["–"]))
+    host_tmp = vol / "zk_backup" / stamp
+    inner = f"/opt/oracle/oradata/zk_backup/{stamp}"
+    dest = BACKUPS / sid / stamp
+    job.on_cancel(lambda: shutil.rmtree(host_tmp, ignore_errors=True))
+    done = False
+    try:
+        job.run(["docker", "exec", c["name"], "mkdir", "-p", inner])
+        p = sqlplus_in(c["name"], f"create or replace directory ZK_BACKUP_DIR as '{inner}';\nexit\n")
+        if "ORA-" in p.stdout:
+            raise RuntimeError("Verzeichnisobjekt ließ sich nicht anlegen: " + p.stdout.strip()[-200:])
+        par = ['userid="/ as sysdba"', "directory=ZK_BACKUP_DIR", f"dumpfile={sid}_%U.dmp", "filesize=8G",
+               "logfile=export.log", f"parallel={dp_parallel(vol)}", "logtime=all", "metrics=yes"]
+        par += ["full=y"] if full else ["schemas=" + ",".join(schemas)]
+        if consistent:
+            par.append("flashback_time=systimestamp")
+        job.log(f"Sicherung mit expdp ({'vollständig' if full else ', '.join(schemas)}"
+                f"{', konsistent zum Startzeitpunkt' if consistent else ''}); die Datenbank läuft weiter")
+        rc, oras = dp_run(job, c["name"], "expdp", par, f"EXP_{stamp}")
+        if rc not in (0, 5):
+            raise RuntimeError(f"expdp ist mit Exit-Code {rc} abgebrochen.")
+        dest.mkdir(parents=True, exist_ok=True)
+        job.log(f"Dumps nach {dest} übernehmen")
+        job.run(["cp", "-a", "--reflink=auto", f"{host_tmp}/.", f"{dest}/"], timeout=86400)
+        files = sorted(f.name for f in dest.glob("*.dmp"))
+        if not files:
+            raise RuntimeError("expdp hat keine Dump-Dateien geschrieben.")
+        size = sum((dest / f).stat().st_size for f in files)
+        extra = dict(info)
+        schema_sizes = extra.pop("schemas")
+        meta = dict(id=f"{sid}/{stamp}", sid=sid, stamp=stamp, created=now_iso(), by=actor(), source=label, kind=kind,
+                    ident=ident, full=full, schemas=[x["name"] for x in schema_sizes] if full else schemas,
+                    schema_sizes=schema_sizes, consistent=consistent, files=files, size=size, rc=rc, warnings=len(oras),
+                    schedule=schedule, **extra)
+        write_json(dest / "backup.json", meta)
+        done = True
+    finally:
+        shutil.rmtree(host_tmp, ignore_errors=True)
+        if not done:
+            shutil.rmtree(dest, ignore_errors=True)
+    tl_add(sid, "backup", f"Sicherung {stamp} der {label} ({size / 1024 ** 3:.1f} GB, {len(files)} Dateien)", ref=f"{sid}/{stamp}")
+    job.log(f"Sicherung fertig: {len(files)} Dateien, {size / 1024 ** 3:.2f} GB" + (f", {len(oras)} Meldungen im Protokoll" if oras else ""))
+
+
+def list_backups() -> list[dict]:
+    out = []
+    for f in BACKUPS.glob("*/*/backup.json"):
+        try:
+            m = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        m.pop("verify_functions", None)
+        m["has_log"] = (f.parent / "export.log").exists()
+        out.append(m)
+    return sorted(out, key=lambda m: m.get("created") or "", reverse=True)
+
+
+def backup_dir(sid: str, stamp: str) -> Path:
+    if not RE_SID.match(sid or "") or not RE_STAMP.match(stamp or ""):
+        raise UserError("Sicherung nicht gefunden.")
+    d = BACKUPS / sid / stamp
+    if not (d / "backup.json").exists():
+        raise UserError("Sicherung nicht gefunden.")
+    return d
+
+
+def retention_backups(job: Job, sid: str, sched_id: str, keep: int) -> None:
+    if keep <= 0:
+        return
+    mine = [b for b in list_backups() if b["sid"] == sid and b.get("schedule") == sched_id]
+    for b in mine[keep:]:
+        job.log(f"Aufbewahrung: Sicherung {b['stamp']} löschen")
+        shutil.rmtree(BACKUPS / sid / b["stamp"], ignore_errors=True)
+
+
+# --- Import aus Dump-Dateien
+def validate_dump_source(data: dict) -> dict:
+    if data.get("backup"):
+        sid, _, stamp = str(data["backup"]).partition("/")
+        d = backup_dir(sid, stamp)
+        meta = json.loads((d / "backup.json").read_text())
+        return dict(kind="backup", backup=f"{sid}/{stamp}", dir=str(d), files=meta.get("files") or [], meta=meta)
+    path = (data.get("path") or "").strip().rstrip("/")
+    if not RE_ABSPATH.match(path or "x") or not Path(path).is_dir():
+        raise UserError("Verzeichnis mit .dmp-Dateien angeben (absoluter Pfad).")
+    files = sorted(f.name for f in Path(path).iterdir() if f.is_file() and f.suffix.lower() == ".dmp")
+    meta = None
+    if (Path(path) / "backup.json").exists():
+        try:
+            meta = json.loads((Path(path) / "backup.json").read_text())
+        except ValueError:
+            meta = None
+    return dict(kind="path", dir=path, files=files, meta=meta)
+
+
+def probe_dump(src: dict) -> dict:
+    problems, warnings = [], []
+    d = Path(src["dir"])
+    files = [f for f in src["files"] if (d / f).is_file()]
+    if not files:
+        problems.append("Keine .dmp-Dateien gefunden.")
+    missing = sorted(set(src["files"]) - set(files))
+    if missing:
+        problems.append("Es fehlen Dateien der Sicherung: " + ", ".join(missing))
+    meta = src.get("meta") or {}
+    img = image_version()
+    if meta.get("version") and vtuple(meta["version"])[:1] > vtuple(img)[:1]:
+        problems.append(f"Die Sicherung stammt aus Oracle {meta['version']}, das Image ist {img}.")
+    if meta.get("tz") and image_tz_max() and meta["tz"] > image_tz_max():
+        problems.append(f"Zeitzonendatei der Sicherung (Version {meta['tz']}) ist neuer als im Image ({image_tz_max()}).")
+    if not meta:
+        warnings.append("Keine Angaben von zeitkapsel zur Sicherung: Zeichensatz bitte selbst wählen; Tablespaces werden "
+                        "aus dem Dump gelesen. Eigene Passwort-Prüffunktionen (SYS) sind in Dumps nie enthalten.")
+    size = sum((d / f).stat().st_size for f in files)
+    return dict(mode="dump", source={k: v for k, v in src.items() if k != "meta"}, files=files, size=size,
+                meta={k: v for k, v in meta.items() if k != "verify_functions"} if meta else None,
+                image_version=img, problems=problems, warnings=warnings)
+
+
+def parse_ddl(text: str) -> tuple[list[dict], list[dict]]:
+    """Tablespaces aus einem impdp-sqlfile (CREATE TABLESPACE, CREATE USER … DEFAULT/TEMPORARY TABLESPACE)."""
+    perm: dict[str, dict] = {}
+    temp: dict[str, dict] = {}
+    users_default, users_temp = set(), set()
+    for stmt in text.split(";"):
+        m = re.search(r'CREATE\s+(BIGFILE\s+|SMALLFILE\s+)?(TEMPORARY\s+|UNDO\s+)?TABLESPACE\s+"([^"]+)"', stmt, re.I)
+        if m:
+            name, kind = m.group(3), (m.group(2) or "").strip().upper()
+            big = bool(m.group(1) and m.group(1).strip().upper() == "BIGFILE")
+            if kind == "UNDO" or name in ("SYSTEM", "SYSAUX"):
+                continue
+            if kind == "TEMPORARY":
+                temp[name] = dict(name=name, bigfile=big)
+            else:
+                bs = re.search(r"BLOCKSIZE\s+(\d+)", stmt, re.I)
+                size = sum(parse_size(x) for x in re.findall(r"\bSIZE\s+(\d+\s*[KMGT]?)\b", stmt, re.I))
+                perm[name] = dict(name=name, block_size=int(bs.group(1)) if bs else 8192, bigfile=big, bytes=size)
+        if re.search(r"CREATE\s+USER\b", stmt, re.I):
+            users_default.update(re.findall(r'DEFAULT\s+TABLESPACE\s+"([^"]+)"', stmt, re.I))
+            users_temp.update(re.findall(r'TEMPORARY\s+TABLESPACE\s+"([^"]+)"', stmt, re.I))
+    for n in users_default - set(perm) - {"SYSTEM", "SYSAUX"}:
+        perm[n] = dict(name=n, block_size=8192, bigfile=False, bytes=0)
+    for n in users_temp - set(temp):
+        temp[n] = dict(name=n, bigfile=False)
+    return list(perm.values()), list(temp.values())
+
+
+def tablespace_sql(perm: list[dict], temp: list[dict]) -> str:
+    """PL/SQL: fehlende Tablespaces als OMF-Dateien anlegen, Smallfile auf genug Dateien bringen."""
+    caches = sorted({t["block_size"] for t in perm if t["block_size"] != 8192})
+    calls = "\n".join(f"  mk({sql_str(t['name'])}, {t['block_size']}, '{'YES' if t['bigfile'] else 'NO'}', {t['bytes']});" for t in perm)
+    tcalls = "\n".join(f"  mkt({sql_str(t['name'])}, '{'YES' if t['bigfile'] else 'NO'}');" for t in temp)
+    return ("alter system set db_create_file_dest='/opt/oracle/oradata' scope=both;\n"
+            + "".join(f"alter system set db_{b // 1024}k_cache_size=64M scope=both;\n" for b in caches)
+            + "declare\n  procedure mk(n varchar2, bs number, big varchar2, bytes number) is c number; have number; files number;\n"
+              "  begin\n    select count(*) into c from dba_tablespaces where tablespace_name = n;\n"
+              "    if c = 0 then\n      execute immediate 'create '||case when big='YES' then 'bigfile ' end||'tablespace \"'||n||'\" datafile size 100M"
+              " autoextend on next 256M maxsize unlimited'||case when bs <> 8192 then ' blocksize '||bs end;\n    end if;\n"
+              "    if big = 'NO' then\n      select count(*) into have from dba_data_files where tablespace_name = n;\n"
+              "      files := ceil(bytes * 1.1 / 32212254720);\n      for i in have + 1 .. files loop\n"
+              "        execute immediate 'alter tablespace \"'||n||'\" add datafile size 100M autoextend on next 256M maxsize unlimited';\n"
+              "      end loop;\n    end if;\n  end;\n"
+              "  procedure mkt(n varchar2, big varchar2) is c number;\n  begin\n"
+              "    select count(*) into c from dba_tablespaces where tablespace_name = n;\n"
+              "    if c = 0 then execute immediate 'create '||case when big='YES' then 'bigfile ' end||'temporary tablespace \"'||n||'\""
+              " tempfile size 100M autoextend on next 256M maxsize unlimited'; end if;\n  end;\nbegin\n"
+            + (calls or "") + ("\n" if calls else "") + (tcalls or "") + "\n  null;\nend;\n/\n")
+
+
+def verify_function_sql(sources: dict) -> str:
+    """Passwort-Prüffunktionen aus der Sicherung in SYS anlegen (Data Pump enthält SYS nicht)."""
+    parts = []
+    for name, text in sources.items():
+        delim = next(d for d in "~^|!#@%" if f"{d}'" not in text)
+        body = "create or replace " + text
+        chunks = [body[i:i + 3000] for i in range(0, len(body), 3000)]
+        parts.append("declare c clob;\nbegin\n" + "".join(f"  c := c || q'{delim}{ch}{delim}';\n" for ch in chunks)
+                     + "  execute immediate c;\nexception when others then dbms_output.put_line('ZK_FNFAILED=" + name + " '||sqlerrm);\nend;\n/\n")
+    return "set serveroutput on\n" + "".join(parts) if parts else ""
+
+
+CLEAN_SCHEMAS_SQL = (
+    "set serveroutput on feedback off\nbegin\n"
+    "  for u in (select username from dba_users where oracle_maintained = 'N') loop\n"
+    "    execute immediate 'drop user \"'||u.username||'\" cascade';\n  end loop;\n"
+    "  for r in (select role from dba_roles where oracle_maintained = 'N') loop\n"
+    "    execute immediate 'drop role \"'||r.role||'\"';\n  end loop;\n"
+    "  dbms_output.put_line('ZK_CLEAN=ok');\nend;\n/\nexit\n")
+
+
+def job_dump_import(job: Job, src: dict, tgt: dict) -> None:
+    plan = probe_dump(src)
+    if plan["problems"]:
+        raise RuntimeError("Import nicht möglich: " + " ".join(plan["problems"]))
+    for w in plan["warnings"]:
+        job.log("Hinweis: " + w)
+    meta = src.get("meta") or {}
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    if tgt["mode"] == "new":
+        sid = tgt["sid"]
+        job.log(f"Neue Datenbank {sid} anlegen (Zeichensatz {tgt['charset']}, national {tgt['ncharset']})")
+        job_newdb(job, sid, "", tgt["password"], tgt["charset"], tgt["port"], tgt["memory_mb"], tgt["ncharset"], start=False)
+        job_master_start(job, sid, tgt["port"])
+        kind, ident = "master", sid
+    else:
+        kind, ident = tgt["kind"], tgt["ident"]
+    sid, c, vol, label = db_target(kind, ident)
+    if kind == "master" and (not c or not c["running"]):
+        job_master_start(job, sid)
+        sid, c, vol, label = db_target(kind, ident)
+    if not c or not c["running"]:
+        raise RuntimeError(f"Die {label} läuft nicht.")
+    cname = c["name"]
+    if tgt["mode"] == "overwrite":
+        if tgt.get("snapshot_before"):
+            name = f"vor-import-{stamp}"
+            if kind == "master":
+                (GOLDEN / sid).mkdir(parents=True, exist_ok=True)
+                job.run(["btrfs", "subvolume", "snapshot", "-r", str(vol), str(GOLDEN / sid / name)])
+                write_json(release_meta_file(sid, name), dict(name=name, created=now_iso(), origin="Sicherung vor Import",
+                                                             description=f"Automatisch vor dem Import aus {src['dir']} angelegt."))
+                tl_add(sid, "release", f"Release {name} (Stand vor dem Import)", ref=name)
+            else:
+                (DEVSNAPS / ident).mkdir(parents=True, exist_ok=True)
+                job.run(["btrfs", "subvolume", "snapshot", "-r", str(vol), str(DEVSNAPS / ident / name)])
+                write_json(devsnap_meta_file(sid, ident, name), dict(name=name, created=now_iso(), consistent=False,
+                                                                     description="Automatisch vor dem Import angelegt."))
+            job.log(f"Stand vor dem Import gesichert als {name} (im laufenden Betrieb, absturzkonsistent)")
+        job.log("Vorhandene Anwendungs-Benutzer mit ihren Objekten sowie eigene Rollen entfernen")
+        p = job.run(["docker", "exec", "-i", cname, "sqlplus", "-s", "/ as sysdba"], input=CLEAN_SCHEMAS_SQL, allow_fail=True)
+        if "ZK_CLEAN=ok" not in p.stdout:
+            raise RuntimeError("Bereinigen fehlgeschlagen: " + " | ".join(dict.fromkeys(re.findall(r"(ORA-\d{5}[^\n]*)", p.stdout))))
+    ensure_tz(job, cname, int(meta.get("tz") or 0))
+    host_imp = vol / "zk_import" / stamp
+    inner = f"/opt/oracle/oradata/zk_import/{stamp}"
+    job.on_cancel(lambda: shutil.rmtree(host_imp, ignore_errors=True))
+    try:
+        host_imp.mkdir(parents=True, exist_ok=True)
+        job.log(f"Dump-Dateien bereitstellen ({plan['size'] / 1024 ** 3:.1f} GB, per Reflink, wenn möglich)")
+        job.run(["cp", "-a", "--reflink=auto", *[str(Path(src["dir"]) / f) for f in plan["files"]], f"{host_imp}/"], timeout=86400)
+        job.run(["chown", "-R", f"{ORACLE_UID}:{ORACLE_UID}", str(vol / "zk_import")])
+        p = sqlplus_in(cname, f"create or replace directory ZK_IMPORT_DIR as '{inner}';\nexit\n")
+        if "ORA-" in p.stdout:
+            raise RuntimeError("Verzeichnisobjekt ließ sich nicht anlegen: " + p.stdout.strip()[-200:])
+        dumpfiles = ",".join(plan["files"])
+        if meta.get("tablespaces"):
+            perm = [t for t in meta["tablespaces"] if not t.get("temporary")]
+            temp = [t for t in meta["tablespaces"] if t.get("temporary")]
+        else:
+            job.log("Tablespaces und Benutzer aus dem Dump lesen (sqlfile)")
+            dp_run(job, cname, "impdp", ['userid="/ as sysdba"', "directory=ZK_IMPORT_DIR", f"dumpfile={dumpfiles}",
+                                         "sqlfile=zk_ddl.sql", "include=TABLESPACE,USER", "full=y", "logfile=zk_ddl.log"], f"DDL_{stamp}")
+            try:
+                perm, temp = parse_ddl((host_imp / "zk_ddl.sql").read_text(errors="replace"))
+            except OSError:
+                perm, temp = [], []
+        job.log(f"Tablespaces anlegen: {', '.join(t['name'] for t in perm + temp) or 'keine zusätzlichen'}")
+        p = job.run(["docker", "exec", "-i", cname, "sqlplus", "-s", "/ as sysdba"], allow_fail=True,
+                    input="whenever sqlerror exit 9\nset feedback off\n" + tablespace_sql(perm, temp) + "exit\n")
+        if p.returncode:
+            raise RuntimeError("Tablespaces ließen sich nicht anlegen: " + " | ".join(dict.fromkeys(re.findall(r"(ORA-\d{5}[^\n]*)", p.stdout))))
+        fns = (meta.get("verify_functions") or {}) if src.get("kind") == "backup" else {}
+        if src.get("kind") == "backup" and not fns:
+            try:
+                fns = json.loads((Path(src["dir"]) / "backup.json").read_text()).get("verify_functions") or {}
+            except (OSError, ValueError):
+                fns = {}
+        if fns:
+            job.log("Passwort-Prüffunktionen aus der Sicherung anlegen: " + ", ".join(fns))
+            p = sqlplus_in(cname, verify_function_sql(fns) + "exit\n")
+            for m in re.findall(r"ZK_FNFAILED=(.*)", p.stdout):
+                job.log("Prüffunktion ließ sich nicht anlegen: " + m)
+        par = ['userid="/ as sysdba"', "directory=ZK_IMPORT_DIR", f"dumpfile={dumpfiles}", f"logfile=import_{stamp}.log",
+               "full=y", "exclude=tablespace", f"parallel={dp_parallel(vol)}", "logtime=all", "metrics=yes"]
+        job.log(f"Import mit impdp in die {label}")
+        rc, oras = dp_run(job, cname, "impdp", par, f"IMP_{stamp}")
+        if rc not in (0, 5):
+            raise RuntimeError(f"impdp ist mit Exit-Code {rc} abgebrochen; Protokoll: zk_import/import_{stamp}.log im Subvolume.")
+        job.log("Objekte neu kompilieren")
+        p = sqlplus_in(cname, "set pagesize 0 feedback off heading off\n@?/rdbms/admin/utlrp.sql\n"
+                              "select 'ZK_INVALID='||count(*) from dba_objects o join dba_users u on u.username = o.owner "
+                              "where u.oracle_maintained = 'N' and o.status <> 'VALID';\nexit\n", timeout=7200)
+        job.log("Ungültige Objekte danach: " + ((re.search(r"ZK_INVALID=(\d+)", p.stdout) or [None, "?"])[1]))
+        if oras:
+            job.log(f"impdp meldete {len(oras)} Fehler bzw. Hinweise; Details oben im Protokoll.")
+    finally:
+        for f in plan["files"]:
+            (host_imp / f).unlink(missing_ok=True)
+    tl_add(sid, "db-imported", f"{label}: Daten aus {'Sicherung ' + src.get('backup') if src.get('kind') == 'backup' else src['dir']} importiert"
+           + (" (vorher geleert)" if tgt["mode"] == "overwrite" else ""), ref=ident)
+
+
+# --- Routen: Sicherungen und Import aus Dumps
+def start_backup(kind: str, ident: str):
+    data = request.get_json(force=True) or {}
+    full = bool(data.get("full", True))
+    schemas = [s.strip().upper() for s in data.get("schemas") or [] if s.strip()]
+    if not full and (not schemas or any(not RE_SCHEMA.match(s) for s in schemas)):
+        raise UserError("Schemas angeben (Großbuchstaben, z. B. APP, REPORTING) oder „ganze Datenbank“.")
+    sid, c, _, label = db_target(kind, ident)
+    if not c or not c["running"]:
+        raise UserError(f"Die {label} läuft nicht.")
+    key = f"backup:{sid}" if kind == "master" else f"dev:{ident}"
+    job = start_job(f"Sicherung der {label}", sid, key, job_backup, kind, ident, full, schemas,
+                    bool(data.get("consistent", True)))
+    return jsonify(job=job.as_dict())
+
+
+@bp.post("/api/db/<sid>/backup")
+def api_master_backup(sid):
+    return start_backup("master", sid)
+
+
+@bp.post("/api/devdbs/<did>/backup")
+def api_dev_backup(did):
+    return start_backup("dev", did)
+
+
+@bp.get("/api/backups")
+def api_backups():
+    du = shutil.disk_usage(BACKUPS) if BACKUPS.exists() else None
+    return jsonify(backups=list_backups(), dir=str(BACKUPS), free=du.free if du else None)
+
+
+@bp.get("/api/backups/<sid>/<stamp>/log")
+def api_backup_log(sid, stamp):
+    d = backup_dir(sid, stamp)
+    try:
+        lines = (d / "export.log").read_text(errors="replace").splitlines()
+    except OSError:
+        lines = []
+    return jsonify(lines=lines[-5000:])
+
+
+@bp.delete("/api/backups/<sid>/<stamp>")
+def api_backup_delete(sid, stamp):
+    d = backup_dir(sid, stamp)
+    shutil.rmtree(d)
+    tl_add(sid, "backup-deleted", f"Sicherung {stamp} gelöscht", ref=f"{sid}/{stamp}")
+    return jsonify(ok=True)
+
+
+@bp.post("/api/import/dump/probe")
+def api_dump_probe():
+    return jsonify(probe_dump(validate_dump_source(request.get_json(force=True) or {})))
+
+
+@bp.post("/api/import/dump")
+def api_dump_import():
+    data = request.get_json(force=True) or {}
+    src = validate_dump_source(data)
+    meta = src.get("meta") or {}
+    mode = data.get("target_mode")
+    if mode == "new":
+        tgt = dict(mode="new", sid=(data.get("target_sid") or "").strip().upper(), port=int(data.get("target_port") or 0),
+                   password=data.get("target_password") or "", memory_mb=int(data.get("memory_mb") or 2048),
+                   charset=data.get("charset") or meta.get("charset") or "AL32UTF8",
+                   ncharset=data.get("ncharset") or meta.get("ncharset") or "AL16UTF16")
+        if not RE_NEWSID.match(tgt["sid"]):
+            raise UserError("Neue SID: Großbuchstaben und Ziffern, beginnt mit einem Buchstaben, höchstens 8 Zeichen.")
+        if (MASTER / tgt["sid"]).exists():
+            raise UserError(f"Eine Datenbank {tgt['sid']} gibt es auf diesem Host schon.")
+        check_new_port(tgt["port"], None)
+        if not RE_DBPWD.match(tgt["password"]):
+            raise UserError("Passwort der neuen DB: 8–30 Zeichen mit Groß- und Kleinbuchstaben und Ziffer; erlaubt sind A–Z, a–z, 0–9, _ # $.")
+        if not re.match(r"^[A-Z0-9_]{2,30}$", tgt["charset"]) or not re.match(r"^[A-Z0-9_]{2,30}$", tgt["ncharset"]):
+            raise UserError("Zeichensatz ungültig.")
+        key, sid = f"newdb:{tgt['sid']}", tgt["sid"]
+    elif mode == "overwrite":
+        kind = data.get("target_kind")
+        ident = (data.get("target_ident") or "").strip()
+        if kind not in ("master", "dev"):
+            raise UserError("Ziel wählen.")
+        sid, c, _, label = db_target(kind, ident)
+        expected = ident if kind == "master" else ident.partition("-")[2]
+        if (data.get("confirm") or "").strip() != expected:
+            raise UserError(f"Zur Bestätigung „{expected}“ eingeben – der Inhalt der {label} wird ersetzt.")
+        tgt = dict(mode="overwrite", kind=kind, ident=ident, snapshot_before=bool(data.get("snapshot_before", True)))
+        key = f"master:{ident}" if kind == "master" else f"dev:{ident}"
+    else:
+        raise UserError("Ziel wählen: neue Datenbank oder vorhandene überschreiben.")
+    title = f"Import aus {'Sicherung ' + src['backup'] if src['kind'] == 'backup' else src['dir']} → " + \
+        (f"neue DB {tgt['sid']}" if mode == "new" else f"{tgt['ident']} (überschreiben)")
+    job = start_job(title, sid, key, job_dump_import, src, tgt)
+    return jsonify(job=job.as_dict())
+
+
 # --------------------------------------------------------------------------- Start
 def start_agent() -> None:
     """Verzeichnisse anlegen und den Zeitplaner starten (einmal pro Prozess)."""
@@ -3906,7 +4498,7 @@ def start_agent() -> None:
         raise SystemExit("ZK_AGENT_TOKEN ist nicht gesetzt – Agent kann nicht starten.")
     if os.geteuid() != 0:
         log.warning("Agent läuft nicht als root; btrfs- und docker-Befehle werden scheitern.")
-    for d in (MASTER, GOLDEN, DEV, DEVSNAPS, BUILD, DEVDUMPS, IMPORT, META):
+    for d in (MASTER, GOLDEN, DEV, DEVSNAPS, BUILD, DEVDUMPS, IMPORT, META, BACKUPS):
         d.mkdir(parents=True, exist_ok=True)
     jobs_housekeeping()
     threading.Thread(target=scheduler_loop, daemon=True, name="zeitplaner").start()

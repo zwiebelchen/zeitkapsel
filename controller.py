@@ -202,9 +202,10 @@ def agent_call(host: dict, method: str, path: str, body=None, user: str = "", qu
 
 # --------------------------------------------------------------------------- Rechte
 USER_GET = (r"state", r"jobs", r"jobs/[^/]+", r"snapshots", r"usage", r"devdbs/[^/]+",
-            r"containers", r"containers/[^/]+", r"ports/free", r"metrics", r"db/[^/]+/settings", r"devdbs/[^/]+/settings")
+            r"containers", r"containers/[^/]+", r"ports/free", r"metrics", r"db/[^/]+/settings", r"devdbs/[^/]+/settings",
+            r"backups", r"backups/[^/]+/[^/]+/log", r"host-settings")
 OWNER_ACTIONS = (
-    ("POST", r"devdbs/([^/]+)/(start|stop|reset|port|settings)"),
+    ("POST", r"devdbs/([^/]+)/(start|stop|reset|port|settings|backup)"),
     ("DELETE", r"devdbs/([^/]+)"),
     ("POST", r"devdbs/([^/]+)/snapshots"),
     ("POST", r"devdbs/([^/]+)/snapshots/[^/]+/restore"),
@@ -516,7 +517,7 @@ def api_audit():
 
 
 # --------------------------------------------------------------------------- Weiterleitung an Agenten
-LONG_CALLS = (r"jobs/[^/]+/retry", r"import/probe", r"import/local/probe", r"import/dp/probe", r"usage", r"newdb/check", r"schedules/[^/]+/run")
+LONG_CALLS = (r"jobs/[^/]+/retry", r"import/dump/probe", r"import/probe", r"import/local/probe", r"import/dp/probe", r"usage", r"newdb/check", r"schedules/[^/]+/run")
 
 
 @bp.route("/api/hosts/<int:hid>/<path:path>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
