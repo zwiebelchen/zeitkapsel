@@ -431,37 +431,72 @@ form.hset label.field input, form.hset label.field textarea { width: 100%; box-s
   </form>
 </dialog>
 
-<!-- PostgreSQL-Dump importieren -->
-<dialog id="dlgPgImport" style="width:min(700px, calc(100vw - 24px))">
+<!-- PostgreSQL importieren -->
+<dialog id="dlgPgImport" style="width:min(720px, calc(100vw - 24px))">
   <form method="dialog" id="fPgImport">
-    <h2>PostgreSQL-Dump importieren</h2>
+    <h2>Datenbank importieren</h2>
+    <div class="engine-pick js-engine">
+      <label><input type="radio" name="engine_sel" value="oracle" > Oracle</label>
+      <label><input type="radio" name="engine_sel" value="postgres" checked> PostgreSQL</label>
+    </div>
     <div class="js-src">
-      <label class="field">Datei oder Verzeichnis auf dem Host
-        <div class="vrow"><input name="path" placeholder="/srv/dumps/shop.dump" autocomplete="off" style="flex:1"><button type="button" class="small js-probe">Prüfen</button></div>
-        <small>pg_dump im Custom-Format (.dump), pg_dump als SQL (.sql, .sql.gz) oder pg_dumpall (.sql, .sql.gz); ein Verzeichnis darf mehrere Dumps enthalten, eine Datei globals*.sql(.gz) wird als Rollen zuerst eingespielt</small></label>
+      <div class="field">Quelle
+        <div class="days">
+          <label><input type="radio" name="source" value="net" checked>Laufender Server per pg_dump</label>
+          <label><input type="radio" name="source" value="base">Laufender Server per pg_basebackup</label>
+          <label><input type="radio" name="source" value="file">Dump-Datei auf diesem Host</label>
+          <label><input type="radio" name="source" value="backup">Aus Sicherung</label>
+        </div>
+      </div>
+      <p class="lead js-src-lead"></p>
+      <div class="js-s-net">
+        <div class="row3">
+          <label class="field">Quell-Host <input name="src_host" placeholder="z. B. pg01" autocomplete="off"></label>
+          <label class="field">Port <input type="number" name="src_port" value="5432" min="1" max="65535"></label>
+          <label class="field">Verbindungs-DB <input name="src_dbname" value="postgres" autocomplete="off"></label>
+        </div>
+        <div class="row2">
+          <label class="field">Benutzer <input name="src_user" value="postgres" autocomplete="off"><small class="js-user-hint"></small></label>
+          <label class="field">Passwort <input type="password" name="src_password" autocomplete="off"></label>
+        </div>
+        <label class="field">PostgreSQL-Version auf diesem Host
+          <div class="vrow"><select name="src_image" class="js-versions"></select>
+            <label class="check"><input type="checkbox" class="js-variants"> Varianten</label></div>
+          <small class="js-vinfo"></small></label>
+      </div>
+      <div class="js-s-file" hidden>
+        <label class="field">Datei oder Verzeichnis auf dem Host <input name="path" placeholder="/srv/dumps/shop.dump" autocomplete="off">
+          <small>pg_dump im Custom-Format (.dump), pg_dump als SQL (.sql, .sql.gz) oder pg_dumpall (.sql, .sql.gz); ein Verzeichnis darf mehrere Dumps enthalten, eine Datei globals*.sql(.gz) wird als Rollen zuerst eingespielt</small></label>
+      </div>
+      <div class="js-s-backup" hidden>
+        <label class="field">Sicherung <select name="backup"></select></label>
+      </div>
+      <div><button type="button" class="small js-probe">Quelle prüfen</button></div>
     </div>
     <div class="js-plan"></div>
     <div class="js-target" hidden>
-      <div class="days"><label><input type="radio" name="target_mode" value="new" checked>Neue Datenbank</label><label><input type="radio" name="target_mode" value="overwrite">Vorhandene überschreiben</label></div>
+      <div class="days js-tmode"><label><input type="radio" name="target_mode" value="new" checked>Neue Datenbank</label><label><input type="radio" name="target_mode" value="overwrite">Vorhandene überschreiben</label></div>
       <fieldset class="plain js-t-new">
         <div class="row2">
           <label class="field">Name <input name="target_sid" required maxlength="16" pattern="[A-Za-z][A-Za-z0-9_]*" autocomplete="off"></label>
           <label class="field">Port <input type="number" name="target_port" required min="1024" max="65535"></label>
         </div>
-        <label class="field">Version
-          <div class="vrow"><select name="image" required class="js-versions"></select>
+        <label class="field js-newver">Version
+          <div class="vrow"><select name="image" class="js-versions"></select>
             <label class="check"><input type="checkbox" class="js-variants"> Varianten</label></div>
           <small class="js-vinfo"></small></label>
-        <div class="row3">
+        <div class="row3 js-newsu">
           <label class="field">Superuser <input name="user" value="postgres" required pattern="[a-z_][a-z0-9_]*"></label>
           <label class="field">Passwort <input type="password" name="target_password" required minlength="8" autocomplete="new-password"></label>
           <label class="field">wiederholen <input type="password" name="target_password2" required autocomplete="new-password"></label>
         </div>
-        <label class="field">Locale <select name="locale" class="js-locales"></select></label>
+        <label class="field js-newloc">Locale <select name="locale" class="js-locales"></select></label>
+        <label class="field js-basesu" hidden>Superuser im übernommenen Cluster <input name="superuser" value="postgres" pattern="[a-z_][a-z0-9_]*">
+          <small>zeitkapsel meldet sich damit im Container an (Sitzungen, Sicherungen); Passwörter kommen aus der Quelle</small></label>
       </fieldset>
       <fieldset class="plain js-t-over" disabled>
         <label class="field">Ziel <select name="target_db" required></select></label>
-        <p class="hint-box">Datenbanken, die der Dump enthält, werden im Ziel gelöscht und neu angelegt; andere Datenbanken bleiben. Bei pg_dumpall wird auch die Datenbank postgres ersetzt.</p>
+        <p class="hint-box">Datenbanken, die importiert werden, werden im Ziel gelöscht und neu angelegt; andere Datenbanken bleiben. Bei pg_dumpall wird auch die Datenbank postgres ersetzt.</p>
         <label class="field">Zur Bestätigung den Namen eingeben <input name="confirm" required autocomplete="off"></label>
         <label class="check"><input type="checkbox" name="snapshot_before" value="1" checked><span>Vorher den Stand sichern <small>als Release (Master-DB) bzw. Snapshot (Entwickler-DB) „vor-import-…“</small></span></label>
       </fieldset>
@@ -646,6 +681,10 @@ form.hset label.field input, form.hset label.field textarea { width: 100%; box-s
 <dialog id="dlgImport" style="width:min(640px, calc(100vw - 24px))">
   <form method="dialog" id="fImport">
     <h2>Datenbank importieren</h2>
+    <div class="engine-pick js-engine">
+      <label><input type="radio" name="engine_sel" value="oracle" checked> Oracle</label>
+      <label><input type="radio" name="engine_sel" value="postgres" > PostgreSQL</label>
+    </div>
     <p class="steps"><span class="js-step1"><b>1. Quelle prüfen</b></span><span>→</span><span class="js-step2">2. Übernehmen</span></p>
     <div class="js-s1">
       <div class="field">Quelle
@@ -1356,7 +1395,6 @@ function renderAdmin() {
       <div class="actions">
         <button data-act="newdb">Neue Datenbank</button>
         <button data-act="import">Datenbank importieren</button>
-        <button data-act="pg-import">PostgreSQL-Dump importieren</button>
         <button class="primary" data-act="sched-new" ${S.dbs.length ? "" : "disabled"}>Zeitplan anlegen</button></div></section>
     <div class="admin-grid">
       <section aria-labelledby="h-sched">
@@ -1671,6 +1709,8 @@ function openImportDialog(preset = {}) {
   openDialog("dlgImport", f => {
     $(".js-host", f).textContent = host.name;
     f.querySelectorAll(".js-host").forEach(x => { x.textContent = host.name; });
+    f.querySelector("input[name=engine_sel][value=oracle]").checked = true;
+    f.querySelectorAll("input[name=engine_sel]").forEach(r => { r.onchange = () => { if (r.value === "postgres") { $("#dlgImport").close(); openPgImport(); } }; });
     const syncMode = () => {
       const mode = f.querySelector('input[name=mode]:checked').value;
       $(".js-ssh", f).hidden = mode !== "ssh"; $(".js-local", f).hidden = mode !== "local"; $(".js-dp", f).hidden = mode !== "dp";
@@ -1686,7 +1726,7 @@ function openImportDialog(preset = {}) {
     if (preset.mode) f.querySelector(`input[name=mode][value=${preset.mode}]`).checked = true;
     syncMode();
     api("GET", "/api/backups").then(r => {
-      f.backup.innerHTML = '<option value="">– Verzeichnis angeben –</option>' + r.backups.map(b =>
+      f.backup.innerHTML = '<option value="">– Verzeichnis angeben –</option>' + r.backups.filter(b => b.engine !== "postgres").map(b =>
         `<option value="${esc(b.id)}">${esc(b.sid)} – ${fmtTime(b.created)} – ${b.full ? "ganze DB" : esc((b.schemas || []).join(", "))} – ${fmtBytes(b.size)}</option>`).join("");
       if (preset.backup) f.backup.value = preset.backup;
       syncMode();
@@ -2085,43 +2125,111 @@ function shipBody(f) {
     delete_source: v("delete_source").checked && !v("delete_source").disabled };
 }
 
-/* ------------------------------------------------------------ PostgreSQL-Dump importieren */
+/* ------------------------------------------------------------ PostgreSQL importieren */
 const PG_FMT = { custom: "pg_dump, Custom-Format", plain: "pg_dump als SQL", dumpall: "pg_dumpall (ganzer Cluster)", globals: "Rollen und Tablespaces" };
+const PG_SRC_LEAD = {
+  net: "Holt die Daten aus einem laufenden PostgreSQL-Server über das Netz – mit pg_dumpall (ganzer Cluster) oder pg_dump je Datenbank, direkt in die Zieldatenbank ohne Zwischendatei. Die Quelle läuft weiter; sie darf älter sein als das Ziel – so lässt sich auch die Hauptversion anheben.",
+  base: "Physische 1:1-Kopie eines laufenden Servers mit pg_basebackup: alle Datenbanken, Rollen und Einstellungen, ohne Export und Import. Die Quelle läuft weiter. Ziel ist eine neue Datenbank derselben Hauptversion; der Benutzer braucht REPLICATION und die Quelle eine replication-Zeile in pg_hba.conf für diesen Host.",
+  file: "Spielt Dump-Dateien aus einem Verzeichnis auf diesem Host ein.",
+  backup: "Stellt eine PostgreSQL-Sicherung von zeitkapsel wieder her.",
+};
 function openPgImport(preset = {}) {
   let plan = null;
+  const srcOf = f => f.querySelector("input[name=source]:checked").value;
   openDialog("dlgPgImport", async f => {
     const planBox = $(".js-plan", f), tgt = $(".js-target", f), go = $(".js-go", f);
-    planBox.innerHTML = ""; tgt.hidden = true; go.disabled = true;
-    $(".js-src", f).hidden = !!preset.backup;
+    const netBox = $(".js-s-net", f);
+    f.querySelector("input[name=engine_sel][value=postgres]").checked = true;
+    f.querySelectorAll("input[name=engine_sel]").forEach(r => { r.onchange = () => { if (r.value === "oracle") { $("#dlgPgImport").close(); openImportDialog(); } }; });
     const targets = S.dbs.filter(d => isPg(d.master)).flatMap(d => [[`master:${d.sid}`, `Master-DB ${d.sid}`],
       ...d.devdbs.filter(x => x.container).map(x => [`dev:${x.id}`, `Entwickler-DB ${x.name} (${d.sid}, ${x.owner || "–"})`])]);
     f.target_db.innerHTML = targets.map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join("") || '<option value="">keine PostgreSQL-DB vorhanden</option>';
     const used = new Set(S.dbs.map(d => d.master.port)); let p = 5432; while (used.has(p)) p++; f.target_port.value = p;
     let chk = {}; try { chk = await api("GET", "/api/newdb/check"); } catch {}
     $(".js-locales", f).innerHTML = (chk.pg_locales || ["C.UTF-8"]).map(c => `<option>${c}</option>`).join("");
+    let bk = []; try { bk = (await api("GET", "/api/backups")).backups.filter(b => b.engine === "postgres"); } catch {}
+    f.backup.innerHTML = bk.map(b => `<option value="${esc(b.id)}">${esc(b.sid)} – ${fmtTime(b.created)} – ${b.mode === "dumpall" ? "pg_dumpall" : "pg_dump"} – ${fmtBytes(b.size)}</option>`).join("")
+      || '<option value="">keine PostgreSQL-Sicherungen vorhanden</option>';
+    const reset = () => { plan = null; planBox.innerHTML = ""; tgt.hidden = true; go.disabled = true; };
     const modeSync = () => {
+      const base = srcOf(f) === "base";
+      if (base) f.querySelector("input[name=target_mode][value=new]").checked = true;
       const m = f.querySelector("input[name=target_mode]:checked").value;
+      $(".js-tmode", f).hidden = base;
       $(".js-t-new", f).disabled = m !== "new"; $(".js-t-over", f).disabled = m !== "overwrite";
+      const net = ["net", "base"].includes(srcOf(f));
+      $(".js-newver", f).hidden = net; $(".js-newver select", f).disabled = net;      // bei Netz-Quellen gilt die Version oben
+      $(".js-newsu", f).hidden = base; $(".js-newsu", f).querySelectorAll("input").forEach(i => { i.disabled = base; });
+      $(".js-newloc", f).hidden = base; $(".js-newloc select", f).disabled = base;
+      $(".js-basesu", f).hidden = !base; f.superuser.disabled = !base;
     };
+    const srcSync = () => {
+      const src = srcOf(f);
+      netBox.hidden = !["net", "base"].includes(src);
+      $(".js-s-file", f).hidden = src !== "file"; $(".js-s-backup", f).hidden = src !== "backup";
+      $(".js-src-lead", f).textContent = PG_SRC_LEAD[src];
+      $(".js-user-hint", f).textContent = src === "base" ? "mit REPLICATION oder SUPERUSER" : "am besten ein Superuser";
+      reset(); modeSync();
+    };
+    f.querySelectorAll("input[name=source]").forEach(r => { r.onchange = srcSync; });
     f.querySelectorAll("input[name=target_mode]").forEach(r => { r.onchange = modeSync; });
+    netBox.querySelectorAll("input").forEach(i => { i.addEventListener("input", reset); });
+    fillVersions(netBox);
+    if (preset.backup) { f.querySelector("input[name=source][value=backup]").checked = true; }
+    srcSync();
+    if (preset.backup) f.backup.value = preset.backup;
+    const srcBody = () => {
+      const src = srcOf(f);
+      if (src === "backup") return { backup: f.backup.value };
+      if (src === "file") return { path: f.path.value.trim() };
+      return { source: src, src_host: f.src_host.value.trim(), src_port: +f.src_port.value, src_user: f.src_user.value.trim(),
+               src_password: f.src_password.value, src_dbname: f.src_dbname.value.trim(), image: f.src_image.value };
+    };
     const probe = async () => {
-      planBox.innerHTML = '<p class="muted-note">Prüfe …</p>'; go.disabled = true;
+      planBox.innerHTML = '<p class="muted-note">Prüfe die Quelle …</p>'; go.disabled = true;
       try {
-        plan = await api("POST", "/api/import/pg/probe", preset.backup ? { backup: preset.backup } : { path: f.path.value.trim() });
+        plan = await api("POST", "/api/import/pg/probe", srcBody());
         const major = (plan.version || "").split(".")[0];
-        planBox.innerHTML = `<dl class="facts-list" style="margin:8px 0">
-            <dt>Quelle</dt><dd>${esc(plan.label)}</dd>
-            ${plan.version ? `<dt>Version</dt><dd>PostgreSQL ${esc(plan.version)} – als Ziel dieselbe oder eine neuere Hauptversion wählen</dd>` : ""}
-          </dl>
-          <div class="table-wrap"><table class="snap"><thead><tr><th>Datei</th><th>Art</th><th>Ziel</th></tr></thead><tbody>
-          ${plan.items.map(i => `<tr><td class="nw">${esc(i.file.split("/").pop())}</td><td>${esc(PG_FMT[i.format] || i.format)}</td><td>${
-            i.format === "custom" || i.format === "plain" ? `Datenbank <input data-ren="${esc(i.database)}" value="${esc(i.target || i.database)}" pattern="[A-Za-z_][A-Za-z0-9_$-]*" style="width:14em">`
-            : i.format === "dumpall" ? (i.databases ? esc(i.databases.join(", ")) : "alle enthaltenen Datenbanken") : "Rollen, Tablespaces"}</td></tr>`).join("")}
-          </tbody></table></div>
-          ${plan.formats.some(x => x === "dumpall" || x === "globals") ? '<p class="muted-note">Rollen aus dem Dump übernehmen ihr Passwort aus der Quelle – auch der Superuser, wenn er dort genauso heißt. Meldungen „Rolle existiert schon“ sind dabei normal.</p>' : ""}`;
-        tgt.hidden = false; go.disabled = false; modeSync();
-        if (!f.target_sid.value && plan.meta && plan.meta.sid) f.target_sid.value = S.dbs.some(d => d.sid === plan.meta.sid) ? plan.meta.sid + "_NEU" : plan.meta.sid;
-        fillVersions($(".js-t-new", f), { prefer: major });
+        if (plan.kind === "net" || plan.kind === "base") {
+          const i = plan.info;
+          planBox.innerHTML = `<dl class="facts-list" style="margin:8px 0">
+              <dt>Quelle</dt><dd>${esc(plan.label)} – PostgreSQL ${esc(i.version)}</dd>
+              <dt>Rechte</dt><dd>${i.superuser ? "Superuser" : "kein Superuser"}${i.replication ? ", REPLICATION" : ""}</dd>
+            </dl>
+            ${plan.problems.map(x => `<p class="form-error">${esc(x)}</p>`).join("")}${plan.warnings.map(x => `<p class="hint-box">${esc(x)}</p>`).join("")}
+            ${plan.kind === "net" ? `<div class="days"><label><input type="radio" name="scope" value="dumpall" checked>Ganzer Cluster (pg_dumpall)</label><label><input type="radio" name="scope" value="dbs">Einzelne Datenbanken (pg_dump) plus Rollen</label></div>` : ""}
+            <div class="table-wrap"><table class="snap"><thead><tr>${plan.kind === "net" ? "<th></th>" : ""}<th>Datenbank</th><th class="num">Größe</th>${plan.kind === "net" ? "<th>Ziel</th>" : ""}</tr></thead><tbody>
+            ${i.databases.map(d => `<tr>${plan.kind === "net" ? `<td><input type="checkbox" data-db="${esc(d.name)}" checked></td>` : ""}<td>${esc(d.name)}</td><td class="num">${d.size != null ? fmtBytes(d.size) : "kein Zugriff"}</td>
+              ${plan.kind === "net" ? `<td><input data-ren="${esc(d.name)}" value="${esc(d.name)}" style="width:12em"></td>` : ""}</tr>`).join("")}
+            </tbody></table></div>`;
+          const scopeSync = () => {
+            const dbs = (f.querySelector("input[name=scope]:checked") || {}).value === "dbs";
+            planBox.querySelectorAll("input[data-db], input[data-ren]").forEach(x => { x.disabled = !dbs; });
+          };
+          planBox.querySelectorAll("input[name=scope]").forEach(r => { r.onchange = scopeSync; }); scopeSync();
+          tgt.hidden = !!plan.problems.length; go.disabled = !!plan.problems.length;
+          if (plan.kind === "base" && !f.src_image.value.endsWith(":" + i.major) && !f.src_image.value.includes(":" + i.major + "."))
+            fillVersions(netBox, { prefer: major, major: i.major });     // pg_basebackup braucht dieselbe Hauptversion
+        } else {
+          planBox.innerHTML = `<dl class="facts-list" style="margin:8px 0">
+              <dt>Quelle</dt><dd>${esc(plan.label)}</dd>
+              ${plan.version ? `<dt>Version</dt><dd>PostgreSQL ${esc(plan.version)} – als Ziel dieselbe oder eine neuere Hauptversion wählen</dd>` : ""}
+            </dl>
+            <div class="table-wrap"><table class="snap"><thead><tr><th>Datei</th><th>Art</th><th>Ziel</th></tr></thead><tbody>
+            ${plan.items.map(i => `<tr><td class="nw">${esc(i.file.split("/").pop())}</td><td>${esc(PG_FMT[i.format] || i.format)}</td><td>${
+              i.format === "custom" || i.format === "plain" ? `Datenbank <input data-ren="${esc(i.database)}" value="${esc(i.target || i.database)}" style="width:12em">`
+              : i.format === "dumpall" ? (i.databases ? esc(i.databases.join(", ")) : "alle enthaltenen Datenbanken") : "Rollen, Tablespaces"}</td></tr>`).join("")}
+            </tbody></table></div>`;
+          tgt.hidden = false; go.disabled = false;
+          fillVersions($(".js-t-new", f), { prefer: major });
+        }
+        if (plan.formats && plan.formats.some(x => x === "dumpall" || x === "globals") || plan.kind === "net")
+          planBox.insertAdjacentHTML("beforeend", '<p class="muted-note">Rollen aus der Quelle bringen ihr Passwort mit – auch der Superuser, wenn er dort genauso heißt. Meldungen „Rolle existiert schon“ sind dabei normal.</p>');
+        if (!f.target_sid.value) {
+          const guess = (plan.meta && plan.meta.sid) || (plan.net ? plan.net.host.split(".")[0].toUpperCase().replace(/[^A-Z0-9_]/g, "_") : "");
+          if (guess) f.target_sid.value = S.dbs.some(d => d.sid === guess) ? guess + "_NEU" : guess;
+        }
+        modeSync();
       } catch (e) { plan = null; planBox.innerHTML = `<p class="form-error">${esc(e.message)}</p>`; }
     };
     $(".js-probe", f).onclick = probe;
@@ -2129,16 +2237,25 @@ function openPgImport(preset = {}) {
   }, async v => {
     const f = $("#fPgImport");
     if (!plan) throw new Error("Erst die Quelle prüfen.");
-    const renames = {};
-    f.querySelectorAll("input[data-ren]").forEach(i => { renames[i.dataset.ren] = i.value.trim(); });
-    const body = { ...(preset.backup ? { backup: preset.backup } : { path: v.path.trim() }), target_mode: v.target_mode, renames };
-    if (v.target_mode === "new") {
+    const renames = {}, dbs = [];
+    f.querySelectorAll("input[data-ren]:not([disabled])").forEach(i => { if (i.value.trim() !== i.dataset.ren) renames[i.dataset.ren] = i.value.trim(); });
+    f.querySelectorAll("input[data-db]:checked:not([disabled])").forEach(i => dbs.push(i.dataset.db));
+    const scope = (f.querySelector("input[name=scope]:checked") || {}).value;
+    const net = plan.kind === "net" || plan.kind === "base";
+    const body = { ...(net ? { source: plan.kind, src_host: f.src_host.value.trim(), src_port: +f.src_port.value, src_user: f.src_user.value.trim(),
+                                src_password: f.src_password.value, src_dbname: f.src_dbname.value.trim() }
+                           : plan.kind === "backup" ? { backup: f.backup.value } : { path: f.path.value.trim() }),
+                   target_mode: plan.kind === "base" ? "new" : v.target_mode, renames, scope, databases: scope === "dbs" ? dbs : [] };
+    if (plan.kind === "base") {
+      Object.assign(body, { target_sid: v.target_sid.toUpperCase(), target_port: +v.target_port, image: f.src_image.value, superuser: v.superuser });
+    } else if (body.target_mode === "new") {
       if (v.target_password !== v.target_password2) throw new Error("Die Passwörter stimmen nicht überein.");
-      Object.assign(body, { target_sid: v.target_sid.toUpperCase(), target_port: +v.target_port, image: v.image, user: v.user,
-        target_password: v.target_password, locale: v.locale });
+      Object.assign(body, { target_sid: v.target_sid.toUpperCase(), target_port: +v.target_port, image: net ? f.src_image.value : v.image,
+        user: v.user, target_password: v.target_password, locale: v.locale });
     } else {
       const [kind, ...rest] = (v.target_db || "").split(":");
       Object.assign(body, { target_kind: kind, target_ident: rest.join(":"), confirm: v.confirm, snapshot_before: !!v.snapshot_before });
+      if (net) body.image = f.src_image.value;
     }
     startedJob(await api("POST", "/api/import/pg", body));
   });

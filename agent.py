@@ -5573,6 +5573,32 @@ def dumpall_databases(path: Path, gz: bool) -> list[str]:
 def pg_restore_source(data: dict) -> dict:
     """Liste der Wiederherstellungs-Schritte aus einer Sicherung von zeitkapsel oder einer Datei auf dem Host."""
     items: list[dict] = []
+    if data.get("source") in ("net", "base"):
+        src = validate_net_source(data)
+        image = check_pg_image(data.get("image")) if data.get("image") else None
+        if not image:
+            raise UserError("Für die Prüfung eine PostgreSQL-Version wählen (deren Werkzeuge verbinden sich mit der Quelle).")
+        info = probe_net(src, image)
+        problems, warnings = [], []
+        if data["source"] == "base":
+            if not (info["superuser"] or info["replication"]):
+                problems.append(f"{src['user']} hat weder SUPERUSER noch REPLICATION; pg_basebackup geht damit nicht.")
+            if info["tablespaces"]:
+                problems.append("Die Quelle hat eigene Tablespaces (" + ", ".join(t["name"] for t in info["tablespaces"])
+                                + "); dafür pg_dump nutzen.")
+            warnings.append("Die Quelle muss in pg_hba.conf eine replication-Verbindung für diesen Benutzer und Host erlauben, "
+                            "und max_wal_senders muss frei sein.")
+        else:
+            if not info["superuser"]:
+                warnings.append(f"{src['user']} ist kein Superuser: Rollen werden ohne Passwörter übernommen, "
+                                "Datenbanken ohne CONNECT-Recht fehlen.")
+            if int(image_pg_major(image).split(".")[0]) < int(info["major"].split(".")[0]):
+                problems.append(f"Die gewählte Version ist älter als die Quelle (PostgreSQL {info['version']}); "
+                                "pg_dump braucht dieselbe oder eine neuere Version.")
+        src_pub = {k: v for k, v in src.items() if k != "password"}
+        return dict(kind=data["source"], label=f"{src['host']}:{src['port']}", version=info["version"], items=[],
+                    meta=dict(sid=None), net=src_pub, info=info, problems=problems, warnings=warnings, image=image,
+                    _src=dict(src, info=info))
     if data.get("backup"):
         sid, _, stamp = str(data["backup"]).partition("/")
         d = backup_dir(sid, stamp)
@@ -5616,9 +5642,198 @@ def pg_restore_source(data: dict) -> dict:
     return dict(kind="path", label=str(path), version=version, items=items, meta=None)
 
 
+# --- Quelle: laufender PostgreSQL-Server im Netz (pg_dump/pg_dumpall bzw. pg_basebackup)
+RE_NETHOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:-]{0,252}$")
+PG_NET_SQL = r"""select 'V', current_setting('server_version_num'), current_setting('server_version');
+select 'S', rolsuper::int, rolreplication::int from pg_roles where rolname = current_user;
+select 'D', datname, case when has_database_privilege(datname, 'CONNECT') then pg_database_size(datname) end
+  from pg_database where not datistemplate and datallowconn order by 1;
+select 'T', spcname, pg_tablespace_location(oid) from pg_tablespace where spcname not in ('pg_default', 'pg_global');"""
+
+
+def pgpass_line(password: str) -> str:
+    esc = password.replace("\\", "\\\\").replace(":", "\\:")
+    return f"*:*:*:*:{esc}\n"
+
+
+def pg_client_cmd(image: str, args: list[str], uid: str | None = None, volumes: list[str] = ()) -> list[str]:
+    """Wegwerf-Container mit den PostgreSQL-Werkzeugen des Images; das Passwort kommt als .pgpass über stdin
+    (taucht so weder in der Prozessliste noch im Vorgangsprotokoll auf)."""
+    cmd = ["docker", "run", "--rm", "-i", "--network", "host"]
+    if uid:
+        cmd += ["-u", uid]
+    for v in volumes:
+        cmd += ["-v", v]
+    return cmd + ["--entrypoint", "sh", image, "-c",
+                  'umask 077; cat > /tmp/.zkpass; export PGPASSFILE=/tmp/.zkpass; exec "$@"', "sh", *args]
+
+
+def net_conn_args(src: dict) -> list[str]:
+    return ["-h", src["host"], "-p", str(src["port"]), "-U", src["user"]]
+
+
+def validate_net_source(data: dict) -> dict:
+    src = dict(host=(data.get("src_host") or "").strip(), port=int(data.get("src_port") or 5432),
+               user=(data.get("src_user") or "postgres").strip(), password=data.get("src_password") or "",
+               dbname=(data.get("src_dbname") or "postgres").strip())
+    if not RE_NETHOST.match(src["host"]):
+        raise UserError("Quell-Host angeben (Name oder IP-Adresse).")
+    if not 1 <= src["port"] <= 65535:
+        raise UserError("Port: 1 bis 65535.")
+    if not RE_PGDB.match(src["user"]) or not RE_PGDB.match(src["dbname"]):
+        raise UserError("Benutzer bzw. Datenbank ungültig.")
+    if not src["password"] or "\n" in src["password"]:
+        raise UserError("Passwort des Quell-Benutzers angeben.")
+    return src
+
+
+def probe_net(src: dict, image: str) -> dict:
+    if sh(["docker", "image", "inspect", image], check=False).returncode:
+        sh(["docker", "pull", "-q", image], timeout=1800)
+    cmd = pg_client_cmd(image, ["psql", "-X", "-At", "-F", "\t", *net_conn_args(src), "-d", src["dbname"], "-c", PG_NET_SQL])
+    try:
+        p = sh(cmd, input=pgpass_line(src["password"]), check=False, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise UserError(f"{src['host']}:{src['port']} antwortet nicht.") from None
+    if p.returncode:
+        raise UserError("Verbindung zur Quelle fehlgeschlagen: " + ((p.stderr or p.stdout).strip().splitlines() or ["?"])[-1][:300])
+    info = dict(version_num=0, version="", superuser=False, replication=False, databases=[], tablespaces=[])
+    for line in p.stdout.splitlines():
+        f = line.split("\t")
+        if f[0] == "V" and len(f) >= 3:
+            info.update(version_num=int(f[1]), version=f[2].split()[0])
+        elif f[0] == "S" and len(f) >= 3:
+            info.update(superuser=f[1] == "1", replication=f[2] == "1")
+        elif f[0] == "D" and len(f) >= 3:
+            info["databases"].append(dict(name=f[1], size=int(f[2]) if f[2].isdigit() else None))
+        elif f[0] == "T" and len(f) >= 3:
+            info["tablespaces"].append(dict(name=f[1], location=f[2]))
+    info["major"] = str(info["version_num"] // 10000) if info["version_num"] >= 100000 else \
+        f"{info['version_num'] // 10000}.{info['version_num'] // 100 % 100}"
+    return info
+
+
+def pg_pipe(job: Job, producer: list[str], consumer: list[str], password: str, errors: list[str]) -> None:
+    """Dump aus dem Wegwerf-Container direkt in den Zielcontainer schicken, ohne Zwischendatei."""
+    script = "set -o pipefail; " + shq(producer) + " | " + shq(consumer)
+    p = job.run(["bash", "-c", script], input=pgpass_line(password), timeout=SHIP_TIMEOUT, allow_fail=True, quiet=True)
+    out = (p.stdout or "") + (p.stderr or "")
+    errs = [l.strip() for l in out.splitlines() if "ERROR:" in l or "pg_restore: error" in l or "pg_dump: error" in l
+            or "pg_dumpall: error" in l]
+    benign = [e for e in errs if re.search(r'role "[^"]+" already exists|database "[^"]+" already exists', e)]
+    real = [e for e in errs if e not in benign]
+    errors += real
+    if p.returncode == 0:
+        for e in real[:15]:
+            job.log("  " + e[:300])
+    job.log(f"  {len(real)} Fehler" + (f", {len(benign)} erwartete Meldungen (Rolle bzw. Datenbank existiert schon)" if benign else ""))
+    if any("pg_dump" in e and "error" in e for e in real) and p.returncode:
+        raise RuntimeError("Der Export aus der Quelle ist abgebrochen (siehe Protokoll).")
+
+
+def pg_net_into(job: Job, cname: str, user: str, image: str, src: dict, overwrite: bool, renames: dict) -> list[str]:
+    errors: list[str] = []
+    info = src["info"]
+    conn = net_conn_args(src)
+    roles_opt = [] if info["superuser"] else ["--no-role-passwords"]
+    psql = ["docker", "exec", "-i", "-u", "postgres", cname, "psql", "-X", "-q", "-U", user]
+    if src["scope"] == "dumpall":
+        dbs = [d["name"] for d in info["databases"]]
+        if overwrite:
+            for db in dbs:
+                if db != "postgres":
+                    pg_drop_db(job, cname, user, db)
+            pg_drop_db(job, cname, user, "postgres")
+            job.run(pg_exec(cname, user, "psql", "-X", "-q", "-d", "template1", "-c", "create database postgres"))
+        job.log(f"pg_dumpall von {src['host']}: Rollen, Tablespaces und alle Datenbanken ({', '.join(dbs)})")
+        pg_pipe(job, pg_client_cmd(image, ["pg_dumpall", *conn, "-l", src["dbname"], *roles_opt]), psql + ["-d", "postgres"],
+                src["password"], errors)
+        return errors
+    job.log(f"Rollen und Tablespaces von {src['host']} (pg_dumpall --globals-only)")
+    pg_pipe(job, pg_client_cmd(image, ["pg_dumpall", *conn, "-l", src["dbname"], "--globals-only", *roles_opt]),
+            psql + ["-d", "postgres"], src["password"], errors)
+    for db in src["databases"]:
+        target = renames.get(db) or db
+        if not RE_PGDB.match(target):
+            raise RuntimeError(f"Ungültiger Datenbankname: {target}")
+        pg_drop_db(job, cname, user, target)
+        qt = '"' + target.replace('"', '""') + '"'
+        job.run(pg_exec(cname, user, "psql", "-X", "-q", "-d", "template1", "-c", f"create database {qt}"))
+        job.log(f"pg_dump {db} → Datenbank {target}")
+        pg_pipe(job, pg_client_cmd(image, ["pg_dump", *conn, "-Fc", "-d", db]),
+                ["docker", "exec", "-i", "-u", "postgres", cname, "pg_restore", "-U", user, "-d", target, "--no-password"],
+                src["password"], errors)
+    return errors
+
+
+def job_pg_basebackup(job: Job, src: dict, tgt: dict) -> None:
+    """Physische 1:1-Kopie eines laufenden Clusters per pg_basebackup in ein neues Subvolume."""
+    sid, image, port = tgt["sid"], tgt["image"], tgt["port"]
+    info = src["info"]
+    pg_pull(job, image, always=True)
+    major = image_pg_major(image)
+    if major != info["major"]:
+        raise RuntimeError(f"Die Quelle ist PostgreSQL {info['major']}, das Image {major}; pg_basebackup braucht dieselbe Hauptversion.")
+    uid = sh(["docker", "run", "--rm", "--entrypoint", "id", image, "-u", "postgres"]).stdout.strip()
+    vol = PG_STORE.master / sid
+    PG_STORE.master.mkdir(parents=True, exist_ok=True)
+    job.run(["btrfs", "subvolume", "create", str(vol)])
+    prepare_new_volume(job, vol)
+    cname = sid.lower()
+    try:
+        data = vol / "pgdata"
+        data.mkdir(mode=0o700)
+        os.chown(data, int(uid), int(uid))
+        first = next((d["name"] for d in info["databases"] if d["name"] != "postgres"), "postgres")
+        write_volume_env(vol, dict(ZK_ENGINE=PG, ZK_IMAGE=image, ZK_PG_USER=tgt["superuser"], ZK_PG_DB=first,
+                                   ZK_SERVICE=first, ZK_SHM_SIZE="256m"))
+        job.log(f"pg_basebackup von {src['host']}:{src['port']} (Quelle läuft weiter; WAL wird mitgestreamt)")
+        job.run(pg_client_cmd(image, ["pg_basebackup", *net_conn_args(src), "-D", "/zk/pgdata", "-X", "stream", "-c", "fast",
+                                      "--no-sync"], uid=uid, volumes=[f"{vol}:/zk"]),
+                input=pgpass_line(src["password"]), timeout=SHIP_TIMEOUT)
+        job.log("Konfiguration für den Container anpassen")
+        notes = []
+        if not (data / "postgresql.conf").exists():   # z. B. Debian/Ubuntu: Konfiguration liegt unter /etc/postgresql
+            job.run(["docker", "run", "--rm", "-u", uid, "-v", f"{vol}:/zk", "--entrypoint", "sh", image, "-c",
+                     "for f in /usr/share/postgresql/postgresql.conf.sample /usr/local/share/postgresql/postgresql.conf.sample "
+                     "/usr/share/postgresql/*/postgresql.conf.sample; do [ -f \"$f\" ] && cp \"$f\" /zk/pgdata/postgresql.conf && exit 0; done; exit 1"])
+            notes.append("postgresql.conf fehlte in der Quelle (liegt dort vermutlich unter /etc/postgresql); "
+                         "es gilt die Vorlage des Images – Einstellungen bei Bedarf mit ALTER SYSTEM nachziehen.")
+        hba = data / "pg_hba.conf"
+        old = hba.read_text() if hba.exists() else ""
+        hba.write_text("# zeitkapsel: Zugriff im Container (vor den Regeln der Quelle); md5 nimmt auch SCRAM-Passwörter an\n"
+                       "local all all trust\nhost all all all md5\n\n" + old)
+        auto = data / "postgresql.auto.conf"
+        auto.write_text((auto.read_text() if auto.exists() else "") +
+                        "\n# zeitkapsel: im Container auf allen Adressen lauschen\nlisten_addresses = '*'\n")
+        for f in ("standby.signal", "recovery.signal"):
+            if (data / f).exists():
+                (data / f).unlink()
+                notes.append(f"{f} entfernt – die Kopie ist eine eigenständige Datenbank, kein Standby.")
+        if not (data / "pg_ident.conf").exists():
+            (data / "pg_ident.conf").touch()
+        sh(["chown", "-R", f"{uid}:{uid}", str(data)])
+        for n in notes:
+            job.log("Hinweis: " + n)
+        db_meta_update(sid, port=port, origin=f"pg_basebackup von {src['host']}:{src['port']} (PostgreSQL {info['version']})",
+                       created=now_iso())
+        t0 = time.time()
+        job.on_cancel(lambda: sh(["docker", "rm", "-f", cname], check=False))
+        job.run(master_run_cmd(sid, port))
+        wait_ready(job, cname, t0)
+    except Exception:
+        sh(["docker", "rm", "-f", cname], check=False)
+        db_meta_file(sid).unlink(missing_ok=True)
+        sh(["btrfs", "subvolume", "delete", str(vol)], check=False)
+        sv_forget(vol)
+        raise
+    tl_add(sid, "db-created", f"Datenbank {sid} per pg_basebackup von {src['host']} übernommen (PostgreSQL {info['version']})")
+
+
 @bp.post("/api/import/pg/probe")
 def api_pg_probe():
     src = pg_restore_source(request.get_json(force=True) or {})
+    src.pop("_src", None)
     src["formats"] = sorted({i["format"] for i in src["items"]})
     return jsonify(src)
 
@@ -5690,12 +5905,14 @@ def job_pg_restore(job: Job, src: dict, tgt: dict) -> None:
         sid = tgt["sid"]
         job_newdb_pg(job, sid, tgt["image"], "postgres", tgt["user"], tgt["password"], tgt["locale"], True, tgt["port"])
         cname, user, label, overwrite = sid.lower(), tgt["user"], f"neue Datenbank {sid}", False
+        image = tgt["image"]
     else:
         kind, ident = tgt["kind"], tgt["ident"]
         sid, c, vol, label = pg_target(kind, ident)
         if not c or not c["running"]:
             raise RuntimeError(f"Die {label} läuft nicht.")
         cname, user, overwrite = c["name"], read_volume_env(vol).get("ZK_PG_USER", "postgres"), True
+        image = read_volume_env(vol).get("ZK_IMAGE") or c["image"]
         if tgt.get("snapshot_before"):
             name = f"vor-import-{stamp}"
             pg_checkpoint(cname)
@@ -5712,7 +5929,10 @@ def job_pg_restore(job: Job, src: dict, tgt: dict) -> None:
                                                                      description="Automatisch vor dem Import angelegt."))
             job.log(f"Stand vor dem Import gesichert als {name}")
     job.log(f"Einspielen aus {src['label']} in die {label}")
-    errors = pg_restore_into(job, cname, user, src, overwrite, tgt.get("renames") or {})
+    if src["kind"] == "net":
+        errors = pg_net_into(job, cname, user, image, src["_src"], overwrite, tgt.get("renames") or {})
+    else:
+        errors = pg_restore_into(job, cname, user, src, overwrite, tgt.get("renames") or {})
     if tgt["mode"] == "new":
         vol = master_dir(sid)
         restored = [d["name"] for d in pg_databases(cname, user) if d["name"] != "postgres"]
@@ -5728,6 +5948,28 @@ def job_pg_restore(job: Job, src: dict, tgt: dict) -> None:
 def api_pg_import():
     data = request.get_json(force=True) or {}
     src = pg_restore_source(data)
+    if src.get("problems"):
+        raise UserError(" ".join(src["problems"]))
+    if src["kind"] == "net":
+        scope = data.get("scope") if data.get("scope") in ("dumpall", "dbs") else "dumpall"
+        known = [d["name"] for d in src["info"]["databases"]]
+        dbs = [d for d in (data.get("databases") or known) if d in known]
+        if scope == "dbs" and not dbs:
+            raise UserError("Mindestens eine Datenbank wählen.")
+        src["_src"].update(scope=scope, databases=dbs)
+    if src["kind"] == "base":
+        tgt = dict(sid=(data.get("target_sid") or "").strip().upper(), image=check_pg_image(data.get("image")),
+                   port=int(data.get("target_port") or 0), superuser=(data.get("superuser") or "postgres").strip())
+        if not RE_PGNAME.match(tgt["sid"]):
+            raise UserError("Name: Großbuchstaben, Ziffern, Unterstrich; höchstens 16 Zeichen.")
+        if master_dir(tgt["sid"]).exists() or any(c["name"] == tgt["sid"].lower() for c in containers()):
+            raise UserError(f"Eine Datenbank {tgt['sid']} gibt es auf diesem Host schon.")
+        if not RE_PGIDENT.match(tgt["superuser"]):
+            raise UserError("Superuser: Kleinbuchstaben, Ziffern, Unterstrich.")
+        check_new_port(tgt["port"], None)
+        job = start_job(f"{tgt['sid']} per pg_basebackup von {src['label']} übernehmen", tgt["sid"], f"newdb:{tgt['sid']}",
+                        job_pg_basebackup, src["_src"], tgt)
+        return jsonify(job=job.as_dict())
     mode = data.get("target_mode")
     renames = {k: v for k, v in (data.get("renames") or {}).items() if isinstance(v, str) and v}
     for v in renames.values():
