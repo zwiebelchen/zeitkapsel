@@ -2,13 +2,14 @@
 
 Datenbanken, deren Daten auf einem BTRFS-Snapshot liegen und wo die DB als Docker-Container läuft, in Sekunden snapshotten, branchen, Entwicklungsinstanzen hochziehen und mehr.
 
-zeitkapsel verwaltet Oracle-Datenbanken, die als Container (Oracle-Image aus `oracle/docker-images`) auf einem oder mehreren Hosts mit btrfs laufen: Releases als schreibgeschützte Snapshots, Entwickler-DBs als beschreibbare Kopien davon, Snapshots dieser Entwickler-DBs, Zeitpläne – über eine Weboberfläche mit Benutzern und Rechten oder über Shell-Skripte.
+zeitkapsel verwaltet Oracle- und PostgreSQL-Datenbanken, die als Container (Oracle-Image aus `oracle/docker-images`, PostgreSQL-Image aus einer wählbaren Registry) auf einem oder mehreren Hosts mit btrfs laufen: Releases als schreibgeschützte Snapshots, Entwickler-DBs als beschreibbare Kopien davon, Snapshots dieser Entwickler-DBs, Zeitpläne – über eine Weboberfläche mit Benutzern und Rechten oder über Shell-Skripte.
 
 | Bereich | Was zeitkapsel tut |
 | --- | --- |
 | Hosts | mehrere DB-Hosts in einer Oberfläche; auf jedem läuft ein Agent |
 | Datenbanken | Master-DBs je Host mit Status, Port und JDBC-URL; starten und stoppen |
-| Neue Datenbank | leere Container-DB (CDB mit PDB) mit eigenem Container anlegen |
+| Neue Datenbank | leere Oracle-DB (Non-CDB oder CDB mit PDB) oder PostgreSQL-Cluster in wählbarer Version mit eigenem Container anlegen |
+| PostgreSQL | Versionen aus einer Registry (Docker Hub oder eigene); Version je Master- und Entwickler-DB innerhalb der Hauptversion wechseln |
 | Import | bestehende DB von einem anderen Server per SSH übernehmen, inklusive spfile und Passwortdatei |
 | Releases | aus der Master-DB, aus einem Entwickler-Snapshot oder von einem Release abgeleitet (wie ein Git-Branch) |
 | Entwickler-DBs | aus einem Release oder Snapshot anlegen, starten, stoppen, zurücksetzen, snapshotten, löschen |
@@ -227,6 +228,22 @@ Releases und Entwickler-DBs aus der Zeit davor bleiben unkomprimiert, bis sie du
 „Verwaltung“ → „Neue Datenbank“ legt eine leere Datenbank mit eigenem Container an. Ohne PDB-Namen entsteht eine klassische Non-CDB in derselben Form wie eine migrierte (Datendateien, Controlfiles und Redo-Logs unter `<SID>/`, spfile und Passwortdatei unter `dbconfig/<SID>/`); mit PDB-Namen eine CDB mit dieser einen PDB.
 
 zeitkapsel ruft dafür dbca selbst im Oracle-Image auf (General_Purpose-Vorlage, Dateisystem, automatische SGA mit der angegebenen Speichergröße, Recovery Area in `fast_recovery_area/` innerhalb des Subvolumes) und startet die DB danach als normale Master-DB. Das dauert 15 bis 45 Minuten. Das Passwort gilt für SYS und SYSTEM (bei einer CDB auch PDBADMIN), wird per stdin übergeben und erscheint weder in der Container-Konfiguration noch im Vorgangsprotokoll. Voraussetzung ist das Korrektur-Image (siehe „Image“); die Oberfläche prüft das vorher.
+
+## PostgreSQL
+
+PostgreSQL-Datenbanken laufen auf demselben Host neben den Oracle-DBs und nutzen dieselbe Ablage: Master-DB, Releases, Entwickler-DBs, deren Snapshots, Zeitpläne, Timeline, Sitzungen, Auslastung und Logs funktionieren genauso.
+
+**Registry.** Unter „Verwaltung“ → „PostgreSQL-Images“ steht das Repository, aus dem die Images kommen: Docker Hub (`docker.io/library/postgres`, Vorgabe) oder eine eigene Registry, z. B. `registry.intern:5000/postgres`, optional mit Benutzer und Passwort bzw. Token. Beim Speichern liest zeitkapsel die Tags über die Registry-API v2 (prüft damit Erreichbarkeit und Anmeldung) und meldet Docker mit `docker login` an, damit `docker pull` klappt. Die Zugangsdaten liegen in `meta/registry.json` (nur für root lesbar). Erwartet wird ein Image im Stil des offiziellen (`POSTGRES_*`-Variablen, `PG_MAJOR`, `pg_isready`); ein eigenes Image auf dieser Basis, etwa mit zusätzlichen Extensions, passt also.
+
+**Neue Datenbank.** „Neue Datenbank“ → PostgreSQL: Name (wie die SID, Großbuchstaben), Version aus der Liste der Tags (nach Hauptversion gruppiert, „lokal“ = schon auf dem Host; Varianten wie alpine oder bookworm über das Häkchen), Port, Datenbank- und Superuser-Name, Passwort, Locale und Datenprüfsummen. Das Passwort geht über eine Datei, die nur für initdb im Subvolume liegt und danach gelöscht wird; der Container wird anschließend ohne die Anlage-Angaben neu erzeugt und hat sie nicht in seiner Konfiguration.
+
+**Ablage.** Das Subvolume `master/<NAME>/` enthält `pgdata/` und `zeitkapsel.env` mit `ZK_ENGINE=postgres` und `ZK_IMAGE=<Image:Tag>`. Es wird genau auf das `VOLUME` des Images gelegt (`/var/lib/postgresql/data` bis Version 17, `/var/lib/postgresql` ab 18), `PGDATA` zeigt auf `pgdata/` darin. Container tragen das Label `zk.engine=postgres`; bereit ist eine DB, sobald `pg_isready` über TCP antwortet. `/dev/shm` ist auf 256 MB voreingestellt.
+
+**Version wechseln.** „Version ändern“ bei der Master-DB (Administrator) bzw. bei der eigenen Entwickler-DB tauscht das Image innerhalb derselben Hauptversion (z. B. 17.5 → 17.6): sauber herunterfahren, Container mit dem neuen Image neu erzeugen. Beim Anlegen einer Entwickler-DB lässt sich ebenfalls eine andere Version derselben Hauptversion wählen. Die Version steht in `zeitkapsel.env` und wandert mit jedem Snapshot mit: Releases übernehmen die Version der Master-DB zum Zeitpunkt der Erstellung. Ein Wechsel der Hauptversion (z. B. 16 → 17) braucht `pg_upgrade` oder Dump und Restore und wird abgelehnt.
+
+**Releases.** Vor dem Snapshot läuft ein `CHECKPOINT` in der Master-DB; die Kopie startet in einem Hilfscontainer, führt die Recovery aus, auf Wunsch zusätzliches SQL („Vorgaben“ → „SQL beim Release-Erstellen (PostgreSQL)“, per psql als Superuser in der Hauptdatenbank) und wird dann sauber heruntergefahren und schreibgeschützt eingefroren.
+
+**Noch nicht für PostgreSQL:** Sicherungen und Wiederherstellen (expdp/impdp), die Import-Assistenten und die Shell-Skripte gibt es nur für Oracle. Speicherparameter wie `shared_buffers` setzt man mit `ALTER SYSTEM` in der Datenbank; sie stehen in `postgresql.auto.conf` und wandern mit jedem Snapshot mit.
 
 ## Import von einem anderen Server
 

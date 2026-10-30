@@ -43,6 +43,8 @@ import shlex
 
 from flask import Blueprint, current_app, has_request_context, jsonify, request
 
+import registry
+
 # --------------------------------------------------------------------------- Konfiguration
 def env(name: str, default: str = "") -> str:
     return os.environ.get("ZK_" + name, os.environ.get("ORADB_" + name, default))
@@ -136,8 +138,28 @@ def ts_key(value) -> float:
         return 0.0
 
 
-def jdbc(port: int | None, service: str) -> str | None:
-    return f"jdbc:oracle:thin:@//{DB_HOST}:{port}/{service}" if port else None
+def jdbc(port: int | None, service: str, engine: str = "oracle") -> str | None:
+    if not port:
+        return None
+    if engine == PG:
+        return f"jdbc:postgresql://{DB_HOST}:{port}/{service}"
+    return f"jdbc:oracle:thin:@//{DB_HOST}:{port}/{service}"
+
+
+# --------------------------------------------------------------------------- Datenbank-Arten (Oracle, PostgreSQL)
+ORA, PG = "oracle", "postgres"
+ENGINE_LABEL = "zk.engine"
+PG_PORT = 5432
+PG_MOUNTS = ("/var/lib/postgresql/data", "/var/lib/postgresql")   # VOLUME der offiziellen Images bis 17 bzw. ab 18
+DB_MOUNTS = ("/opt/oracle/oradata",) + PG_MOUNTS
+
+
+def engine_of(vol: Path) -> str:
+    return PG if read_volume_env(vol).get("ZK_ENGINE") == PG else ORA
+
+
+def engine_label(engine: str) -> str:
+    return "PostgreSQL" if engine == PG else "Oracle"
 
 
 # --------------------------------------------------------------------------- zeitkapsel.env im Subvolume
@@ -178,6 +200,12 @@ def write_volume_env(vol: Path, data: dict) -> None:
         if v not in (None, ""):
             lines.append(f'{k}="{v}"')
     (vol / VOLUME_ENV).write_text("\n".join(lines) + "\n")
+
+
+def update_volume_env(vol: Path, **kw) -> None:
+    e = read_volume_env(vol)
+    e.update({k: v for k, v in kw.items() if v is not None})
+    write_volume_env(vol, e)
 
 
 def docker_extra(vol: Path) -> list[str]:
@@ -261,6 +289,12 @@ def sv_forget(path: Path) -> None:
 
 def check_volume(vol: Path, sid: str) -> None:
     """Dieselbe Prüfung wie startdb.sh: ohne Markierungsdateien würde das Oracle-Skript löschen."""
+    if engine_of(vol) == PG:   # ohne PG_VERSION würde das Postgres-Image ein leeres Cluster anlegen
+        if not (vol / "pgdata" / "PG_VERSION").is_file():
+            raise RuntimeError("Fehlende Datei, Start abgebrochen: pgdata/PG_VERSION")
+        if not read_volume_env(vol).get("ZK_IMAGE"):
+            raise RuntimeError("In zeitkapsel.env fehlt ZK_IMAGE (Postgres-Image).")
+        return
     missing = []
     for p in (vol / f".{sid}.created", vol / "dbconfig" / sid / f"spfile{sid}.ora",
               vol / "dbconfig" / sid / f"orapw{sid}"):
@@ -285,10 +319,11 @@ def containers() -> list[dict]:
     raw = sh(["docker", "inspect", *ids], check=False).stdout or "[]"
     out = []
     for c in json.loads(raw):
-        binds = (c["HostConfig"].get("PortBindings") or {}).get("1521/tcp") or []
+        pb = c["HostConfig"].get("PortBindings") or {}
+        binds = pb.get("1521/tcp") or pb.get(f"{PG_PORT}/tcp") or []
         port = int(binds[0]["HostPort"]) if binds and binds[0].get("HostPort") else None
         mount = next((m["Source"] for m in c.get("Mounts", [])
-                      if m.get("Destination") == "/opt/oracle/oradata"), None)
+                      if m.get("Destination") in DB_MOUNTS and m.get("Type") == "bind"), None)
         st = c["State"]
         out.append(dict(
             id=c["Id"], name=c["Name"].lstrip("/"), labels=c["Config"].get("Labels") or {},
@@ -297,6 +332,8 @@ def containers() -> list[dict]:
             started=st.get("StartedAt"),
             mem_limit=int(c["HostConfig"].get("Memory") or 0), nano_cpus=int(c["HostConfig"].get("NanoCpus") or 0),
             shm_size=int(c["HostConfig"].get("ShmSize") or 0),
+            engine=PG if (c["Config"].get("Labels") or {}).get(ENGINE_LABEL) == PG else ORA,
+            image=c["Config"].get("Image") or "",
         ))
     return out
 
@@ -311,6 +348,10 @@ def db_state(c: dict | None) -> str:
     key = (c["id"], c["started"])
     if _ready_cache.get(key) in ("bereit", "Fehler"):
         return _ready_cache[key]
+    if c.get("engine") == PG:
+        state = "bereit" if pg_ready(c["id"]) else "startet"
+        _ready_cache[key] = state
+        return state
     p = sh(["docker", "logs", "--since", c["started"], c["id"]], check=False)
     text = p.stdout + p.stderr
     state = "Fehler" if FAIL_MARK in text else "bereit" if READY_MARK in text else "startet"
@@ -323,6 +364,7 @@ HOST_SETTINGS = {   # Schlüssel: (Typ, Vorgabe, Bereich)
     "release_sga_mb": (int, 1024, (256, 1048576)),
     "release_pga_mb": (int, 300, (64, 1048576)),
     "release_extra_sql": (str, "", None),
+    "pg_release_sql": (str, "", None),
     "dev_cpus": (float, 0, (0, 1024)),
     "dev_memory_mb": (int, 0, (0, 1048576)),
     "dev_shm_mb": (int, 0, (0, 1048576)),
@@ -628,8 +670,39 @@ def jobs_housekeeping() -> None:
         f.with_suffix(".log").unlink(missing_ok=True)
 
 
+def pg_ready(cname: str) -> bool:
+    """Über TCP prüfen: der Zwischen-Server beim ersten Initialisieren lauscht nur am Unix-Socket."""
+    try:
+        return sh(["docker", "exec", cname, "pg_isready", "-q", "-h", "127.0.0.1", "-p", str(PG_PORT)],
+                  check=False, timeout=15).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def pg_wait_ready(job: Job, cname: str, timeout: int) -> None:
+    job.log("Warte, bis PostgreSQL Verbindungen annimmt …")
+    t0 = time.time()
+    fmt = "{{.State.Running}} {{.State.Restarting}} {{.RestartCount}}"
+    first = sh(["docker", "inspect", "-f", fmt, cname], check=False).stdout.split()
+    while time.time() - t0 < timeout:
+        st = sh(["docker", "inspect", "-f", fmt, cname], check=False).stdout.split()
+        if len(st) < 3 or st[0] != "true" or st[1] == "true" or (len(first) == 3 and st[2] != first[2]):
+            tail = sh(["docker", "logs", "--tail", "8", cname], check=False)
+            msg = " | ".join(l.strip() for l in (tail.stdout + tail.stderr).splitlines() if l.strip())
+            raise RuntimeError(f"PostgreSQL in {cname} startet nicht: {msg[-700:]}")
+        if pg_ready(cname):
+            job.log(f"Datenbank bereit nach {int(time.time() - t0)} s.")
+            return
+        job.sleep(2)
+    raise RuntimeError("Zeitüberschreitung beim Warten auf die Datenbank.")
+
+
 def wait_ready(job: Job, cname: str, since: float, timeout: int | None = None) -> None:
     timeout = timeout or READY_TIMEOUT
+    lbl = sh(["docker", "inspect", "-f", '{{index .Config.Labels "%s"}}' % ENGINE_LABEL, cname], check=False).stdout.strip()
+    if lbl == PG:
+        pg_wait_ready(job, cname, timeout)
+        return
     job.log(f"Warte auf „{READY_MARK}“ (höchstens {timeout // 60} Minuten) …")
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -792,7 +865,8 @@ def devdbs(cs: list[dict]) -> list[dict]:
             id=did, sid=sid, name=name, release=release, owner=owner,
             base=L.get("devbase") or (f"release:{release}" if release else ""),
             created=L.get("devcreated", ""), port=c["port"], container=c["name"],
-            state=db_state(c), jdbc=jdbc(c["port"], service_name(DEV / did, sid)),
+            state=db_state(c), jdbc=jdbc(c["port"], service_name(DEV / did, sid), c["engine"]),
+            engine=c["engine"], image=c["image"] if c["engine"] == PG else "",
         )
     if DEV.is_dir():
         for p in DEV.iterdir():
@@ -807,7 +881,8 @@ def devdbs(cs: list[dict]) -> list[dict]:
             items[p.name] = dict(id=p.name, sid=sid, name=name, release="", owner=meta.get("owner", ""),
                                  base=meta.get("base", ""),
                                  created=info.get("created") or "", port=None, container=None,
-                                 state="ohne Container", jdbc=None)
+                                 state="ohne Container", jdbc=None, engine=engine_of(p),
+                                 image=read_volume_env(p).get("ZK_IMAGE", ""))
     for d in items.values():
         d["base_label"] = base_label(d)
         d["snapshots"] = devsnaps_of(d["sid"], d["id"])
@@ -824,9 +899,12 @@ def master_info(sid: str, cs: list[dict]) -> dict:
     e = read_volume_env(MASTER / sid)
     port = (c["port"] if c else None) or db_meta(sid).get("port")
     service = service_name(MASTER / sid, sid)
+    eng = PG if e.get("ZK_ENGINE") == PG else ORA
     return dict(container=c["name"] if c else None, state=db_state(c), port=port, service=service,
-                type=e.get("ZK_DB_TYPE", "noncdb"), pdb=e.get("ZK_PDB", ""),
-                jdbc=jdbc(port, service) if c else None, origin=db_meta(sid).get("origin", ""))
+                type=e.get("ZK_DB_TYPE", "noncdb") if eng == ORA else "", pdb=e.get("ZK_PDB", ""),
+                jdbc=jdbc(port, service, eng) if c else None, origin=db_meta(sid).get("origin", ""),
+                engine=eng, image=e.get("ZK_IMAGE", "") if eng == PG else IMAGE,
+                pg_major=data_pg_major(MASTER / sid) if eng == PG else "", pg_user=e.get("ZK_PG_USER", ""))
 
 
 def timeline(sid: str, rels: list[dict], devs: list[dict]) -> list[dict]:
@@ -865,20 +943,39 @@ def job_release(job: Job, sid: str, name: str, description: str,
     (GOLDEN / sid).mkdir(parents=True, exist_ok=True)
     BUILD.mkdir(parents=True, exist_ok=True)
 
+    is_pg = engine_of(src) == PG
+    if is_pg and src == MASTER / sid:
+        c = master_container(sid, containers())
+        if c and c["running"]:
+            job.log("Checkpoint in der Master-DB (verkürzt die Recovery der Kopie)")
+            pg_checkpoint(c["name"])
     job.log(f"Snapshot von {origin or 'Master-DB ' + sid} (die Quelle läuft weiter)")
     job.run(["btrfs", "subvolume", "snapshot", str(src), str(tmp)])
     try:
         check_volume(tmp, sid)
         t0 = time.time()
         job.on_cancel(lambda: sh(["docker", "rm", "-f", bname], check=False))
-        job.run(["docker", "run", "-d", "--name", bname, "--init", "-e", f"ORACLE_SID={sid}",
-                 "-v", f"{tmp}:/opt/oracle/oradata", *docker_extra(tmp), IMAGE])
-        wait_ready(job, bname, t0)
-        sql = release_sql()
-        job.log("Einstellungen für Entwickler-DBs setzen, sauber herunterfahren")
-        job.run(["docker", "exec", "-i", bname, "sqlplus", "-s", "/ as sysdba"],
-                input="whenever sqlerror exit failure\n" + sql + "\nshutdown immediate\nexit\n",
-                timeout=1800)
+        if is_pg:
+            job.run(pg_run_cmd(bname, tmp, None, {}, restart=False))
+            wait_ready(job, bname, t0)
+            extra = (hs("pg_release_sql") or "").strip()
+            if extra:
+                e = read_volume_env(tmp)
+                job.log("Zusätzliches SQL für Releases ausführen")
+                job.run(["docker", "exec", "-i", "-u", "postgres", bname, "psql", "-X", "-v", "ON_ERROR_STOP=1",
+                         "-U", e.get("ZK_PG_USER", "postgres"), "-d", e.get("ZK_PG_DB", "postgres")],
+                        input=extra + "\n", timeout=1800)
+            job.log("Sauber herunterfahren")
+            job.run(["docker", "stop", "-t", "600", bname], timeout=700)
+        else:
+            job.run(["docker", "run", "-d", "--name", bname, "--init", "-e", f"ORACLE_SID={sid}",
+                     "-v", f"{tmp}:/opt/oracle/oradata", *docker_extra(tmp), IMAGE])
+            wait_ready(job, bname, t0)
+            sql = release_sql()
+            job.log("Einstellungen für Entwickler-DBs setzen, sauber herunterfahren")
+            job.run(["docker", "exec", "-i", bname, "sqlplus", "-s", "/ as sysdba"],
+                    input="whenever sqlerror exit failure\n" + sql + "\nshutdown immediate\nexit\n",
+                    timeout=1800)
         job.run(["docker", "rm", "-f", bname])
         job.log("Release schreibgeschützt einfrieren")
         job.run(["btrfs", "subvolume", "snapshot", "-r", str(tmp), str(dst)])
@@ -908,6 +1005,10 @@ def job_release_derive(job: Job, sid: str, name: str, description: str,
 
 def dev_run_cmd(did: str, sid: str, port: int, release: str, owner: str, created: str,
                 base: str) -> list[str]:
+    if engine_of(DEV / did) == PG:
+        labels = [("devdb", "1"), ("devport", str(port)), ("devsid", sid), ("devrelease", release),
+                  ("devowner", owner), ("devbase", base), ("devcreated", created)]
+        return pg_run_cmd(did.lower(), DEV / did, port, dev_settings(sid, did), restart=False, labels=labels)
     return ["docker", "run", "-d", "--name", did.lower(), "--init", "--stop-timeout", "600",
             "--label", "devdb=1", "--label", f"devport={port}", "--label", f"devsid={sid}",
             "--label", f"devrelease={release}", "--label", f"devowner={owner}",
@@ -920,6 +1021,8 @@ def dev_run_cmd(did: str, sid: str, port: int, release: str, owner: str, created
 
 
 def prepare_dumps(did: str, sid: str) -> None:
+    if engine_of(DEV / did) == PG:
+        return
     (DEVDUMPS / did / "19c" / "datapump" / sid).mkdir(parents=True, exist_ok=True)
     sh(["chown", "-R", f"{ORACLE_UID}:{ORACLE_UID}", str(DEVDUMPS / did)])
 
@@ -928,7 +1031,7 @@ def dev_meta_file(sid: str, did: str) -> Path:
     return META / sid / "devdbs" / f"{did}.json"
 
 
-def job_dev_create(job: Job, sid: str, name: str, source: str, owner: str) -> None:
+def job_dev_create(job: Job, sid: str, name: str, source: str, owner: str, image: str = "") -> None:
     src, label, release = resolve_source(sid, source)
     did = f"{sid}-{name}"
     # Besitz auch ohne Container festhalten (z. B. wenn der Start scheitert)
@@ -939,6 +1042,15 @@ def job_dev_create(job: Job, sid: str, name: str, source: str, owner: str) -> No
     DEV.mkdir(parents=True, exist_ok=True)
     job.run(["btrfs", "subvolume", "snapshot", str(src), str(vol)])
     try:
+        if image and engine_of(vol) == PG and image != read_volume_env(vol).get("ZK_IMAGE"):
+            pg_pull(job, image, always=True)
+            have, want = data_pg_major(vol), image_pg_major(image)
+            if have != want:
+                raise RuntimeError(f"Der Ausgangsstand gehört zu PostgreSQL {have}, das gewählte Image bringt {want}.")
+            job.log(f"Version {image.rpartition(':')[2]} statt {read_volume_env(vol).get('ZK_IMAGE', '?').rpartition(':')[2]}")
+            update_volume_env(vol, ZK_IMAGE=image)
+        elif engine_of(vol) == PG:
+            pg_pull(job, read_volume_env(vol)["ZK_IMAGE"])
         check_volume(vol, sid)
         prepare_dumps(did, sid)
         with _port_lock:
@@ -972,6 +1084,8 @@ def job_dev_recreate(job: Job, dev: dict, source: str, new_base: bool = False) -
     job.run(["btrfs", "subvolume", "snapshot", str(src), str(vol)])
     check_volume(vol, sid)
     prepare_dumps(did, sid)
+    if engine_of(vol) == PG:
+        pg_pull(job, read_volume_env(vol)["ZK_IMAGE"])
     with _port_lock:
         t0 = time.time()
         job.run(dev_run_cmd(did, sid, dev["port"], release, dev["owner"],
@@ -990,7 +1104,9 @@ def job_dev_snapshot(job: Job, dev: dict, snap: str, description: str, consisten
         job.log("Entwickler-DB sauber herunterfahren")
         job.run(["docker", "stop", "-t", "600", dev["container"]], timeout=700)
     else:
-        job.log("Snapshot im laufenden Betrieb (absturzkonsistent, Oracle führt beim Start eine Instance Recovery aus)"
+        if running and dev.get("engine") == PG:
+            pg_checkpoint(dev["container"])
+        job.log("Snapshot im laufenden Betrieb (absturzkonsistent, die DB stellt den Stand beim Start selbst wieder her)"
                 if running else "Entwickler-DB ist gestoppt, Snapshot ist konsistent")
     try:
         job.run(["btrfs", "subvolume", "snapshot", "-r", str(DEV / did), str(DEVSNAPS / did / snap)])
@@ -1613,6 +1729,14 @@ def db_sessions(name: str, fresh: bool = False) -> dict:
         hit = _sessions_cache.get(name)
     if hit and not fresh and time.time() - hit[0] < SESSIONS_TTL:
         return hit[1]
+    labels = sh(["docker", "inspect", "-f", '{{index .Config.Labels "%s"}} {{index .Config.Labels "zk.pguser"}}'
+                 % ENGINE_LABEL, name], check=False).stdout.split()
+    if labels and labels[0] == PG:
+        res = pg_sessions(name, labels[1] if len(labels) > 1 else "postgres")
+        res["at"] = now_iso()
+        with _sessions_lock:
+            _sessions_cache[name] = (time.time(), res)
+        return res
     try:
         p = sh(["docker", "exec", "-i", name, "sqlplus", "-s", "-L", "/ as sysdba"], input=SESSIONS_SQL,
                timeout=30, check=False)
@@ -1642,6 +1766,38 @@ def db_sessions(name: str, fresh: bool = False) -> dict:
     with _sessions_lock:
         _sessions_cache[name] = (time.time(), res)
     return res
+
+
+PG_SESSIONS_SQL = r"""select pid, coalesce(datname, '-'), coalesce(usename, '-'),
+       coalesce(client_hostname, host(client_addr), 'lokal'), coalesce(nullif(application_name, ''), '-'),
+       coalesce(state, '-'), extract(epoch from now() - backend_start)::bigint,
+       extract(epoch from now() - coalesce(state_change, backend_start))::bigint, client_addr is null
+  from pg_stat_activity
+ where backend_type = 'client backend' and pid <> pg_backend_pid()
+ order by state, usename, backend_start"""
+
+
+def pg_sessions(name: str, user: str) -> dict:
+    try:
+        p = sh(["docker", "exec", "-u", "postgres", name, "psql", "-X", "-q", "-At", "-F", "\t", "-U", user,
+                "-d", "postgres", "-c", PG_SESSIONS_SQL], timeout=30, check=False)
+    except subprocess.TimeoutExpired:
+        return dict(name=name, error="Zeitüberschreitung bei der Abfrage.", sessions=[])
+    if p.returncode:
+        return dict(name=name, error=(p.stderr or p.stdout).strip()[-300:] or "Datenbank nicht abfragbar.", sessions=[])
+    rows = []
+    for line in p.stdout.splitlines():
+        f = line.split("\t")
+        if len(f) != 9:
+            continue
+        num = lambda v: int(v) if v.lstrip("-").isdigit() else None
+        rows.append(dict(sid=num(f[0]), serial=None, container=f[1], username=f[2], osuser="-", machine=f[3],
+                         program=f[4], module=f[5], status="ACTIVE" if f[5] == "active" else "INACTIVE",
+                         logon_secs=num(f[6]), idle_secs=num(f[7]), local=f[8] == "t"))
+    ext = [r for r in rows if not r["local"]]
+    return dict(name=name, error="", sessions=rows, count=len(ext), engine=PG,
+                active=sum(1 for r in ext if r["status"] == "ACTIVE"), local=len(rows) - len(ext),
+                users=sorted({r["username"] for r in ext}))
 
 
 @bp.get("/api/containers/<name>/sessions")
@@ -1926,8 +2082,13 @@ def api_dev_create(sid):
     did = f"{sid}-{name}"
     if (DEV / did).exists() or any(c["name"] == did.lower() for c in containers()):
         raise UserError(f"Eine Entwickler-DB „{name}“ gibt es für {sid} schon.")
+    image = (data.get("image") or "").strip()
+    if image:
+        if engine_of(MASTER / sid) != PG:
+            raise UserError("Eine Version lässt sich nur bei PostgreSQL-Datenbanken wählen.")
+        image = check_pg_image(image)
     job = start_job(f"Entwickler-DB {name} ({sid}) anlegen", sid, f"dev:{did}",
-                    job_dev_create, sid, name, source, owner)
+                    job_dev_create, sid, name, source, owner, image)
     return jsonify(job=job.as_dict())
 
 
@@ -2478,6 +2639,8 @@ def port_in_use(port: int, cs: list[dict]) -> bool:
 
 def master_run_cmd(sid: str, port: int) -> list[str]:
     vol = MASTER / sid
+    if engine_of(vol) == PG:
+        return pg_run_cmd(sid.lower(), vol, port, db_meta(sid).get("container") or {}, restart=True)
     cmd = ["docker", "run", "-d", "--name", sid.lower(), "--init", "--restart", "unless-stopped",
            "--stop-timeout", "600", "-p", f"{port}:1521", "-e", f"ORACLE_SID={sid}",
            "-v", f"{vol}:/opt/oracle/oradata"]
@@ -2571,10 +2734,11 @@ def settings_target(kind: str, ident: str) -> tuple[str, dict | None, dict, Path
 def settings_view(kind: str, ident: str) -> dict:
     sid, c, saved, _ = settings_target(kind, ident)
     running = bool(c and c["running"])
-    ora = oracle_params(c["name"]) if running else {}
+    eng = engine_of((MASTER / sid) if kind == "master" else (DEV / ident))
+    ora = oracle_params(c["name"]) if running and eng == ORA else {}
     env_shm = read_volume_env((MASTER / sid) if kind == "master" else (DEV / ident)).get("ZK_SHM_SIZE", "")
     return dict(kind=kind, id=ident, sid=sid, container=c["name"] if c else None, running=running,
-                saved=saved, env_shm=env_shm,
+                saved=saved, env_shm=env_shm, engine=eng,
                 actual=dict(memory=c["mem_limit"], cpus=c["nano_cpus"] / 1e9 if c else 0, shm=c["shm_size"]) if c else None,
                 oracle=ora, amm=bool(ora.get("memory_target")), host_mem=os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"),
                 host_cpus=os.cpu_count())
@@ -3281,6 +3445,338 @@ def job_import(job: Job, src: dict, port: int, restart_source: bool) -> None:
         job.run(["docker", "exec", cname, "bash", "-c", "$ORACLE_HOME/OPatch/datapatch -verbose"], timeout=7200)
 
 
+# --------------------------------------------------------------------------- PostgreSQL: Registry und Images
+REGISTRY_FILE = META / "registry.json"
+DEFAULT_PG_REPO = env("PG_REPO", "docker.io/library/postgres")
+RE_IMAGE = re.compile(r"^[a-z0-9][a-z0-9._/:-]{0,250}$")
+TAGS_TTL = 600
+_tags_cache: dict[str, tuple[float, list[str]]] = {}
+
+
+def registry_conf() -> dict:
+    try:
+        c = json.loads(REGISTRY_FILE.read_text())
+    except (OSError, ValueError):
+        c = {}
+    return dict(url=c.get("url") or DEFAULT_PG_REPO, user=c.get("user") or "", password=c.get("password") or "",
+                insecure=bool(c.get("insecure")))
+
+
+def registry_client(conf: dict | None = None) -> registry.Registry:
+    c = conf or registry_conf()
+    try:
+        return registry.Registry(c["url"], c["user"], c["password"], c["insecure"])
+    except registry.RegistryError as e:
+        raise UserError(str(e)) from None
+
+
+def pg_image_base(conf: dict | None = None) -> str:
+    r = registry_client(conf)
+    return registry.image_base(r.host, r.path)
+
+
+def local_tags(base: str) -> set[str]:
+    p = sh(["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"], check=False)
+    return {line.rpartition(":")[2] for line in p.stdout.split() if line.rpartition(":")[0] == base}
+
+
+def registry_tags(force: bool = False) -> dict:
+    conf = registry_conf()
+    r = registry_client(conf)
+    base = registry.image_base(r.host, r.path)
+    key = f"{conf['url']}|{conf['user']}"
+    hit = _tags_cache.get(key)
+    error = ""
+    if hit and not force and time.time() - hit[0] < TAGS_TTL:
+        tags = hit[1]
+    else:
+        try:
+            tags = r.tags()
+            _tags_cache[key] = (time.time(), tags)
+        except registry.RegistryError as e:
+            tags, error = (hit[1] if hit else []), str(e)
+    have = local_tags(base)
+    infos = registry.version_tags(tags)
+    for t in infos:
+        t["image"] = f"{base}:{t['tag']}"
+        t["local"] = t["tag"] in have
+    # lokal vorhandene Versions-Tags auch dann anbieten, wenn die Registry nicht erreichbar ist
+    known = {t["tag"] for t in infos}
+    for tag in have - known:
+        i = registry.tag_info(tag)
+        if i:
+            infos.append(dict(i, image=f"{base}:{tag}", local=True))
+    infos.sort(key=registry.sort_key)
+    return dict(repo=conf["url"], base=base, tags=infos, total=len(tags), error=error)
+
+
+def check_pg_image(image: str) -> str:
+    """Nur Images aus dem eingestellten Repository zulassen (Benutzer dürfen Versionen für Entwickler-DBs wählen)."""
+    image = (image or "").strip()
+    base = pg_image_base()
+    if not RE_IMAGE.match(image) or not image.startswith(base + ":") or "/" in image[len(base) + 1:]:
+        raise UserError(f"Image muss aus {base} stammen, z. B. {base}:17.")
+    return image
+
+
+def docker_login(conf: dict) -> str:
+    """docker login für eine Registry mit Anmeldung, damit docker pull klappt; liefert eine Fehlermeldung oder ''."""
+    if not conf["user"]:
+        return ""
+    r = registry_client(conf)
+    host = "https://index.docker.io/v1/" if r.host == registry.HUB else r.host
+    p = sh(["docker", "login", host, "-u", conf["user"], "--password-stdin"], input=conf["password"],
+           check=False, timeout=60)
+    return "" if p.returncode == 0 else (p.stderr or p.stdout).strip()[-300:]
+
+
+def pg_pull(job: "Job", image: str, always: bool = False) -> None:
+    have = sh(["docker", "image", "inspect", image], check=False).returncode == 0
+    if have and not always:
+        return
+    job.log(f"Image {image} holen")
+    p = job.run(["docker", "pull", "-q", image], timeout=1800, allow_fail=have)
+    if p.returncode and have:
+        job.log("Holen fehlgeschlagen, das vorhandene lokale Image wird verwendet.")
+
+
+def image_config(image: str) -> dict:
+    p = sh(["docker", "image", "inspect", "-f", "{{json .Config}}", image], check=False)
+    if p.returncode:
+        sh(["docker", "pull", "-q", image], timeout=1800)
+        p = sh(["docker", "image", "inspect", "-f", "{{json .Config}}", image])
+    return json.loads(p.stdout or "{}") or {}
+
+
+def image_pg_major(image: str) -> str:
+    envs = dict(x.partition("=")[::2] for x in (image_config(image).get("Env") or []))
+    major = envs.get("PG_MAJOR", "")
+    if not major:
+        raise RuntimeError(f"{image} ist kein PostgreSQL-Image im Stil des offiziellen Images (PG_MAJOR fehlt).")
+    return major
+
+
+def pg_mount_target(image: str) -> str:
+    """Das Subvolume genau auf das VOLUME des Images legen, sonst legt Docker ein anonymes Volume an."""
+    vols = list((image_config(image).get("Volumes") or {}).keys())
+    for m in PG_MOUNTS:
+        if m in vols:
+            return m
+    return PG_MOUNTS[0]
+
+
+def data_pg_major(vol: Path) -> str:
+    try:
+        return (vol / "pgdata" / "PG_VERSION").read_text().strip()
+    except OSError:
+        return ""
+
+
+def pg_run_cmd(name: str, vol: Path, port: int | None, settings: dict, *, restart: bool,
+               labels: list[tuple[str, str]] = (), init_env: list[str] = (), image: str | None = None) -> list[str]:
+    e = read_volume_env(vol)
+    image = image or e["ZK_IMAGE"]
+    target = pg_mount_target(image)
+    cmd = ["docker", "run", "-d", "--name", name, "--init", "--stop-timeout", "600"]
+    if restart:
+        cmd += ["--restart", "unless-stopped"]
+    for k, v in [(ENGINE_LABEL, PG), ("zk.pguser", e.get("ZK_PG_USER", "postgres")), *labels]:
+        cmd += ["--label", f"{k}={v}"]
+    if port:
+        cmd += ["-p", f"{port}:{PG_PORT}"]
+    cmd += ["-e", f"PGDATA={target}/pgdata", "-v", f"{vol}:{target}", *init_env]
+    return cmd + docker_extra(vol) + settings_args(settings) + [image]
+
+
+def pg_checkpoint(cname: str) -> None:
+    """Vor einem Snapshot im laufenden Betrieb: kürzere Recovery beim Start der Kopie."""
+    user = sh(["docker", "inspect", "-f", '{{index .Config.Labels "zk.pguser"}}', cname], check=False).stdout.strip() or "postgres"
+    sh(["docker", "exec", "-u", "postgres", cname, "psql", "-X", "-q", "-U", user, "-d", "postgres", "-c", "checkpoint"],
+       check=False, timeout=600)
+
+
+# --------------------------------------------------------------------------- PostgreSQL: neue Datenbank
+RE_PGNAME = re.compile(r"^[A-Z][A-Z0-9_]{0,15}$")
+RE_PGIDENT = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+PG_LOCALES = ["C.UTF-8", "en_US.UTF-8", "C"]
+
+
+def job_newdb_pg(job: Job, sid: str, image: str, dbname: str, user: str, password: str, locale: str,
+                 checksums: bool, port: int) -> None:
+    vol = MASTER / sid
+    pg_pull(job, image, always=True)
+    major = image_pg_major(image)
+    job.log(f"PostgreSQL {major} aus {image}")
+    uid = sh(["docker", "run", "--rm", "--entrypoint", "id", image, "-u", "postgres"]).stdout.strip()
+    target = pg_mount_target(image)
+    job.run(["btrfs", "subvolume", "create", str(vol)])
+    prepare_new_volume(job, vol)
+    pwfile = vol / ".zk_initpw"
+    cname = sid.lower()
+    try:
+        write_volume_env(vol, dict(ZK_ENGINE=PG, ZK_IMAGE=image, ZK_PG_USER=user, ZK_PG_DB=dbname,
+                                   ZK_SERVICE=dbname, ZK_SHM_SIZE="256m"))
+        pwfile.write_text(password)
+        os.chown(pwfile, int(uid), 0)
+        pwfile.chmod(0o400)
+        args = f"--encoding=UTF8 --locale={locale}" + (" --data-checksums" if checksums else "")
+        init_env = ["-e", f"POSTGRES_PASSWORD_FILE={target}/.zk_initpw", "-e", f"POSTGRES_USER={user}",
+                    "-e", f"POSTGRES_DB={dbname}", "-e", f"POSTGRES_INITDB_ARGS={args}"]
+        job.log("Cluster anlegen (initdb)")
+        t0 = time.time()
+        job.on_cancel(lambda: sh(["docker", "rm", "-f", cname], check=False))
+        job.run(pg_run_cmd(cname, vol, port, {}, restart=True, init_env=init_env))
+        wait_ready(job, cname, t0)
+        job.log("Container ohne die Angaben zum Anlegen neu erzeugen")
+        job.run(["docker", "stop", "-t", "600", cname], timeout=700)
+        job.run(["docker", "rm", cname])
+        pwfile.unlink(missing_ok=True)
+        db_meta_update(sid, port=port, origin=f"neu angelegt ({engine_label(PG)} {major})", created=now_iso())
+        t0 = time.time()
+        job.run(master_run_cmd(sid, port))
+        wait_ready(job, cname, t0)
+    except Exception:
+        sh(["docker", "rm", "-f", cname], check=False)
+        sh(["btrfs", "subvolume", "delete", str(vol)], check=False)
+        sv_forget(vol)
+        db_meta_file(sid).unlink(missing_ok=True)
+        raise
+    finally:
+        pwfile.unlink(missing_ok=True)
+    tl_add(sid, "db-created", f"Datenbank {sid} neu angelegt (PostgreSQL {major}, {image.rpartition(':')[2]})")
+
+
+def newdb_pg_request(data: dict):
+    sid = (data.get("sid") or "").strip().upper()
+    image = check_pg_image(data.get("image"))
+    dbname = (data.get("dbname") or sid.lower()).strip()
+    user = (data.get("user") or "postgres").strip()
+    pwd = data.get("password") or ""
+    locale = data.get("locale") or PG_LOCALES[0]
+    port = int(data.get("port") or 0)
+    if not RE_PGNAME.match(sid):
+        raise UserError("Name: Großbuchstaben, Ziffern, Unterstrich; beginnt mit einem Buchstaben, höchstens 16 Zeichen.")
+    if (MASTER / sid).exists() or any(c["name"] == sid.lower() for c in containers()):
+        raise UserError(f"Eine Datenbank {sid} gibt es auf diesem Host schon.")
+    if not RE_PGIDENT.match(dbname) or not RE_PGIDENT.match(user):
+        raise UserError("Datenbank- und Benutzername: Kleinbuchstaben, Ziffern, Unterstrich; beginnt mit Buchstabe oder _.")
+    if not 8 <= len(pwd) <= 100 or any(ch in pwd for ch in "\r\n"):
+        raise UserError("Passwort: 8 bis 100 Zeichen.")
+    if locale not in PG_LOCALES:
+        raise UserError("Locale nicht unterstützt.")
+    check_new_port(port, None)
+    job = start_job(f"Neue PostgreSQL-Datenbank {sid} anlegen", sid, f"newdb:{sid}", job_newdb_pg, sid, image,
+                    dbname, user, pwd, locale, bool(data.get("checksums", True)), port)
+    return jsonify(job=job.as_dict())
+
+
+# --------------------------------------------------------------------------- PostgreSQL: Version wechseln
+def job_pg_image(job: Job, kind: str, ident: str, image: str) -> None:
+    if kind == "master":
+        sid, vol, c = ident, MASTER / ident, master_container(ident, containers())
+        cname, label = c["name"] if c else ident.lower(), f"Master-DB {ident}"
+    else:
+        dev = find_dev(ident)
+        sid, vol, cname, label = dev["sid"], DEV / ident, dev["container"], f"Entwickler-DB {dev['name']}"
+    old = read_volume_env(vol).get("ZK_IMAGE", "")
+    pg_pull(job, image, always=True)
+    have, want = data_pg_major(vol), image_pg_major(image)
+    if have != want:
+        raise RuntimeError(f"Die Daten gehören zu PostgreSQL {have}, das Image bringt {want}. Innerhalb einer "
+                           "Hauptversion lässt sich wechseln; ein Upgrade braucht pg_upgrade oder Dump und Restore.")
+    cs = containers()
+    cur = next((x for x in cs if x["name"] == cname), None)
+    was_running = bool(cur and cur["running"])
+    if cur:
+        if was_running:
+            job.log(f"{label} sauber herunterfahren")
+            job.run(["docker", "stop", "-t", "600", cname], timeout=700)
+        job.run(["docker", "rm", cname])
+    update_volume_env(vol, ZK_IMAGE=image)
+    tl_add(sid, "image", f"{label}: {old.rpartition(':')[2] or '?'} → {image.rpartition(':')[2]}", ref=ident)
+    if kind == "master":
+        port = (cur["port"] if cur else None) or db_meta(sid).get("port")
+        t0 = time.time()
+        job.run(master_run_cmd(sid, int(port)))
+        wait_ready(job, cname, t0)
+    else:
+        dev = find_dev(ident)
+        t0 = time.time()
+        job.run(dev_run_cmd(ident, sid, dev["port"] or cur["port"], dev["release"], dev["owner"],
+                            dev["created"] or now_iso(), dev["base"]))
+        wait_ready(job, cname, t0)          # auch eine gestoppte DB einmal starten: prüft die neue Version
+        if not was_running:
+            job.run(["docker", "stop", "-t", "600", cname], timeout=700)
+
+
+def start_image_job(kind: str, ident: str):
+    data = request.get_json(force=True) or {}
+    image = check_pg_image(data.get("image"))
+    if kind == "master":
+        vol = MASTER / need_sid(ident)
+    else:
+        dev = find_dev(ident)
+        if not dev["container"] or not dev["port"]:
+            raise UserError("Zu dieser Entwickler-DB gibt es keinen Container; sie lässt sich nur löschen.")
+        vol = DEV / dev["id"]
+    if engine_of(vol) != PG:
+        raise UserError("Die Version lässt sich nur bei PostgreSQL-Datenbanken wählen.")
+    if read_volume_env(vol).get("ZK_IMAGE") == image:
+        raise UserError("Diese Version ist bereits eingestellt.")
+    label = f"Master-DB {ident}" if kind == "master" else f"Entwickler-DB {ident.partition('-')[2]}"
+    key = f"master:{ident}" if kind == "master" else f"dev:{ident}"
+    sid = ident if kind == "master" else ident.partition("-")[0]
+    job = start_job(f"{label} auf {image.rpartition(':')[2]} umstellen", sid, key, job_pg_image, kind, ident, image)
+    return jsonify(job=job.as_dict())
+
+
+@bp.post("/api/db/<sid>/image")
+def api_master_image(sid):
+    return start_image_job("master", sid)
+
+
+@bp.post("/api/devdbs/<did>/image")
+def api_dev_image(did):
+    return start_image_job("dev", did)
+
+
+# --------------------------------------------------------------------------- PostgreSQL: Registry-Routen
+@bp.get("/api/registry")
+def api_registry_get():
+    c = registry_conf()
+    return jsonify(url=c["url"], user=c["user"], has_password=bool(c["password"]), insecure=c["insecure"],
+                   base=pg_image_base(c))
+
+
+@bp.put("/api/registry")
+def api_registry_put():
+    data = request.get_json(force=True) or {}
+    old = registry_conf()
+    conf = dict(url=(data.get("url") or "").strip() or DEFAULT_PG_REPO, user=(data.get("user") or "").strip(),
+                password=data.get("password") if data.get("password") else (old["password"] if data.get("user") == old["user"] else ""),
+                insecure=bool(data.get("insecure")))
+    if not conf["user"]:
+        conf["password"] = ""
+    r = registry_client(conf)        # prüft das Format
+    try:
+        n = len(registry.version_tags(r.tags()))
+    except registry.RegistryError as e:
+        raise UserError(f"Registry nicht nutzbar: {e}") from None
+    login_err = docker_login(conf)
+    REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    write_json(REGISTRY_FILE, conf)
+    REGISTRY_FILE.chmod(0o600)
+    _tags_cache.clear()
+    log.info("Postgres-Registry geändert von %s: %s", actor(), conf["url"])
+    return jsonify(ok=True, versions=n, base=registry.image_base(r.host, r.path),
+                   warning=f"docker login fehlgeschlagen: {login_err}" if login_err else "")
+
+
+@bp.get("/api/registry/tags")
+def api_registry_tags():
+    return jsonify(registry_tags(force=request.args.get("refresh") == "1"))
+
+
 # --------------------------------------------------------------------------- Routen für Master, Neuanlage, Import
 @bp.get("/api/summary")
 def api_summary():
@@ -3338,12 +3834,14 @@ def api_master(sid, action):
 @bp.get("/api/newdb/check")
 def api_newdb_check():
     reason = image_can_create()
-    return jsonify(ok=reason is None, reason=reason, image=IMAGE, charsets=CHARSETS)
+    return jsonify(ok=reason is None, reason=reason, image=IMAGE, charsets=CHARSETS, pg_locales=PG_LOCALES)
 
 
 @bp.post("/api/newdb")
 def api_newdb():
     data = request.get_json(force=True)
+    if data.get("engine") == PG:
+        return newdb_pg_request(data)
     sid = (data.get("sid") or "").strip().upper()
     pdb = (data.get("pdb") or "").strip().upper()
     pwd = data.get("password") or ""
@@ -4161,8 +4659,12 @@ def db_target(kind: str, ident: str) -> tuple[str, dict | None, Path, str]:
     cs = containers()
     if kind == "master":
         need_sid(ident)
+        if engine_of(MASTER / ident) == PG:
+            raise UserError("Sicherungen und Data-Pump-Importe gibt es nur für Oracle-Datenbanken.")
         return ident, master_container(ident, cs), MASTER / ident, f"Master-DB {ident}"
     dev = find_dev(ident)
+    if dev.get("engine") == PG:
+        raise UserError("Sicherungen und Data-Pump-Importe gibt es nur für Oracle-Datenbanken.")
     c = next((x for x in cs if x["name"] == dev["container"]), None)
     return dev["sid"], c, DEV / ident, f"Entwickler-DB {dev['name']}"
 

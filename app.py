@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-zeitkapsel – Oracle-Datenbanken in Docker auf btrfs: Releases, Entwickler-DBs, Snapshots.
+zeitkapsel – Oracle- und PostgreSQL-Datenbanken in Docker auf btrfs: Releases, Entwickler-DBs, Snapshots.
 
 Rollen (ZK_ROLE)
   all         Controller und Agent in einem Prozess (erster bzw. einziger Host)

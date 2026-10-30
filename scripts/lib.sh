@@ -33,6 +33,10 @@ zk_extra_args() {   # zusätzliche docker-run-Argumente aus <vol>/zeitkapsel.env
 
 zk_check_volume() {   # ohne Markierungsdateien würde das Startskript des Images Daten löschen
   local vol=$1 sid=$2 f
+  if grep -qs '^ZK_ENGINE="\?postgres' "$vol/zeitkapsel.env"; then
+    echo "$vol ist eine PostgreSQL-Datenbank; die Skripte unterstützen nur Oracle – bitte die Oberfläche nutzen." >&2
+    return 1
+  fi
   for f in "$vol/.$sid.created" "$vol/dbconfig/$sid/spfile$sid.ora" "$vol/dbconfig/$sid/orapw$sid"; do
     [ -e "$f" ] || { echo "FEHLT: $f – abgebrochen" >&2; return 1; }
   done

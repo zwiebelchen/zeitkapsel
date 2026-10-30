@@ -256,6 +256,15 @@ table.snap td.num { text-align: right; white-space: nowrap; }
 table.snap tr.logrow td { background: #f0f3f1; padding: 0; }
 table.snap tr.logrow pre { margin: 0; padding: 10px 14px; font-size: 12px; line-height: 1.4; max-height: 420px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
 dialog.wide { width: min(1100px, calc(100vw - 24px)); }
+.tag.pg { border-color: #336791; color: #336791; }
+fieldset.plain { border: 0; padding: 0; margin: 0; min-width: 0; display: grid; gap: 12px; }
+fieldset.plain[disabled] { display: none; }
+.engine-pick { display: flex; gap: 8px; margin-bottom: 4px; }
+.engine-pick label { flex: 1; border: 1px solid var(--rule); border-radius: 8px; padding: 8px 10px; cursor: pointer; font-size: 14px; }
+.engine-pick label:has(input:checked) { border-color: var(--release); box-shadow: 0 0 0 1px var(--release) inset; }
+.engine-pick small { display: block; color: var(--muted); font-size: 12.5px; }
+.vrow { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.vrow select { flex: 1; min-width: 180px; }
 button.sess { font-size: 12.5px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--rule); background: transparent; color: var(--muted); cursor: pointer; }
 button.sess.busy { border-color: #b0731b; color: #b0731b; font-weight: 600; }
 button.sess.idle { border-color: var(--rule-soft); }
@@ -384,11 +393,30 @@ form.hset label.field input, form.hset label.field textarea { width: 100%; box-s
     <label class="field">Ausgangsstand
       <select name="source" required></select>
     </label>
+    <label class="field js-pgver" hidden>PostgreSQL-Version
+      <div class="vrow"><select name="image" class="js-versions"></select>
+        <label class="check"><input type="checkbox" class="js-variants"> Varianten</label></div>
+      <small class="js-vinfo"></small></label>
     <label class="field js-owner">Für Benutzer
       <select name="owner"></select>
     </label>
     <p class="form-error"></p>
     <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Entwickler-DB anlegen</button></div>
+  </form>
+</dialog>
+
+<!-- PostgreSQL-Version wechseln -->
+<dialog id="dlgImage">
+  <form method="dialog" id="fImage">
+    <h2>Version ändern: <span class="js-name"></span></h2>
+    <p class="lead js-lead"></p>
+    <label class="field">Neue Version
+      <div class="vrow"><select name="image" required class="js-versions"></select>
+        <label class="check"><input type="checkbox" class="js-variants"> Varianten</label>
+        <button type="button" class="small quiet js-vreload">Neu laden</button></div>
+      <small class="js-vinfo"></small></label>
+    <p class="form-error"></p>
+    <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Version wechseln</button></div>
   </form>
 </dialog>
 
@@ -406,7 +434,7 @@ form.hset label.field input, form.hset label.field textarea { width: 100%; box-s
     </label>
     <label class="check"><input type="checkbox" name="consistent" value="1">
       <span>DB dafür kurz herunterfahren
-        <small>Ergibt einen sauber geschlossenen Stand; die DB ist dafür ein bis zwei Minuten nicht erreichbar. Ohne Haken entsteht der Snapshot sofort im laufenden Betrieb; Oracle stellt den Stand beim nächsten Start selbst wieder her.</small></span>
+        <small>Ergibt einen sauber geschlossenen Stand; die DB ist dafür ein bis zwei Minuten nicht erreichbar. Ohne Haken entsteht der Snapshot sofort im laufenden Betrieb; die Datenbank stellt den Stand beim nächsten Start selbst wieder her.</small></span>
     </label>
     <p class="form-error"></p>
     <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Snapshot erstellen</button></div>
@@ -496,7 +524,36 @@ form.hset label.field input, form.hset label.field textarea { width: 100%; box-s
 <dialog id="dlgNewDb">
   <form method="dialog" id="fNewDb">
     <h2>Neue Datenbank anlegen</h2>
-    <p class="lead">Legt auf <b class="js-host"></b> eine leere Datenbank mit eigenem Container an – als klassische Non-CDB wie die bisherigen, oder mit PDB, wenn du einen PDB-Namen angibst. dbca braucht dafür 15 bis 45 Minuten.</p>
+    <div class="engine-pick">
+      <label><input type="radio" name="engine" value="oracle" checked> Oracle 19c<small>dbca, 15 bis 45 Minuten</small></label>
+      <label><input type="radio" name="engine" value="postgres"> PostgreSQL<small>Version aus der Registry, unter einer Minute</small></label>
+    </div>
+    <fieldset class="plain js-pg-fields" disabled>
+      <p class="lead" style="margin:0">Legt auf <b class="js-host"></b> einen leeren PostgreSQL-Cluster mit eigenem Container an. Image aus <code class="js-repo"></code>.</p>
+      <div class="row2">
+        <label class="field">Name <input name="sid" required maxlength="16" pattern="[A-Za-z][A-Za-z0-9_]*" placeholder="z. B. SHOP" autocomplete="off"><small>wie die SID bei Oracle; Großbuchstaben</small></label>
+        <label class="field">Port <input type="number" name="port" required min="1024" max="65535" value="5432"></label>
+      </div>
+      <label class="field">Version
+        <div class="vrow"><select name="image" required class="js-versions"></select>
+          <label class="check"><input type="checkbox" class="js-variants"> Varianten (alpine, bookworm …)</label>
+          <button type="button" class="small quiet js-vreload">Neu laden</button></div>
+        <small class="js-vinfo"></small></label>
+      <div class="row2">
+        <label class="field">Datenbank <input name="dbname" maxlength="63" pattern="[a-z_][a-z0-9_]*" placeholder="leer = Name in Kleinbuchstaben" autocomplete="off"><small>wird mit angelegt (POSTGRES_DB)</small></label>
+        <label class="field">Superuser <input name="user" value="postgres" required maxlength="63" pattern="[a-z_][a-z0-9_]*" autocomplete="off"></label>
+      </div>
+      <div class="row2">
+        <label class="field">Passwort <input type="password" name="password" required minlength="8" maxlength="100" autocomplete="new-password"><small>für den Superuser</small></label>
+        <label class="field">Passwort wiederholen <input type="password" name="password2" required autocomplete="new-password"></label>
+      </div>
+      <div class="row2">
+        <label class="field">Locale <select name="locale" class="js-locales"></select><small>Kodierung immer UTF8</small></label>
+        <label class="check" style="align-self:center"><input type="checkbox" name="checksums" value="1" checked><span>Datenprüfsummen <small>initdb --data-checksums</small></span></label>
+      </div>
+    </fieldset>
+    <fieldset class="plain js-ora-fields">
+    <p class="lead" style="margin:0">Legt auf <b class="js-host"></b> eine leere Datenbank mit eigenem Container an – als klassische Non-CDB wie die bisherigen, oder mit PDB, wenn du einen PDB-Namen angibst. dbca braucht dafür 15 bis 45 Minuten.</p>
     <div class="row2">
       <label class="field">SID <input name="sid" required maxlength="8" pattern="[A-Za-z][A-Za-z0-9]*" placeholder="z. B. KUNDE1" autocomplete="off"><small>höchstens 8 Zeichen</small></label>
       <label class="field">PDB <small>optional</small> <input name="pdb" maxlength="30" pattern="[A-Za-z][A-Za-z0-9_]*" placeholder="leer lassen = Non-CDB" autocomplete="off"><small>nur für eine Container-DB mit PDB</small></label>
@@ -511,6 +568,7 @@ form.hset label.field input, form.hset label.field textarea { width: 100%; box-s
       <label class="field">Passwort wiederholen <input type="password" name="password2" required autocomplete="new-password"></label>
     </div>
     <p class="hint-box js-imgwarn" hidden></p>
+    </fieldset>
     <p class="form-error"></p>
     <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Datenbank anlegen</button></div>
   </form>
@@ -676,6 +734,7 @@ form.hset label.field input, form.hset label.field textarea { width: 100%; box-s
       </div>
       <label class="check" style="margin-top:8px"><input type="checkbox" name="restart" value="1"><span>Datenbank danach neu starten <small>Oracle übernimmt geänderte Werte erst beim nächsten Start; ohne Haken wirken sie beim nächsten Neustart.</small></span></label>
     </fieldset>
+    <p class="muted-note js-pg-note" hidden>PostgreSQL-Parameter wie shared_buffers oder work_mem setzt du mit <code>ALTER SYSTEM</code> in der Datenbank; sie liegen in <code>postgresql.auto.conf</code> und wandern mit jedem Snapshot mit.</p>
     <p class="hint-box js-ora-off" hidden>Die Datenbank läuft nicht; Oracle-Parameter lassen sich nur bei laufender DB ändern. Die Container-Einstellungen gelten beim nächsten Start.</p>
     <p class="form-error"></p>
     <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Übernehmen</button></div>
@@ -897,7 +956,7 @@ function renderNav() {
       return `<div class="navdb">
         <a href="${link({ h: h.id, db: d.sid })}" ${cur(here && view.kind === "db" && db && d.sid === db.sid && !view.dev)}>
           <span class="dot ${STATE[d.state] || ""}" title="${esc(d.state)}"></span>
-          <span>${esc(d.sid)}</span><span class="port">${d.port ?? ""}</span></a>
+          <span>${esc(d.sid)}${d.engine === "postgres" ? ' <span class="tag pg" title="PostgreSQL">PG</span>' : ""}</span><span class="port">${d.port ?? ""}</span></a>
         ${devs.length ? `<button class="navtoggle" data-act="nav-toggle" data-key="${esc(key)}" aria-expanded="${open ? "true" : "false"}"
           title="${devs.length} Entwickler-DB${devs.length === 1 ? "" : "s"} ${open ? "einklappen" : "ausklappen"}">${open ? "▾" : "▸"}<span>${devs.length}</span></button>` : ""}
         ${devLinks}</div>`;
@@ -937,6 +996,7 @@ function renderDb(db) {
         ${m.port ? `<span>Port ${m.port}</span>` : ""}
         ${m.container && m.state !== "gestoppt" && m.state !== "kein Container" ? sessBadge(m.container, isAdmin()) : ""}
         ${m.type === "cdb" ? `<span>Container-DB, PDB ${esc(m.pdb)}</span>` : ""}
+        ${isPg(m) ? `<span class="tag pg" title="${esc(m.image)}">PostgreSQL ${esc(imgTag(m.image))}</span>${m.pg_user ? `<span>Superuser ${esc(m.pg_user)}</span>` : ""}` : ""}
         ${m.jdbc ? jdbcField(m.jdbc) : (m.container ? "" : `<span>Master-Container nicht gefunden</span>`)}
       </div>
       <div class="actions">
@@ -945,7 +1005,8 @@ function renderDb(db) {
             : `<button data-act="master-stop">Master stoppen</button>`}
           <button data-act="master-port" data-sid="${esc(db.sid)}" data-port="${m.port || ""}">Port ändern</button>
           <button data-act="settings" data-kind="master" data-id="${esc(db.sid)}">Einstellungen</button>
-          ${m.state === "bereit" ? `<button data-act="backup" data-kind="master" data-id="${esc(db.sid)}" data-label="Master-DB ${esc(db.sid)}">Sichern</button>` : ""}
+          ${isPg(m) ? `<button data-act="pg-image" data-kind="master" data-id="${esc(db.sid)}">Version ändern</button>` : ""}
+          ${m.state === "bereit" && !isPg(m) ? `<button data-act="backup" data-kind="master" data-id="${esc(db.sid)}" data-label="Master-DB ${esc(db.sid)}">Sichern</button>` : ""}
           <button data-act="note-add">Notiz hinzufügen</button>
           <button class="primary" data-act="release-new" ${db.release_busy ? 'disabled title="Ein Release wird gerade erstellt"' : ""}>${db.release_busy ? "Release wird erstellt …" : "Release erstellen"}</button>` : ""}
       </div>
@@ -1110,6 +1171,7 @@ function renderDevs(db) {
         <span>${d.owner ? "gehört " + esc(d.owner) : "Besitzer unbekannt"}</span>
         <span>${d.base_label ? "aus " + esc(d.base_label) : "Ausgangsstand unbekannt"}</span>
         ${d.port ? `<span>Port ${d.port}</span>` : ""}
+        ${isPg(d) && d.image ? `<span class="tag pg" title="${esc(d.image)}">PostgreSQL ${esc(imgTag(d.image))}</span>` : ""}
         ${d.created ? `<span>angelegt ${fmtTime(d.created, false)}</span>` : ""}
         ${d.container && running ? sessBadge(d.container, mine) : ""}
       </div>
@@ -1122,7 +1184,8 @@ function renderDevs(db) {
         ${noCont ? "" : `<button class="quiet small" data-act="dev-reset" data-id="${esc(d.id)}" ${working || !d.base ? "disabled" : ""}>Auf Ausgangsstand zurücksetzen</button>`}
         <button class="quiet small" data-act="dev-port" data-id="${esc(d.id)}" data-port="${d.port || ""}" ${working ? "disabled" : ""}>Port ändern</button>
         <button class="quiet small" data-act="settings" data-kind="dev" data-id="${esc(d.id)}" ${working ? "disabled" : ""}>Einstellungen</button>
-        ${d.state === "bereit" ? `<button class="quiet small" data-act="backup" data-kind="dev" data-id="${esc(d.id)}" data-label="Entwickler-DB ${esc(d.name)}" ${working ? "disabled" : ""}>Sichern</button>` : ""}
+        ${isPg(d) && !noCont ? `<button class="quiet small" data-act="pg-image" data-kind="dev" data-id="${esc(d.id)}" ${working ? "disabled" : ""}>Version ändern</button>` : ""}
+        ${d.state === "bereit" && !isPg(d) ? `<button class="quiet small" data-act="backup" data-kind="dev" data-id="${esc(d.id)}" data-label="Entwickler-DB ${esc(d.name)}" ${working ? "disabled" : ""}>Sichern</button>` : ""}
         ${isAdmin() ? `<button class="quiet small" data-act="dev-owner" data-id="${esc(d.id)}">Besitzer ändern</button>` : ""}
         <button class="quiet small danger" data-act="dev-del" data-id="${esc(d.id)}" ${working ? "disabled" : ""}>Löschen</button>
       </div>` : ""}
@@ -1152,8 +1215,9 @@ function allSnapshots(db) {
 
 async function loadAdmin() {
   try {
-    const [sch, sys, hset] = await Promise.all([api("GET", "/api/schedules"), api("GET", "/api/admin"), api("GET", "/api/host-settings")]);
-    admin = { ...sch, sys, hset };
+    const [sch, sys, hset, reg] = await Promise.all([api("GET", "/api/schedules"), api("GET", "/api/admin"), api("GET", "/api/host-settings"),
+                                                     api("GET", "/api/registry").catch(() => null)]);
+    admin = { ...sch, sys, hset, reg };
     render();
   } catch (e) { toast(e.message); }
 }
@@ -1224,6 +1288,7 @@ function renderAdmin() {
       </section>
       <section aria-labelledby="h-sys">
         ${hostSettingsHtml(admin.hset)}
+        ${registryHtml(admin.reg)}
         <div class="section-head" style="margin-top:26px"><h2 id="h-sys">System</h2></div>
         <dl class="facts-list">
           <dt>Host</dt><dd>${esc(sys.host)}</dd>
@@ -1425,7 +1490,7 @@ function dpPlanHtml(plan, host, freePort) {
 function dumpPlanHtml(plan, host, freePort) {
   const m = plan.meta || {};
   const targets = [];
-  for (const db of S.dbs) {
+  for (const db of S.dbs.filter(d => d.master.engine !== "postgres")) {
     targets.push([`master:${db.sid}`, `Master-DB ${db.sid}`]);
     for (const d of db.devdbs) targets.push([`dev:${d.id}`, `Entwickler-DB ${d.name} (${db.sid}, ${d.owner || "–"})`]);
   }
@@ -1827,6 +1892,45 @@ function canLogs(name, db) {
   return !!(d && d.owner === O.me.username);
 }
 
+/* ------------------------------------------------------------ PostgreSQL-Versionen aus der Registry */
+const pgTagsCache = {};   // je Host: { at, data }
+async function loadPgTags(force) {
+  const c = pgTagsCache[view.hid];
+  if (!force && c && Date.now() - c.at < 300000) return c.data;
+  const data = await api("GET", "/api/registry/tags" + (force ? "?refresh=1" : ""));
+  pgTagsCache[view.hid] = { at: Date.now(), data };
+  return data;
+}
+const imgTag = image => (image || "").split(":").pop();
+function isPg(x) { return x && x.engine === "postgres"; }
+/* Füllt ein Versions-Select; opts.major beschränkt auf eine Hauptversion, opts.keep = Eintrag „wie bisher“ */
+async function fillVersions(root, opts = {}) {
+  const sel = $(".js-versions", root), varCb = $(".js-variants", root), info = $(".js-vinfo", root), reload = $(".js-vreload", root);
+  const draw = data => {
+    const wantVar = varCb && varCb.checked;
+    let tags = data.tags.filter(t => (wantVar || !t.variant) && (!opts.major || String(t.major) === String(opts.major)));
+    const groups = {};
+    for (const t of tags) (groups[t.major] = groups[t.major] || []).push(t);
+    const cur = opts.current ? `<option value="" selected>${opts.keep ? esc(opts.keep) : `wie bisher (${esc(imgTag(opts.current))})`}</option>` : "";
+    sel.innerHTML = cur + Object.keys(groups).sort((a, b) => b - a).map(m => `<optgroup label="PostgreSQL ${m}">${groups[m].map(t =>
+      `<option value="${esc(t.image)}" ${t.image === opts.current && !opts.keep ? "disabled" : ""}>${esc(t.tag)}${t.local ? " · lokal" : ""}</option>`).join("")}</optgroup>`).join("");
+    if (!opts.current) {
+      const pick = tags.find(t => !t.variant && t.minor != null) || tags[0];   // neueste konkrete Version, z. B. 17.6
+      if (pick) sel.value = pick.image;
+    }
+    if (info) info.textContent = data.error ? `Registry: ${data.error}${data.tags.length ? " – angezeigt werden lokal vorhandene Images." : ""}`
+      : `${data.repo}: ${data.tags.length} Versions-Tags` + (opts.major ? `, angezeigt nur PostgreSQL ${opts.major} (die Daten gehören zu dieser Hauptversion)` : "")
+        + "; „lokal“ = schon auf dem Host, startet ohne Download.";
+  };
+  sel.innerHTML = "<option value=\"\">Lade Versionen …</option>";
+  try {
+    let data = await loadPgTags();
+    draw(data);
+    if (varCb) varCb.onchange = () => draw(data);
+    if (reload) reload.onclick = async () => { sel.innerHTML = "<option>Lade …</option>"; data = await loadPgTags(true); draw(data); };
+  } catch (e) { sel.innerHTML = ""; if (info) info.textContent = e.message; }
+}
+
 /* ------------------------------------------------------------ Sitzungen */
 const sessCache = {};   // je Host: { at, data: { <container>: {count, active, local, users, error} } }
 function sessInfo(name) {
@@ -1903,16 +2007,17 @@ function openSessions(name) {
     const rows = r.sessions.filter(x => showLocal || !x.local);
     $(".js-sum", dlg).textContent = (r.count ? `${sessText(r)} von außen` : "Keine Sitzungen von außen – die Datenbank kann gefahrlos angehalten werden.")
       + (r.local ? ` · ${r.local} interne (Healthcheck, docker exec)` : "") + ` · Stand ${fmtTime(r.at)}`;
-    const cdb = new Set(r.sessions.map(x => x.container)).size > 1 || r.sessions.some(x => x.container === "CDB$ROOT");
+    const pg = r.engine === "postgres";
+    const cdb = pg || new Set(r.sessions.map(x => x.container)).size > 1 || r.sessions.some(x => x.container === "CDB$ROOT");
     $(".js-table", dlg).innerHTML = rows.length ? `<table class="snap"><thead><tr>
-        <th>DB-Benutzer</th>${cdb ? "<th>Container</th>" : ""}<th>Status</th><th>OS-Benutzer</th><th>Rechner</th><th>Programm</th><th>Modul</th>
-        <th class="num">angemeldet seit</th><th class="num">letzte Aktivität vor</th><th class="num">SID, Serial#</th></tr></thead><tbody>
+        <th>DB-Benutzer</th>${cdb ? `<th>${pg ? "Datenbank" : "PDB"}</th>` : ""}<th>Status</th>${pg ? "" : "<th>OS-Benutzer</th>"}<th>Rechner</th><th>Programm</th><th>${pg ? "Zustand" : "Modul"}</th>
+        <th class="num">angemeldet seit</th><th class="num">letzte Aktivität vor</th><th class="num">${pg ? "PID" : "SID, Serial#"}</th></tr></thead><tbody>
       ${rows.map(x => `<tr class="${x.local ? "sess-local" : ""}">
         <td class="nw"><b>${esc(x.username)}</b>${x.local ? ' <span class="tag">intern</span>' : ""}</td>${cdb ? `<td class="nw">${esc(x.container)}</td>` : ""}
         <td class="nw">${pillPlain(x.status === "ACTIVE" ? "aktiv" : "inaktiv", x.status === "ACTIVE" ? "warn" : "off")}</td>
-        <td class="nw">${esc(x.osuser)}</td><td class="nw">${esc(x.machine)}</td><td>${esc(x.program)}</td><td>${esc(x.module)}</td>
+        ${pg ? "" : `<td class="nw">${esc(x.osuser)}</td>`}<td class="nw">${esc(x.machine)}</td><td>${esc(x.program)}</td><td>${esc(x.module)}</td>
         <td class="num nw">${fmtSecs(x.logon_secs)}</td><td class="num nw">${fmtSecs(x.idle_secs)}</td>
-        <td class="num nw">${x.sid}, ${x.serial}</td></tr>`).join("")}</tbody></table>` : "";
+        <td class="num nw">${x.sid}${x.serial != null ? ", " + x.serial : ""}</td></tr>`).join("")}</tbody></table>` : "";
   };
   const load = async () => {
     try { last = await api("GET", `/api/containers/${encodeURIComponent(name)}/sessions?fresh=1`); }
@@ -2057,6 +2162,8 @@ function hostSettingsHtml(h) {
       <label class="field">Zusätzliches SQL beim Release-Erstellen <small>z. B. Passwörter zurücksetzen, Jobs abschalten, Daten anonymisieren; läuft als SYSDBA vor dem Herunterfahren</small>
         <textarea name="release_extra_sql" rows="4" placeholder="alter user app identified by Entwickler1;" ${h.release_sql_file ? "disabled" : ""}>${esc(s.release_extra_sql || "")}</textarea>
         ${h.release_sql_file ? `<small class="bad">ZK_RELEASE_SQL_FILE (${esc(h.release_sql_file)}) ist gesetzt und hat Vorrang; SGA, PGA und dieses Feld wirken dann nicht.</small>` : ""}</label>
+      <label class="field">SQL beim Release-Erstellen (PostgreSQL) <small>läuft per psql als Superuser in der Hauptdatenbank der Kopie, bevor sie sauber heruntergefahren wird</small>
+        <textarea name="pg_release_sql" rows="3" placeholder="alter role app password 'entwickler';">${esc(s.pg_release_sql || "")}</textarea></label>
       <div class="row3">
         <label class="field">CPU-Kerne <input type="number" name="dev_cpus" min="0" step="any" placeholder="unbegrenzt" value="${n(s.dev_cpus)}"></label>
         <label class="field">RAM-Limit (MB) <input type="number" name="dev_memory_mb" min="0" step="any" placeholder="unbegrenzt" value="${n(s.dev_memory_mb)}"></label>
@@ -2069,6 +2176,22 @@ function hostSettingsHtml(h) {
       </div>
       <p class="form-error"></p>
       <div><button class="primary" type="button" data-act="hset-save">Vorgaben speichern</button></div>
+    </form>`;
+}
+
+function registryHtml(r) {
+  if (!r) return "";
+  return `<div class="section-head" style="margin-top:26px"><h2>PostgreSQL-Images</h2></div>
+    <form id="fReg" class="hset" onsubmit="return false">
+      <p class="muted-note" style="margin:0">Repository, aus dem neue PostgreSQL-Datenbanken und Versionswechsel ihre Images holen. Docker Hub: <code>docker.io/library/postgres</code>; eigene Registry z. B. <code>registry.intern:5000/postgres</code>. Erwartet wird ein Image im Stil des offiziellen (Umgebungsvariablen POSTGRES_*, PG_MAJOR).</p>
+      <label class="field">Repository <input name="url" value="${esc(r.url)}" required autocomplete="off"><small>lokal als <code>${esc(r.base)}:&lt;Version&gt;</code></small></label>
+      <div class="row2">
+        <label class="field">Benutzer <small>optional</small> <input name="user" value="${esc(r.user)}" autocomplete="off"></label>
+        <label class="field">Passwort bzw. Token <input type="password" name="password" autocomplete="new-password" placeholder="${r.has_password ? "gespeichert – leer lassen" : ""}"></label>
+      </div>
+      <label class="check"><input type="checkbox" name="insecure" value="1" ${r.insecure ? "checked" : ""}><span>Ohne gültiges TLS-Zertifikat bzw. per HTTP <small>Docker selbst braucht dafür einen Eintrag unter insecure-registries in /etc/docker/daemon.json</small></span></label>
+      <p class="form-error"></p>
+      <div><button class="primary" type="button" data-act="reg-save">Prüfen und speichern</button></div>
     </form>`;
 }
 
@@ -2278,16 +2401,54 @@ document.addEventListener("click", async ev => {
       }
       case "newdb": {
         const chk = await api("GET", "/api/newdb/check");
+        let repo = "";
+        try { repo = (await loadPgTags()).repo; } catch {}
         openDialog("dlgNewDb", f => {
-          $(".js-host", f).textContent = currentHost().name;
-          f.charset.innerHTML = chk.charsets.map(c => `<option>${c}</option>`).join("");
+          const ora = $(".js-ora-fields", f), pg = $(".js-pg-fields", f);
+          f.querySelectorAll(".js-host").forEach(x => { x.textContent = currentHost().name; });
+          $(".js-repo", f).textContent = repo || "(Registry unter Verwaltung einstellen)";
+          $("[name=charset]", ora).innerHTML = chk.charsets.map(c => `<option>${c}</option>`).join("");
+          $(".js-locales", pg).innerHTML = (chk.pg_locales || ["C.UTF-8"]).map(c => `<option>${c}</option>`).join("");
           const used = new Set(S.dbs.map(d => d.master.port));
-          let p = 1522; while (used.has(p)) p++; f.port.value = p;
+          const freeFrom = p => { while (used.has(p)) p++; return p; };
+          $("[name=port]", ora).value = freeFrom(1522); $("[name=port]", pg).value = freeFrom(5432);
           $(".js-imgwarn", f).hidden = chk.ok;
           $(".js-imgwarn", f).textContent = chk.ok ? "" : `Das Image kann keine neuen Datenbanken anlegen (${chk.reason}). Erst das Korrektur-Image aus docker/Dockerfile.fix bauen.`;
+          let loaded = false;
+          const sw = () => {
+            const isPgSel = f.querySelector("input[name=engine]:checked").value === "postgres";
+            ora.disabled = isPgSel; pg.disabled = !isPgSel;
+            if (isPgSel && !loaded) { loaded = true; fillVersions(pg); }
+          };
+          f.querySelectorAll("input[name=engine]").forEach(r => { r.onchange = sw; });
+          sw();
         }, async v => {
           if (v.password !== v.password2) throw new Error("Die Passwörter stimmen nicht überein.");
-          startedJob(await api("POST", "/api/newdb", { sid: v.sid.toUpperCase(), pdb: (v.pdb || "").trim().toUpperCase(), password: v.password, charset: v.charset, port: +v.port, memory_mb: +v.memory_mb }));
+          if (v.engine === "postgres") {
+            if (!v.image) throw new Error("Bitte eine Version wählen.");
+            startedJob(await api("POST", "/api/newdb", { engine: "postgres", sid: v.sid.toUpperCase(), image: v.image, port: +v.port,
+              dbname: (v.dbname || "").trim() || v.sid.toLowerCase(), user: v.user, password: v.password, locale: v.locale, checksums: !!v.checksums }));
+          } else {
+            startedJob(await api("POST", "/api/newdb", { sid: v.sid.toUpperCase(), pdb: (v.pdb || "").trim().toUpperCase(), password: v.password, charset: v.charset, port: +v.port, memory_mb: +v.memory_mb }));
+          }
+        });
+        break;
+      }
+      case "pg-image": {
+        const kind = b.dataset.kind, id = b.dataset.id;
+        const isMaster = kind === "master";
+        const cur = isMaster ? db.master : db.devdbs.find(x => x.id === id);
+        const major = isMaster ? db.master.pg_major : (b.dataset.major || db.master.pg_major);
+        openDialog("dlgImage", f => {
+          $(".js-name", f).textContent = isMaster ? id : cur.name;
+          $(".js-lead", f).textContent = `Aktuell ${cur.image || "?"}. Zur Auswahl stehen Versionen derselben Hauptversion (PostgreSQL ${major}); `
+            + `der Container wird dafür sauber heruntergefahren und mit dem neuen Image neu erzeugt, die Daten bleiben unverändert.`
+            + (isMaster ? " Neue Releases übernehmen die Version; bestehende Entwickler-DBs behalten ihre." : "");
+          fillVersions(f, { major, current: cur.image });
+        }, async v => {
+          if (!v.image) throw new Error("Bitte eine andere Version wählen.");
+          const url = isMaster ? `/api/db/${encodeURIComponent(id)}/image` : `/api/devdbs/${encodeURIComponent(id)}/image`;
+          startedJob(await api("POST", url, { image: v.image }));
         });
         break;
       }
@@ -2410,7 +2571,13 @@ document.addEventListener("click", async ev => {
           $(".js-owner", f).hidden = !isAdmin();
           f.owner.innerHTML = (isAdmin() ? O.users : [O.me.username]).map(u => `<option>${esc(u)}</option>`).join("");
           f.owner.value = O.me.username;
-        }, async v => startedJob(await api("POST", `/api/db/${encodeURIComponent(db.sid)}/devdbs`, v)));
+          const pgv = $(".js-pgver", f);
+          pgv.hidden = !isPg(db.master);
+          if (isPg(db.master)) fillVersions(pgv, { major: db.master.pg_major, current: db.master.image, keep: "wie im Ausgangsstand" });
+        }, async v => {
+          if (!v.image) delete v.image;
+          startedJob(await api("POST", `/api/db/${encodeURIComponent(db.sid)}/devdbs`, v));
+        });
         break;
       case "desc-edit": {
         const rel = db.releases.find(r => r.name === b.dataset.name);
@@ -2517,7 +2684,8 @@ document.addEventListener("click", async ev => {
           $(".js-cur-mem", f).textContent = a.memory ? `aktuell ${fmtBytes(a.memory)}` : "aktuell unbegrenzt";
           $(".js-cur-shm", f).textContent = a.shm ? `aktuell ${fmtBytes(a.shm)}${st.env_shm ? ", aus zeitkapsel.env " + st.env_shm : ""}` : "";
           const hasOra = st.running && Object.keys(o).length;
-          $(".js-ora", f).hidden = !hasOra; $(".js-ora-off", f).hidden = !!hasOra;
+          const pgDb = st.engine === "postgres";
+          $(".js-ora", f).hidden = !hasOra || pgDb; $(".js-ora-off", f).hidden = !!hasOra || pgDb; $(".js-pg-note", f).hidden = !pgDb;
           $(".js-ora-amm", f).hidden = !st.amm; $(".js-ora-asmm", f).hidden = !!st.amm;
           f.sga_mb.value = MB(o.sga_target); f.pga_mb.value = MB(o.pga_aggregate_target); f.memory_target_mb.value = MB(o.memory_target);
           $(".js-cur-sga", f).textContent = o.sga_target ? `aktuell ${MB(o.sga_target)} MB, max. ${MB(o.sga_max_size)} MB` : "";
@@ -2563,10 +2731,24 @@ document.addEventListener("click", async ev => {
       case "backup-restore":
         openImportDialog({ mode: "dump", backup: b.dataset.id });
         break;
+      case "reg-save": {
+        const f = $("#fReg");
+        $("#fReg .form-error").textContent = "";
+        b.disabled = true;
+        try {
+          const r = await api("PUT", "/api/registry", { url: f.elements.url.value, user: f.elements.user.value,
+            password: f.elements.password.value, insecure: f.elements.insecure.checked });
+          Object.keys(pgTagsCache).forEach(k => delete pgTagsCache[k]);
+          toast(`Registry gespeichert: ${r.versions} Versionen gefunden`); if (r.warning) toast(r.warning);
+          await loadAdmin();
+        } catch (e) { $("#fReg .form-error").textContent = e.message; }
+        finally { b.disabled = false; }
+        break;
+      }
       case "hset-save": {
         const f = $("#fHset");
         const val = n => f.elements[n].value;
-        const body = { release_sga_mb: +val("release_sga_mb"), release_pga_mb: +val("release_pga_mb"), release_extra_sql: val("release_extra_sql"),
+        const body = { release_sga_mb: +val("release_sga_mb"), release_pga_mb: +val("release_pga_mb"), release_extra_sql: val("release_extra_sql"), pg_release_sql: val("pg_release_sql"),
           dev_cpus: +val("dev_cpus") || 0, dev_memory_mb: +val("dev_memory_mb") || 0, dev_shm_mb: +val("dev_shm_mb") || 0,
           dev_db_mb: +val("dev_db_mb") || 0, dev_port_start: +val("dev_port_start"), dev_port_end: +val("dev_port_end") };
         try { await api("PUT", "/api/host-settings", body); toast("Vorgaben gespeichert"); await loadAdmin(); }
