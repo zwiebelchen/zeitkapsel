@@ -405,6 +405,46 @@ form.hset label.field input, form.hset label.field textarea { width: 100%; box-s
   </form>
 </dialog>
 
+<!-- PostgreSQL-Dump importieren -->
+<dialog id="dlgPgImport" style="width:min(700px, calc(100vw - 24px))">
+  <form method="dialog" id="fPgImport">
+    <h2>PostgreSQL-Dump importieren</h2>
+    <div class="js-src">
+      <label class="field">Datei oder Verzeichnis auf dem Host
+        <div class="vrow"><input name="path" placeholder="/srv/dumps/shop.dump" autocomplete="off" style="flex:1"><button type="button" class="small js-probe">Prüfen</button></div>
+        <small>pg_dump im Custom-Format (.dump), pg_dump als SQL (.sql, .sql.gz) oder pg_dumpall (.sql, .sql.gz); ein Verzeichnis darf mehrere Dumps enthalten, eine Datei globals*.sql(.gz) wird als Rollen zuerst eingespielt</small></label>
+    </div>
+    <div class="js-plan"></div>
+    <div class="js-target" hidden>
+      <div class="days"><label><input type="radio" name="target_mode" value="new" checked>Neue Datenbank</label><label><input type="radio" name="target_mode" value="overwrite">Vorhandene überschreiben</label></div>
+      <fieldset class="plain js-t-new">
+        <div class="row2">
+          <label class="field">Name <input name="target_sid" required maxlength="16" pattern="[A-Za-z][A-Za-z0-9_]*" autocomplete="off"></label>
+          <label class="field">Port <input type="number" name="target_port" required min="1024" max="65535"></label>
+        </div>
+        <label class="field">Version
+          <div class="vrow"><select name="image" required class="js-versions"></select>
+            <label class="check"><input type="checkbox" class="js-variants"> Varianten</label></div>
+          <small class="js-vinfo"></small></label>
+        <div class="row3">
+          <label class="field">Superuser <input name="user" value="postgres" required pattern="[a-z_][a-z0-9_]*"></label>
+          <label class="field">Passwort <input type="password" name="target_password" required minlength="8" autocomplete="new-password"></label>
+          <label class="field">wiederholen <input type="password" name="target_password2" required autocomplete="new-password"></label>
+        </div>
+        <label class="field">Locale <select name="locale" class="js-locales"></select></label>
+      </fieldset>
+      <fieldset class="plain js-t-over" disabled>
+        <label class="field">Ziel <select name="target_db" required></select></label>
+        <p class="hint-box">Datenbanken, die der Dump enthält, werden im Ziel gelöscht und neu angelegt; andere Datenbanken bleiben. Bei pg_dumpall wird auch die Datenbank postgres ersetzt.</p>
+        <label class="field">Zur Bestätigung den Namen eingeben <input name="confirm" required autocomplete="off"></label>
+        <label class="check"><input type="checkbox" name="snapshot_before" value="1" checked><span>Vorher den Stand sichern <small>als Release (Master-DB) bzw. Snapshot (Entwickler-DB) „vor-import-…“</small></span></label>
+      </fieldset>
+    </div>
+    <p class="form-error"></p>
+    <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary js-go" value="ok" disabled>Import starten</button></div>
+  </form>
+</dialog>
+
 <!-- PostgreSQL-Version wechseln -->
 <dialog id="dlgImage">
   <form method="dialog" id="fImage">
@@ -509,6 +549,8 @@ form.hset label.field input, form.hset label.field textarea { width: 100%; box-s
         <small>die neuesten n behalten, 0 = alle</small>
       </label>
     </div>
+    <label class="field js-pgmode" hidden>Art der Sicherung (PostgreSQL)
+      <select name="pg_mode"><option value="dump">pg_dump je Datenbank plus Rollen</option><option value="dumpall">pg_dumpall (ganzer Cluster als SQL)</option></select></label>
     <label class="check js-consistent"><input type="checkbox" name="consistent" value="1">
       <span class="js-consistent-text">DB dafür kurz herunterfahren <small>Sauber geschlossener Stand; ohne Haken entsteht der Snapshot im laufenden Betrieb.</small></span>
     </label>
@@ -745,10 +787,17 @@ form.hset label.field input, form.hset label.field textarea { width: 100%; box-s
 <dialog id="dlgBackup">
   <form method="dialog" id="fBackup">
     <h2>Sichern: <span class="js-name"></span></h2>
-    <p class="lead">Exportiert die laufende Datenbank mit expdp nach <code class="js-dir"></code>. Die Datenbank läuft dabei weiter.</p>
+    <p class="lead js-lead"></p>
+    <div class="js-pg" hidden>
+      <div class="days"><label><input type="radio" name="mode" value="dump" checked>pg_dump je Datenbank</label><label><input type="radio" name="mode" value="dumpall">pg_dumpall</label></div>
+      <small class="muted-note js-mode-hint"></small>
+      <label class="field js-dbs">Datenbanken <small>leer = alle</small> <input name="databases" placeholder="z. B. shop, reporting" autocomplete="off"><small>durch Komma getrennt</small></label>
+    </div>
+    <div class="js-ora">
     <div class="days js-scope"><label><input type="radio" name="scope" value="full" checked>Ganze Datenbank</label><label><input type="radio" name="scope" value="schemas">Nur Schemas</label></div>
     <label class="field js-schemas" hidden>Schemas <input name="schemas" placeholder="z. B. APP, REPORTING" autocomplete="off"><small>durch Komma getrennt</small></label>
     <label class="check"><input type="checkbox" name="consistent" value="1" checked><span>Konsistent zum Startzeitpunkt <small>flashback_time; braucht ausreichend Undo</small></span></label>
+    </div>
     <p class="form-error"></p>
     <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Sicherung starten</button></div>
   </form>
@@ -1215,9 +1264,9 @@ function allSnapshots(db) {
 
 async function loadAdmin() {
   try {
-    const [sch, sys, hset, reg] = await Promise.all([api("GET", "/api/schedules"), api("GET", "/api/admin"), api("GET", "/api/host-settings"),
-                                                     api("GET", "/api/registry").catch(() => null)]);
-    admin = { ...sch, sys, hset, reg };
+    const [sch, sys, hset, reg, storage] = await Promise.all([api("GET", "/api/schedules"), api("GET", "/api/admin"), api("GET", "/api/host-settings"),
+                                                     api("GET", "/api/registry").catch(() => null), api("GET", "/api/storage").catch(() => null)]);
+    admin = { ...sch, sys, hset, reg, storage };
     render();
   } catch (e) { toast(e.message); }
 }
@@ -1278,6 +1327,7 @@ function renderAdmin() {
       <div class="actions">
         <button data-act="newdb">Neue Datenbank</button>
         <button data-act="import">Datenbank importieren</button>
+        <button data-act="pg-import">PostgreSQL-Dump importieren</button>
         <button class="primary" data-act="sched-new" ${S.dbs.length ? "" : "disabled"}>Zeitplan anlegen</button></div></section>
     <div class="admin-grid">
       <section aria-labelledby="h-sched">
@@ -1288,12 +1338,15 @@ function renderAdmin() {
       </section>
       <section aria-labelledby="h-sys">
         ${hostSettingsHtml(admin.hset)}
+        ${storageHtml(admin.storage)}
         ${registryHtml(admin.reg)}
         <div class="section-head" style="margin-top:26px"><h2 id="h-sys">System</h2></div>
         <dl class="facts-list">
           <dt>Host</dt><dd>${esc(sys.host)}</dd>
           <dt>Image</dt><dd>${esc(sys.image)}</dd>
-          <dt>Ablage</dt><dd>${esc(sys.base)}</dd>
+          <dt>Ablage Oracle</dt><dd>${esc(sys.base)}</dd>
+          <dt>Ablage PostgreSQL</dt><dd>${esc(sys.pg_base || "")}</dd>
+          <dt>Angaben</dt><dd>${esc(sys.meta || "")}</dd>
           <dt>Speicher</dt><dd>${fmtBytes(sys.disk.free)} frei von ${fmtBytes(sys.disk.total)}</dd>
           <dt>Ports</dt><dd>${esc(sys.ports)} für Entwickler-DBs</dd>
           <dt>Startwartezeit</dt><dd>${Math.round(sys.ready_timeout / 60)} Minuten</dd>
@@ -1331,7 +1384,10 @@ function openSchedDialog(sc) {
     const sync = () => {
       const a = f.action.value;
       $(".js-dev", f).hidden = a !== "devsnap";
-      $(".js-consistent", f).hidden = a !== "devsnap" && a !== "backup";
+      const selDb = S.dbs.find(d => d.sid === f.sid.value);
+      const pgSel = !!(selDb && isPg(selDb.master));
+      $(".js-consistent", f).hidden = (a !== "devsnap" && a !== "backup") || (a === "backup" && pgSel);
+      $(".js-pgmode", f).hidden = !(a === "backup" && pgSel);
       $(".js-consistent-text", f).innerHTML = a === "backup"
         ? "Konsistent zum Startzeitpunkt <small>flashback_time; die DB läuft dabei weiter</small>"
         : "DB dafür kurz herunterfahren <small>Sauber geschlossener Stand; ohne Haken entsteht der Snapshot im laufenden Betrieb.</small>";
@@ -1364,7 +1420,7 @@ function openSchedDialog(sc) {
     };
     f.use_window.onchange = sync;
     f.every.oninput = sync;
-    f.sid.onchange = fillDevs;
+    f.sid.onchange = () => { fillDevs(); sync(); };
     if (sc) {
       f.id.value = sc.id; f.label.value = sc.label; f.action.value = sc.action; f.sid.value = sc.sid;
       f.freq.value = sc.freq || "daily";
@@ -1374,7 +1430,7 @@ function openSchedDialog(sc) {
       f.use_window.checked = !!sc.window;
       if (sc.window) { f.window_from.value = sc.window.start; f.window_to.value = sc.window.end; }
       f.template.value = sc.template || ""; f.keep.value = sc.keep ?? 7;
-      f.consistent.checked = !!sc.consistent; f.enabled.checked = !!sc.enabled;
+      f.consistent.checked = !!sc.consistent; f.enabled.checked = !!sc.enabled; f.pg_mode.value = sc.pg_mode || "dump";
       if (sc.target) f.target.value = sc.target;
       f.keep_stopped.checked = sc.keep_stopped !== false;
       f.querySelectorAll('input[name=day]').forEach(cb => { cb.checked = sc.days.includes(+cb.value); });
@@ -1395,7 +1451,7 @@ function openSchedDialog(sc) {
       freq: v.freq, every: +v.every, minute: +v.minute,
       window_from: v.use_window ? v.window_from : "", window_to: v.use_window ? v.window_to : "",
       days: [...f.querySelectorAll('input[name=day]:checked')].map(cb => +cb.value),
-      template: v.template, keep: +v.keep || 0, consistent: !!v.consistent, enabled: !!v.enabled,
+      template: v.template, keep: +v.keep || 0, consistent: !!v.consistent, enabled: !!v.enabled, pg_mode: v.pg_mode || "dump",
       devs: [...f.querySelectorAll('input[name=devsel]:checked')].map(cb => cb.value),
       target: v.target, keep_stopped: !!v.keep_stopped,
     };
@@ -1915,7 +1971,8 @@ async function fillVersions(root, opts = {}) {
     sel.innerHTML = cur + Object.keys(groups).sort((a, b) => b - a).map(m => `<optgroup label="PostgreSQL ${m}">${groups[m].map(t =>
       `<option value="${esc(t.image)}" ${t.image === opts.current && !opts.keep ? "disabled" : ""}>${esc(t.tag)}${t.local ? " · lokal" : ""}</option>`).join("")}</optgroup>`).join("");
     if (!opts.current) {
-      const pick = tags.find(t => !t.variant && t.minor != null) || tags[0];   // neueste konkrete Version, z. B. 17.6
+      const concrete = tags.filter(t => !t.variant && t.minor != null);    // neueste konkrete Version, z. B. 17.6
+      const pick = concrete.find(t => opts.prefer && String(t.major) === String(opts.prefer)) || concrete[0] || tags[0];
       if (pick) sel.value = pick.image;
     }
     if (info) info.textContent = data.error ? `Registry: ${data.error}${data.tags.length ? " – angezeigt werden lokal vorhandene Images." : ""}`
@@ -1929,6 +1986,65 @@ async function fillVersions(root, opts = {}) {
     if (varCb) varCb.onchange = () => draw(data);
     if (reload) reload.onclick = async () => { sel.innerHTML = "<option>Lade …</option>"; data = await loadPgTags(true); draw(data); };
   } catch (e) { sel.innerHTML = ""; if (info) info.textContent = e.message; }
+}
+
+/* ------------------------------------------------------------ PostgreSQL-Dump importieren */
+const PG_FMT = { custom: "pg_dump, Custom-Format", plain: "pg_dump als SQL", dumpall: "pg_dumpall (ganzer Cluster)", globals: "Rollen und Tablespaces" };
+function openPgImport(preset = {}) {
+  let plan = null;
+  openDialog("dlgPgImport", async f => {
+    const planBox = $(".js-plan", f), tgt = $(".js-target", f), go = $(".js-go", f);
+    planBox.innerHTML = ""; tgt.hidden = true; go.disabled = true;
+    $(".js-src", f).hidden = !!preset.backup;
+    const targets = S.dbs.filter(d => isPg(d.master)).flatMap(d => [[`master:${d.sid}`, `Master-DB ${d.sid}`],
+      ...d.devdbs.filter(x => x.container).map(x => [`dev:${x.id}`, `Entwickler-DB ${x.name} (${d.sid}, ${x.owner || "–"})`])]);
+    f.target_db.innerHTML = targets.map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join("") || '<option value="">keine PostgreSQL-DB vorhanden</option>';
+    const used = new Set(S.dbs.map(d => d.master.port)); let p = 5432; while (used.has(p)) p++; f.target_port.value = p;
+    let chk = {}; try { chk = await api("GET", "/api/newdb/check"); } catch {}
+    $(".js-locales", f).innerHTML = (chk.pg_locales || ["C.UTF-8"]).map(c => `<option>${c}</option>`).join("");
+    const modeSync = () => {
+      const m = f.querySelector("input[name=target_mode]:checked").value;
+      $(".js-t-new", f).disabled = m !== "new"; $(".js-t-over", f).disabled = m !== "overwrite";
+    };
+    f.querySelectorAll("input[name=target_mode]").forEach(r => { r.onchange = modeSync; });
+    const probe = async () => {
+      planBox.innerHTML = '<p class="muted-note">Prüfe …</p>'; go.disabled = true;
+      try {
+        plan = await api("POST", "/api/import/pg/probe", preset.backup ? { backup: preset.backup } : { path: f.path.value.trim() });
+        const major = (plan.version || "").split(".")[0];
+        planBox.innerHTML = `<dl class="facts-list" style="margin:8px 0">
+            <dt>Quelle</dt><dd>${esc(plan.label)}</dd>
+            ${plan.version ? `<dt>Version</dt><dd>PostgreSQL ${esc(plan.version)} – als Ziel dieselbe oder eine neuere Hauptversion wählen</dd>` : ""}
+          </dl>
+          <div class="table-wrap"><table class="snap"><thead><tr><th>Datei</th><th>Art</th><th>Ziel</th></tr></thead><tbody>
+          ${plan.items.map(i => `<tr><td class="nw">${esc(i.file.split("/").pop())}</td><td>${esc(PG_FMT[i.format] || i.format)}</td><td>${
+            i.format === "custom" || i.format === "plain" ? `Datenbank <input data-ren="${esc(i.database)}" value="${esc(i.target || i.database)}" pattern="[A-Za-z_][A-Za-z0-9_$-]*" style="width:14em">`
+            : i.format === "dumpall" ? (i.databases ? esc(i.databases.join(", ")) : "alle enthaltenen Datenbanken") : "Rollen, Tablespaces"}</td></tr>`).join("")}
+          </tbody></table></div>
+          ${plan.formats.some(x => x === "dumpall" || x === "globals") ? '<p class="muted-note">Rollen aus dem Dump übernehmen ihr Passwort aus der Quelle – auch der Superuser, wenn er dort genauso heißt. Meldungen „Rolle existiert schon“ sind dabei normal.</p>' : ""}`;
+        tgt.hidden = false; go.disabled = false; modeSync();
+        if (!f.target_sid.value && plan.meta && plan.meta.sid) f.target_sid.value = S.dbs.some(d => d.sid === plan.meta.sid) ? plan.meta.sid + "_NEU" : plan.meta.sid;
+        fillVersions($(".js-t-new", f), { prefer: major });
+      } catch (e) { plan = null; planBox.innerHTML = `<p class="form-error">${esc(e.message)}</p>`; }
+    };
+    $(".js-probe", f).onclick = probe;
+    if (preset.backup) probe();
+  }, async v => {
+    const f = $("#fPgImport");
+    if (!plan) throw new Error("Erst die Quelle prüfen.");
+    const renames = {};
+    f.querySelectorAll("input[data-ren]").forEach(i => { renames[i.dataset.ren] = i.value.trim(); });
+    const body = { ...(preset.backup ? { backup: preset.backup } : { path: v.path.trim() }), target_mode: v.target_mode, renames };
+    if (v.target_mode === "new") {
+      if (v.target_password !== v.target_password2) throw new Error("Die Passwörter stimmen nicht überein.");
+      Object.assign(body, { target_sid: v.target_sid.toUpperCase(), target_port: +v.target_port, image: v.image, user: v.user,
+        target_password: v.target_password, locale: v.locale });
+    } else {
+      const [kind, ...rest] = (v.target_db || "").split(":");
+      Object.assign(body, { target_kind: kind, target_ident: rest.join(":"), confirm: v.confirm, snapshot_before: !!v.snapshot_before });
+    }
+    startedJob(await api("POST", "/api/import/pg", body));
+  });
 }
 
 /* ------------------------------------------------------------ Sitzungen */
@@ -2179,6 +2295,21 @@ function hostSettingsHtml(h) {
     </form>`;
 }
 
+function storageHtml(v) {
+  if (!v) return "";
+  const rows = v.stores.map(st => `<form id="fStore-${st.engine}" class="hset" onsubmit="return false">
+      <label class="field">${esc(st.label)}
+        <div class="vrow"><input name="path" value="${esc(st.base)}" required autocomplete="off" style="flex:1;min-width:200px">
+          <button type="button" class="small" data-act="store-save" data-engine="${esc(st.engine)}" ${v.busy ? 'disabled title="Es läuft ein Vorgang"' : ""}>Übernehmen</button></div>
+        <small>${st.fstype ? `${esc(st.fstype)}${st.compress ? ", " + esc(st.compress) : ""}, eingehängt unter ${esc(st.target)}` : "Dateisystem unbekannt"}
+          · ${st.dbs.length ? `${st.dbs.length} Datenbank(en): ${esc(st.dbs.join(", "))}` : "noch keine Datenbanken"} · Sicherungen in ${esc(st.backups)}${st.base !== st.default ? ` · Vorgabe ${esc(st.default)}` : ""}</small></label>
+      ${st.misplaced.length ? `<p class="hint-box">${st.misplaced.length} ${esc(st.label)}-Datenbank(en) liegen noch in der anderen Ablage: <b>${esc(st.misplaced.join(", "))}</b>. „Übernehmen“ mit unverändertem Pfad verschiebt sie hierher.</p>` : ""}
+      <p class="form-error"></p></form>`).join("");
+  return `<div class="section-head" style="margin-top:26px"><h2>Ablage</h2></div>
+    <p class="muted-note" style="margin:0 0 8px">Wo die Datenbanken jeder Art liegen: Master-DBs, Releases, Entwickler-DBs, Snapshots, Angaben je DB und Sicherungen. Der Pfad muss auf btrfs liegen. Liegen dort schon Datenbanken, zieht „Übernehmen“ sie um: Container herunterfahren, Subvolumes verschieben (nur innerhalb desselben btrfs, ohne Kopie), Container mit dem neuen Pfad wieder starten. Die Angaben von zeitkapsel selbst (Vorgänge, Zeitpläne, Vorgaben) bleiben in <code>${esc(v.meta)}</code>.</p>
+    ${rows}`;
+}
+
 function registryHtml(r) {
   if (!r) return "";
   return `<div class="section-head" style="margin-top:26px"><h2>PostgreSQL-Images</h2></div>
@@ -2207,17 +2338,18 @@ function renderBackupsPage() {
   const total = d.backups.reduce((a, b) => a + (b.size || 0), 0);
   const rows = d.backups.map(b => `<tr>
       <td class="nw"><b>${esc(b.sid)}</b></td><td class="nw">${fmtTime(b.created)}</td><td>${esc(b.source || "")}</td>
-      <td>${b.full ? "ganze Datenbank" : esc((b.schemas || []).join(", "))}${b.consistent ? "" : ' <span class="tag">nicht konsistent</span>'}</td>
+      <td>${b.engine === "postgres" ? `<span class="tag pg">PG</span> ${b.mode === "dumpall" ? "pg_dumpall" : "pg_dump"}: ${esc((b.databases || []).join(", "))}${b.mode === "dumpall" ? "" : " + Rollen"}`
+        : (b.full ? "ganze Datenbank" : esc((b.schemas || []).join(", ")))}${b.consistent ? "" : ' <span class="tag">nicht konsistent</span>'}</td>
       <td class="num nw">${fmtBytes(b.size)}</td><td class="nw">${esc(b.version || "–")}</td>
       <td class="nw">${esc(b.by || "–")}${b.schedule ? ' <span class="tag">Zeitplan</span>' : ""}${b.warnings ? ` <span class="tag" title="Meldungen im Protokoll">${b.warnings} Meldungen</span>` : ""}</td>
       <td><div class="acts">
-        ${isAdmin() ? `<button class="quiet small" data-act="backup-restore" data-id="${esc(b.id)}">Wiederherstellen …</button>` : ""}
+        ${isAdmin() ? `<button class="quiet small" data-act="backup-restore" data-id="${esc(b.id)}" data-engine="${esc(b.engine || "oracle")}">Wiederherstellen …</button>` : ""}
         ${b.has_log ? `<button class="quiet small" data-act="backup-log" data-id="${esc(b.id)}">Protokoll</button>` : ""}
         ${isAdmin() ? `<button class="quiet small danger" data-act="backup-del" data-id="${esc(b.id)}">Löschen</button>` : ""}</div></td></tr>`).join("");
   main.innerHTML = `
     <section class="dbhead"><h1>Sicherungen</h1>
       <div class="facts"><span>${esc(currentHost().name)}</span><span>${d.backups.length} Sicherungen, ${fmtBytes(total)}</span>${d.free != null ? `<span>${fmtBytes(d.free)} frei</span>` : ""}</div></section>
-    <p class="muted-note" style="max-width:80ch;margin-top:14px">Sicherungen sind Data-Pump-Exporte (expdp) mit Angaben zu Version, Zeichensatz, Tablespaces und Passwort-Prüffunktionen. Sie liegen unter <code>${esc(d.dir)}/&lt;SID&gt;/&lt;Zeitpunkt&gt;/</code>. Neue Sicherungen startest du mit „Sichern“ bei der Datenbank oder regelmäßig über einen Zeitplan unter „Verwaltung“; „Wiederherstellen“ öffnet den Import-Assistenten.</p>
+    <p class="muted-note" style="max-width:80ch;margin-top:14px">Sicherungen sind Data-Pump-Exporte (expdp) mit Angaben zu Version, Zeichensatz, Tablespaces und Passwort-Prüffunktionen. Sie liegen unter <code>${esc(d.dir)}/&lt;SID&gt;/&lt;Zeitpunkt&gt;/</code>. PostgreSQL-Sicherungen (pg_dump im Custom-Format plus Rollen oder pg_dumpall als SQL) liegen unter <code>${esc(d.pg_dir || "")}/&lt;Name&gt;/&lt;Zeitpunkt&gt;/</code>. Neue Sicherungen startest du mit „Sichern“ bei der Datenbank oder regelmäßig über einen Zeitplan unter „Verwaltung“; „Wiederherstellen“ öffnet den Import-Assistenten.</p>
     <div class="table-wrap" style="margin-top:12px"><table class="snap"><thead><tr><th>Datenbank</th><th>Zeitpunkt</th><th>Quelle</th><th>Umfang</th><th class="num">Größe</th><th>Version</th><th>Von</th><th></th></tr></thead>
       <tbody>${rows || '<tr><td colspan="8">Noch keine Sicherungen.</td></tr>'}</tbody></table></div>`;
 }
@@ -2702,16 +2834,35 @@ document.addEventListener("click", async ev => {
       }
       case "backup": {
         const kind = b.dataset.kind, id = b.dataset.id;
-        let dir = "/srv/oradb/backups";
-        try { dir = (await api("GET", "/api/backups")).dir; } catch {}
+        const target = kind === "master" ? db.master : db.devdbs.find(x => x.id === id);
+        const pgDb = isPg(target);
+        let info = { dir: "/srv/oradb/backups", pg_dir: "/srv/postgres/backups" };
+        try { info = await api("GET", "/api/backups"); } catch {}
+        const sid = kind === "master" ? id : id.split("-")[0];
         openDialog("dlgBackup", f => {
           $(".js-name", f).textContent = b.dataset.label;
-          $(".js-dir", f).textContent = `${dir}/${kind === "master" ? id : id.split("-")[0]}/<Zeitpunkt>/`;
+          $(".js-pg", f).hidden = !pgDb; $(".js-ora", f).hidden = pgDb;
+          $(".js-lead", f).innerHTML = pgDb
+            ? `Sichert die laufende PostgreSQL-Datenbank nach <code>${esc(info.pg_dir)}/${esc(sid)}/&lt;Zeitpunkt&gt;/</code>. Sie läuft dabei weiter; jeder Dump ist in sich konsistent.`
+            : `Exportiert die laufende Datenbank mit expdp nach <code>${esc(info.dir)}/${esc(sid)}/&lt;Zeitpunkt&gt;/</code>. Die Datenbank läuft dabei weiter.`;
+          const modeSync = () => {
+            const m = f.querySelector("input[name=mode]:checked").value;
+            $(".js-dbs", f).hidden = m !== "dump";
+            $(".js-mode-hint", f).textContent = m === "dump"
+              ? "Je Datenbank eine Datei im Custom-Format (komprimiert, einzeln wiederherstellbar) plus Rollen und Tablespaces (pg_dumpall --globals-only)."
+              : "Eine SQL-Datei (gzip) mit Rollen, Tablespaces und allen Datenbanken; stellt den ganzen Cluster wieder her.";
+          };
+          f.querySelectorAll("input[name=mode]").forEach(r => { r.onchange = modeSync; });
+          modeSync();
           f.querySelectorAll("input[name=scope]").forEach(r => { r.onchange = () => { $(".js-schemas", f).hidden = f.querySelector("input[name=scope]:checked").value !== "schemas"; }; });
           $(".js-schemas", f).hidden = true;
         }, async v => {
-          const full = v.scope !== "schemas";
           const url = kind === "master" ? `/api/db/${encodeURIComponent(id)}/backup` : `/api/devdbs/${encodeURIComponent(id)}/backup`;
+          if (pgDb) {
+            startedJob(await api("POST", url, { mode: v.mode, databases: v.mode === "dump" ? (v.databases || "").split(",").map(x => x.trim()).filter(Boolean) : [] }));
+            return;
+          }
+          const full = v.scope !== "schemas";
           startedJob(await api("POST", url, { full, schemas: full ? [] : (v.schemas || "").split(",").map(x => x.trim().toUpperCase()).filter(Boolean), consistent: !!v.consistent }));
         });
         break;
@@ -2729,8 +2880,32 @@ document.addEventListener("click", async ev => {
         break;
       }
       case "backup-restore":
-        openImportDialog({ mode: "dump", backup: b.dataset.id });
+        if (b.dataset.engine === "postgres") openPgImport({ backup: b.dataset.id });
+        else openImportDialog({ mode: "dump", backup: b.dataset.id });
         break;
+      case "pg-import":
+        openPgImport();
+        break;
+      case "store-save": {
+        const eng = b.dataset.engine;
+        const st = admin.storage.stores.find(x => x.engine === eng);
+        const path = $(`#fStore-${eng} [name=path]`).value.trim();
+        const err = $(`#fStore-${eng} .form-error`); err.textContent = "";
+        const affected = [...st.dbs, ...st.misplaced];
+        let move = false;
+        if (affected.length) {
+          const where = path === st.base ? `in die Ablage ${path}` : `von ${st.base} nach ${path}`;
+          if (!confirm(`${st.label}-Datenbanken ${where} verschieben?\n\nBetroffen: ${affected.join(", ")} mit ihren Releases, Entwickler-DBs, Snapshots, Angaben und Sicherungen.\n\n`
+            + "Laufende Container werden sauber heruntergefahren, die Subvolumes innerhalb desselben btrfs verschoben (keine Kopie) und die Container mit dem neuen Pfad wieder gestartet. Das geht nur, wenn sonst kein Vorgang läuft.")) return;
+          move = true;
+        }
+        try {
+          const r = await api("PUT", "/api/storage", { engine: eng, path, move });
+          if (r.job) startedJob(r); else toast(`Ablage für ${st.label}: ${path}`);
+          await loadAdmin();
+        } catch (e) { err.textContent = e.message; }
+        break;
+      }
       case "reg-save": {
         const f = $("#fReg");
         $("#fReg .form-error").textContent = "";

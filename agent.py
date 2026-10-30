@@ -84,14 +84,71 @@ RE_OWNER = re.compile(r"^[\w .@-]{0,40}$")
 RE_DEVID = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,15}-[a-z0-9][a-z0-9-]{0,29}$")
 TEXT_MAX = 500
 
-MASTER = BASE / "master"
-GOLDEN = BASE / "golden"
-DEV = BASE / "dev"
-BUILD = BASE / "build"
-DEVDUMPS = BASE / "devdumps"
-DEVSNAPS = BASE / "devsnaps"
-IMPORT = BASE / "import"      # Ablage für Subvolumes von anderswo (btrfs receive, Kopie einer anderen Instanz)
-META = BASE / "meta"
+META = BASE / "meta"          # globale Angaben (Vorgänge, Vorgaben, Zeitpläne, Registry) und Oracle-DBs
+PG_BASE = Path(env("PG_BASE", "/srv/postgres"))
+
+
+STORAGE_FILE = META / "storage.json"   # in der Oberfläche einstellbare Ablagepfade je Datenbank-Art
+
+
+class Store:
+    """Ablage einer Datenbank-Art: Subvolumes, Angaben je DB und Sicherungen. Der Pfad ist zur Laufzeit änderbar."""
+
+    def __init__(self, engine: str, default: Path, backups_env: str):
+        self.engine, self.default, self.backups_env = engine, default, backups_env
+        self.set_base(default)
+
+    def set_base(self, base: Path) -> None:
+        self.base = Path(base)
+        self.master, self.golden, self.dev = self.base / "master", self.base / "golden", self.base / "dev"
+        self.devsnaps, self.build, self.meta = self.base / "devsnaps", self.base / "build", self.base / "meta"
+        self.devdumps, self.import_dir = self.base / "devdumps", self.base / "import"
+        self.backups = Path(env(self.backups_env)) if env(self.backups_env) else self.base / "backups"
+
+    def dirs(self) -> tuple[Path, ...]:
+        return (self.master, self.golden, self.dev, self.devsnaps, self.build, self.meta, self.backups)
+
+
+ORA_STORE = Store("oracle", BASE, "BACKUP_DIR")
+PG_STORE = Store("postgres", PG_BASE, "PG_BACKUP_DIR")
+STORES = (ORA_STORE, PG_STORE)
+
+
+def load_storage() -> None:
+    try:
+        conf = json.loads(STORAGE_FILE.read_text())
+    except (OSError, ValueError):
+        conf = {}
+    for st in STORES:
+        st.set_base(Path(conf.get(st.engine) or st.default))
+
+
+load_storage()
+
+
+def store_of(sid: str) -> Store:
+    """PostgreSQL-DBs liegen unter PG_BASE; alles andere (und noch nicht angelegte Namen) unter BASE."""
+    return PG_STORE if sid and (PG_STORE.master / sid).is_dir() else ORA_STORE
+
+
+def master_dir(sid: str) -> Path:
+    return store_of(sid).master / sid
+
+
+def golden_dir(sid: str) -> Path:
+    return store_of(sid).golden / sid
+
+
+def dev_dir(did: str) -> Path:
+    return store_of(did.partition("-")[0]).dev / did
+
+
+def devsnaps_dir(did: str) -> Path:
+    return store_of(did.partition("-")[0]).devsnaps / did
+
+
+def meta_dir(sid: str) -> Path:
+    return store_of(sid).meta / sid
 
 bp = Blueprint("agent", __name__, url_prefix="/agent")
 
@@ -230,7 +287,7 @@ def service_name(vol: Path, sid: str) -> str:
 
 
 def db_meta_file(sid: str) -> Path:
-    return META / sid / "db.json"
+    return meta_dir(sid) / "db.json"
 
 
 def db_meta(sid: str) -> dict:
@@ -593,6 +650,8 @@ def start_job(title: str, sid: str | None, busy_key: str, fn, *args) -> Job:
     with _lock:
         if busy_key in _busy:
             raise UserError("Dafür läuft gerade schon ein Vorgang.")
+        if "storage" in _busy:
+            raise UserError("Gerade zieht eine Ablage um; neue Vorgänge erst danach.")
         _busy.add(busy_key)
         job = Job(title, sid)
         JOBS[job.id] = job
@@ -722,7 +781,7 @@ def wait_ready(job: Job, cname: str, since: float, timeout: int | None = None) -
 
 # --------------------------------------------------------------------------- Timeline und Metadaten
 def tl_file(sid: str) -> Path:
-    return META / sid / "timeline.jsonl"
+    return meta_dir(sid) / "timeline.jsonl"
 
 
 def tl_read(sid: str) -> list[dict]:
@@ -757,7 +816,7 @@ def tl_add(sid: str, kind: str, text: str, ref: str | None = None, ts: str | Non
 
 
 def release_meta_file(sid: str, name: str) -> Path:
-    return META / sid / "releases" / f"{name}.json"
+    return meta_dir(sid) / "releases" / f"{name}.json"
 
 
 def release_meta(sid: str, name: str) -> dict:
@@ -767,19 +826,21 @@ def release_meta(sid: str, name: str) -> dict:
 
 # --------------------------------------------------------------------------- Zustand lesen
 def master_sids() -> list[str]:
-    if not MASTER.is_dir():
-        return []
-    return sorted(p.name for p in MASTER.iterdir() if p.is_dir() and RE_SID.match(p.name))
+    out = set()
+    for st in STORES:
+        if st.master.is_dir():
+            out |= {p.name for p in st.master.iterdir() if p.is_dir() and RE_SID.match(p.name)}
+    return sorted(out)
 
 
 def need_sid(sid: str) -> str:
-    if not RE_SID.match(sid or "") or not (MASTER / sid).is_dir():
+    if not RE_SID.match(sid or "") or not (master_dir(sid)).is_dir():
         raise UserError(f"Unbekannte Datenbank „{sid}“.")
     return sid
 
 
 def releases(sid: str) -> list[dict]:
-    d = GOLDEN / sid
+    d = golden_dir(sid)
     out = []
     if d.is_dir():
         for p in d.iterdir():
@@ -796,11 +857,11 @@ def releases(sid: str) -> list[dict]:
 
 
 def devsnap_meta_file(sid: str, did: str, snap: str) -> Path:
-    return META / sid / "devsnaps" / f"{did}__{snap}.json"
+    return meta_dir(sid) / "devsnaps" / f"{did}__{snap}.json"
 
 
 def devsnaps_of(sid: str, did: str) -> list[dict]:
-    d = DEVSNAPS / did
+    d = devsnaps_dir(did)
     out = []
     if d.is_dir():
         for p in d.iterdir():
@@ -825,17 +886,17 @@ def resolve_source(sid: str, source: str) -> tuple[Path, str, str]:
     """
     kind, _, rest = (source or "").partition(":")
     if kind == "release":
-        if not RE_RELEASE.match(rest) or not (GOLDEN / sid / rest).is_dir():
+        if not RE_RELEASE.match(rest) or not (golden_dir(sid) / rest).is_dir():
             raise UserError("Release nicht gefunden.")
-        return GOLDEN / sid / rest, f"Release {rest}", rest
+        return golden_dir(sid) / rest, f"Release {rest}", rest
     if kind == "snap":
         did, _, snap = rest.partition("/")
         if (not RE_DEVID.match(did) or not did.startswith(sid + "-") or not RE_RELEASE.match(snap)
-                or not (DEVSNAPS / did / snap).is_dir()):
+                or not (devsnaps_dir(did) / snap).is_dir()):
             raise UserError("Snapshot nicht gefunden.")
         f = devsnap_meta_file(sid, did, snap)
         release = (json.loads(f.read_text()) if f.exists() else {}).get("release", "")
-        return DEVSNAPS / did / snap, f"Snapshot {snap} von {did.partition('-')[2]}", release
+        return devsnaps_dir(did) / snap, f"Snapshot {snap} von {did.partition('-')[2]}", release
     raise UserError("Unbekannte Quelle.")
 
 
@@ -848,10 +909,10 @@ def base_label(dev: dict) -> str:
 
 def devdbs(cs: list[dict]) -> list[dict]:
     items: dict[str, dict] = {}
-    dev_root = os.path.realpath(DEV)
+    dev_roots = {os.path.realpath(st.dev) for st in STORES}
     for c in cs:
         L = c["labels"]
-        in_dev = c["mount"] and os.path.dirname(c["mount"]) == dev_root
+        in_dev = c["mount"] and os.path.dirname(c["mount"]) in dev_roots
         if L.get("devdb") != "1" and not in_dev:
             continue
         did = os.path.basename(c["mount"]) if c["mount"] else c["name"]
@@ -865,24 +926,23 @@ def devdbs(cs: list[dict]) -> list[dict]:
             id=did, sid=sid, name=name, release=release, owner=owner,
             base=L.get("devbase") or (f"release:{release}" if release else ""),
             created=L.get("devcreated", ""), port=c["port"], container=c["name"],
-            state=db_state(c), jdbc=jdbc(c["port"], service_name(DEV / did, sid), c["engine"]),
+            state=db_state(c), jdbc=jdbc(c["port"], service_name(dev_dir(did), sid), c["engine"]),
             engine=c["engine"], image=c["image"] if c["engine"] == PG else "",
         )
-    if DEV.is_dir():
-        for p in DEV.iterdir():
-            if p.name in items or not p.is_dir():
-                continue
-            sid, _, name = p.name.partition("-")
-            info = subvol_info(p) or {}
-            try:
-                meta = json.loads(dev_meta_file(sid, p.name).read_text())
-            except (OSError, ValueError):
-                meta = {}
-            items[p.name] = dict(id=p.name, sid=sid, name=name, release="", owner=meta.get("owner", ""),
-                                 base=meta.get("base", ""),
-                                 created=info.get("created") or "", port=None, container=None,
-                                 state="ohne Container", jdbc=None, engine=engine_of(p),
-                                 image=read_volume_env(p).get("ZK_IMAGE", ""))
+    for p in (x for st in STORES if st.dev.is_dir() for x in st.dev.iterdir()):
+        if p.name in items or not p.is_dir():
+            continue
+        sid, _, name = p.name.partition("-")
+        info = subvol_info(p) or {}
+        try:
+            meta = json.loads(dev_meta_file(sid, p.name).read_text())
+        except (OSError, ValueError):
+            meta = {}
+        items[p.name] = dict(id=p.name, sid=sid, name=name, release="", owner=meta.get("owner", ""),
+                             base=meta.get("base", ""),
+                             created=info.get("created") or "", port=None, container=None,
+                             state="ohne Container", jdbc=None, engine=engine_of(p),
+                             image=read_volume_env(p).get("ZK_IMAGE", ""))
     for d in items.values():
         d["base_label"] = base_label(d)
         d["snapshots"] = devsnaps_of(d["sid"], d["id"])
@@ -890,21 +950,21 @@ def devdbs(cs: list[dict]) -> list[dict]:
 
 
 def master_container(sid: str, cs: list[dict]) -> dict | None:
-    vol = os.path.realpath(MASTER / sid)
+    vol = os.path.realpath(master_dir(sid))
     return next((c for c in cs if c["mount"] == vol and not c["name"].startswith(("release-build-", "zk-create-"))), None)
 
 
 def master_info(sid: str, cs: list[dict]) -> dict:
     c = master_container(sid, cs)
-    e = read_volume_env(MASTER / sid)
+    e = read_volume_env(master_dir(sid))
     port = (c["port"] if c else None) or db_meta(sid).get("port")
-    service = service_name(MASTER / sid, sid)
+    service = service_name(master_dir(sid), sid)
     eng = PG if e.get("ZK_ENGINE") == PG else ORA
     return dict(container=c["name"] if c else None, state=db_state(c), port=port, service=service,
                 type=e.get("ZK_DB_TYPE", "noncdb") if eng == ORA else "", pdb=e.get("ZK_PDB", ""),
                 jdbc=jdbc(port, service, eng) if c else None, origin=db_meta(sid).get("origin", ""),
                 engine=eng, image=e.get("ZK_IMAGE", "") if eng == PG else IMAGE,
-                pg_major=data_pg_major(MASTER / sid) if eng == PG else "", pg_user=e.get("ZK_PG_USER", ""))
+                pg_major=data_pg_major(master_dir(sid)) if eng == PG else "", pg_user=e.get("ZK_PG_USER", ""))
 
 
 def timeline(sid: str, rels: list[dict], devs: list[dict]) -> list[dict]:
@@ -935,16 +995,16 @@ def timeline(sid: str, rels: list[dict], devs: list[dict]) -> list[dict]:
 def job_release(job: Job, sid: str, name: str, description: str,
                 src: Path | None = None, origin: str = "", parent: str = "", lineage: str = "",
                 schedule: str = "") -> None:
-    src = src or MASTER / sid
-    dst = GOLDEN / sid / name
+    src = src or master_dir(sid)
+    dst = golden_dir(sid) / name
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    tmp = BUILD / f"{sid}-{name}-{stamp}"
+    tmp = store_of(sid).build / f"{sid}-{name}-{stamp}"
     bname = f"release-build-{sid.lower()}-{stamp}"
-    (GOLDEN / sid).mkdir(parents=True, exist_ok=True)
-    BUILD.mkdir(parents=True, exist_ok=True)
+    (golden_dir(sid)).mkdir(parents=True, exist_ok=True)
+    tmp.parent.mkdir(parents=True, exist_ok=True)
 
     is_pg = engine_of(src) == PG
-    if is_pg and src == MASTER / sid:
+    if is_pg and src == master_dir(sid):
         c = master_container(sid, containers())
         if c and c["running"]:
             job.log("Checkpoint in der Master-DB (verkürzt die Recovery der Kopie)")
@@ -995,8 +1055,8 @@ def job_release_derive(job: Job, sid: str, name: str, description: str,
                        src: Path, origin: str, parent: str, lineage: str) -> None:
     """Release von einem bestehenden Release ableiten: das Quell-Release ist bereits sauber
     geschlossen und für Entwickler eingerichtet, daher genügt ein schreibgeschützter Snapshot."""
-    (GOLDEN / sid).mkdir(parents=True, exist_ok=True)
-    job.run(["btrfs", "subvolume", "snapshot", "-r", str(src), str(GOLDEN / sid / name)])
+    (golden_dir(sid)).mkdir(parents=True, exist_ok=True)
+    job.run(["btrfs", "subvolume", "snapshot", "-r", str(src), str(golden_dir(sid) / name)])
     write_json(release_meta_file(sid, name),
                dict(name=name, description=description, created=now_iso(), origin=origin,
                     parent=parent, lineage=lineage))
@@ -1005,30 +1065,30 @@ def job_release_derive(job: Job, sid: str, name: str, description: str,
 
 def dev_run_cmd(did: str, sid: str, port: int, release: str, owner: str, created: str,
                 base: str) -> list[str]:
-    if engine_of(DEV / did) == PG:
+    if engine_of(dev_dir(did)) == PG:
         labels = [("devdb", "1"), ("devport", str(port)), ("devsid", sid), ("devrelease", release),
                   ("devowner", owner), ("devbase", base), ("devcreated", created)]
-        return pg_run_cmd(did.lower(), DEV / did, port, dev_settings(sid, did), restart=False, labels=labels)
+        return pg_run_cmd(did.lower(), dev_dir(did), port, dev_settings(sid, did), restart=False, labels=labels)
     return ["docker", "run", "-d", "--name", did.lower(), "--init", "--stop-timeout", "600",
             "--label", "devdb=1", "--label", f"devport={port}", "--label", f"devsid={sid}",
             "--label", f"devrelease={release}", "--label", f"devowner={owner}",
             "--label", f"devbase={base}",
             "--label", f"devcreated={created}",
             "-p", f"{port}:1521", "-e", f"ORACLE_SID={sid}",
-            "-v", f"{DEV / did}:/opt/oracle/oradata",
-            "-v", f"{DEVDUMPS / did}:/oracle/dumps", *docker_extra(DEV / did),
+            "-v", f"{dev_dir(did)}:/opt/oracle/oradata",
+            "-v", f"{ORA_STORE.devdumps / did}:/oracle/dumps", *docker_extra(dev_dir(did)),
             *settings_args(dev_settings(sid, did)), IMAGE]
 
 
 def prepare_dumps(did: str, sid: str) -> None:
-    if engine_of(DEV / did) == PG:
+    if engine_of(dev_dir(did)) == PG:
         return
-    (DEVDUMPS / did / "19c" / "datapump" / sid).mkdir(parents=True, exist_ok=True)
-    sh(["chown", "-R", f"{ORACLE_UID}:{ORACLE_UID}", str(DEVDUMPS / did)])
+    (ORA_STORE.devdumps / did / "19c" / "datapump" / sid).mkdir(parents=True, exist_ok=True)
+    sh(["chown", "-R", f"{ORACLE_UID}:{ORACLE_UID}", str(ORA_STORE.devdumps / did)])
 
 
 def dev_meta_file(sid: str, did: str) -> Path:
-    return META / sid / "devdbs" / f"{did}.json"
+    return meta_dir(sid) / "devdbs" / f"{did}.json"
 
 
 def job_dev_create(job: Job, sid: str, name: str, source: str, owner: str, image: str = "") -> None:
@@ -1038,8 +1098,8 @@ def job_dev_create(job: Job, sid: str, name: str, source: str, owner: str, image
     h = host_settings()
     defaults = {k: v for k, v in (("cpus", h["dev_cpus"]), ("memory_mb", h["dev_memory_mb"]), ("shm_mb", h["dev_shm_mb"])) if v}
     write_json(dev_meta_file(sid, did), dict(owner=owner, base=source, created=now_iso(), container=defaults))
-    vol = DEV / did
-    DEV.mkdir(parents=True, exist_ok=True)
+    vol = dev_dir(did)
+    vol.parent.mkdir(parents=True, exist_ok=True)
     job.run(["btrfs", "subvolume", "snapshot", str(src), str(vol)])
     try:
         if image and engine_of(vol) == PG and image != read_volume_env(vol).get("ZK_IMAGE"):
@@ -1061,7 +1121,7 @@ def job_dev_create(job: Job, sid: str, name: str, source: str, owner: str, image
     except Exception:
         sh(["docker", "rm", "-f", did.lower()], check=False)
         sh(["btrfs", "subvolume", "delete", str(vol)], check=False)
-        shutil.rmtree(DEVDUMPS / did, ignore_errors=True)
+        shutil.rmtree(ORA_STORE.devdumps / did, ignore_errors=True)
         sv_forget(vol)
         raise
     tl_add(sid, "dev-created", f"Entwickler-DB {name} aus {label} angelegt"
@@ -1077,7 +1137,7 @@ def job_dev_recreate(job: Job, dev: dict, source: str, new_base: bool = False) -
     src, label, lineage = resolve_source(sid, source)
     base = source if new_base else dev["base"]
     release = lineage if new_base else dev["release"]
-    vol = DEV / did
+    vol = dev_dir(did)
     job.run(["docker", "rm", "-f", dev["container"]])
     job.run(["btrfs", "subvolume", "delete", str(vol)])
     sv_forget(vol)
@@ -1099,7 +1159,7 @@ def job_dev_snapshot(job: Job, dev: dict, snap: str, description: str, consisten
     did, sid = dev["id"], dev["sid"]
     running = dev["state"] in ("bereit", "startet", "startet neu")
     stop_first = consistent and running
-    (DEVSNAPS / did).mkdir(parents=True, exist_ok=True)
+    (devsnaps_dir(did)).mkdir(parents=True, exist_ok=True)
     if stop_first:
         job.log("Entwickler-DB sauber herunterfahren")
         job.run(["docker", "stop", "-t", "600", dev["container"]], timeout=700)
@@ -1109,7 +1169,7 @@ def job_dev_snapshot(job: Job, dev: dict, snap: str, description: str, consisten
         job.log("Snapshot im laufenden Betrieb (absturzkonsistent, die DB stellt den Stand beim Start selbst wieder her)"
                 if running else "Entwickler-DB ist gestoppt, Snapshot ist konsistent")
     try:
-        job.run(["btrfs", "subvolume", "snapshot", "-r", str(DEV / did), str(DEVSNAPS / did / snap)])
+        job.run(["btrfs", "subvolume", "snapshot", "-r", str(dev_dir(did)), str(devsnaps_dir(did) / snap)])
     finally:
         if stop_first:
             t0 = time.time()
@@ -1123,7 +1183,7 @@ def job_dev_snapshot(job: Job, dev: dict, snap: str, description: str, consisten
 
 
 def delete_devsnap(sid: str, did: str, snap: str) -> None:
-    path = DEVSNAPS / did / snap
+    path = devsnaps_dir(did) / snap
     sh(["btrfs", "subvolume", "delete", str(path)])
     sv_forget(path)
     devsnap_meta_file(sid, did, snap).unlink(missing_ok=True)
@@ -1133,17 +1193,17 @@ def job_dev_delete(job: Job, dev: dict) -> None:
     did = dev["id"]
     if dev["container"]:
         job.run(["docker", "rm", "-f", dev["container"]])
-    if (DEV / did).exists():
-        job.run(["btrfs", "subvolume", "delete", str(DEV / did)])
-        sv_forget(DEV / did)
-    shutil.rmtree(DEVDUMPS / did, ignore_errors=True)
+    if (dev_dir(did)).exists():
+        job.run(["btrfs", "subvolume", "delete", str(dev_dir(did))])
+        sv_forget(dev_dir(did))
+    shutil.rmtree(ORA_STORE.devdumps / did, ignore_errors=True)
     dev_meta_file(dev["sid"], did).unlink(missing_ok=True)
     for snap in dev["snapshots"]:
         job.log(f"Snapshot {snap['name']} löschen")
         delete_devsnap(dev["sid"], did, snap["name"])
-    if (DEVSNAPS / did).is_dir():
+    if (devsnaps_dir(did)).is_dir():
         try:
-            (DEVSNAPS / did).rmdir()
+            (devsnaps_dir(did)).rmdir()
         except OSError:
             pass
     tl_add(dev["sid"], "dev-deleted", f"Entwickler-DB {dev['name']} gelöscht"
@@ -1151,7 +1211,7 @@ def job_dev_delete(job: Job, dev: dict) -> None:
 
 
 def job_dev_start(job: Job, dev: dict) -> None:
-    check_volume(DEV / dev["id"], dev["sid"])
+    check_volume(dev_dir(dev["id"]), dev["sid"])
     t0 = time.time()
     job.run(["docker", "start", dev["container"]])
     wait_ready(job, dev["container"], t0)
@@ -1226,7 +1286,8 @@ def validate_schedule(data: dict) -> dict:
         keep = int(data.get("keep") or 0)
         if keep < 0 or keep > 999:
             raise UserError("Aufbewahren: 0 (alle behalten) bis 999.")
-        out.update(keep=keep, consistent=bool(data.get("consistent", True)))
+        out.update(keep=keep, consistent=bool(data.get("consistent", True)),
+                   pg_mode=data.get("pg_mode") if data.get("pg_mode") in ("dump", "dumpall") else "dump")
     if action in ("release", "devsnap"):
         tpl = (data.get("template") or "").strip()
         sample = expand_name(tpl, dt.datetime(2026, 12, 31, 23, 59))
@@ -1356,8 +1417,8 @@ def retention_releases(job: Job, sid: str, sched_id: str, keep: int) -> None:
             job.log(f"Release {r['name']} bleibt, daran hängen noch: {', '.join(deps)}")
             continue
         job.log(f"Aufbewahrung: Release {r['name']} löschen")
-        job.run(["btrfs", "subvolume", "delete", str(GOLDEN / sid / r["name"])])
-        sv_forget(GOLDEN / sid / r["name"])
+        job.run(["btrfs", "subvolume", "delete", str(golden_dir(sid) / r["name"])])
+        sv_forget(golden_dir(sid) / r["name"])
         release_meta_file(sid, r["name"]).unlink(missing_ok=True)
         tl_add(sid, "release-deleted", f"Release {r['name']} gelöscht (Aufbewahrung)", ref=r["name"])
 
@@ -1385,7 +1446,7 @@ def job_scheduled(job: Job, sc: dict, when: dt.datetime) -> None:
         sid = sc["sid"]
         desc = f"Automatisch durch Zeitplan „{sc['label']}“"
         if sc["action"] == "release":
-            name = unique_name(expand_name(sc["template"], when), lambda n: (GOLDEN / sid / n).exists())
+            name = unique_name(expand_name(sc["template"], when), lambda n: (golden_dir(sid) / n).exists())
             job.log(f"Release-Name: {name}")
             job_release(job, sid, name, desc, schedule=sc["id"])
             retention_releases(job, sid, sc["id"], sc["keep"])
@@ -1393,7 +1454,7 @@ def job_scheduled(job: Job, sc: dict, when: dt.datetime) -> None:
             dev = find_dev(sc["dev"])
             if not dev["container"]:
                 raise RuntimeError(f"Entwickler-DB {dev['name']} hat keinen Container.")
-            name = unique_name(expand_name(sc["template"], when), lambda n: (DEVSNAPS / dev["id"] / n).exists())
+            name = unique_name(expand_name(sc["template"], when), lambda n: (devsnaps_dir(dev["id"]) / n).exists())
             job.log(f"Snapshot-Name: {name}")
             job_dev_snapshot(job, dev, name, desc, sc.get("consistent", False), schedule=sc["id"])
             retention_devsnaps(job, sid, dev["id"], sc["id"], sc["keep"])
@@ -1409,6 +1470,9 @@ def job_scheduled(job: Job, sc: dict, when: dt.datetime) -> None:
                 job.run(["docker", "stop", "-t", "600", d["container"]], timeout=700)
                 stopped += 1
             job.log(f"{stopped} Entwickler-DB(s) gestoppt")
+        elif sc["action"] == "backup" and engine_of(master_dir(sid)) == PG:
+            job_pg_backup(job, "master", sid, sc.get("pg_mode") or "dump", [], schedule=sc["id"])
+            retention_backups(job, sid, sc["id"], sc.get("keep", 0))
         elif sc["action"] == "backup":
             job_backup(job, "master", sid, True, [], sc.get("consistent", True), schedule=sc["id"])
             retention_backups(job, sid, sc["id"], sc.get("keep", 0))
@@ -1563,7 +1627,7 @@ def api_state():
             release_busy = f"release:{sid}" in _busy
         dbs.append(dict(sid=sid, master=master_info(sid, cs), releases=rels, release_busy=release_busy,
                         devdbs=my_devs, timeline=timeline(sid, rels, my_devs)))
-    du = shutil.disk_usage(BASE)
+    du = shutil.disk_usage(ORA_STORE.base)
     with _lock:
         jobs = [j.as_dict() for j in sorted(JOBS.values(), key=lambda j: j.started, reverse=True)]
     return jsonify(host=DB_HOST, image=IMAGE, disk=dict(total=du.total, used=du.used, free=du.free),
@@ -1647,13 +1711,15 @@ def container_kind(c: dict) -> str | None:
         return "Neuanlage"
     if name.startswith("zk-verify-"):
         return "Prüfstart"
-    if c["labels"].get("devdb") == "1" or os.path.dirname(mount) == os.path.realpath(DEV):
+    parent = os.path.dirname(mount)
+    if c["labels"].get("devdb") == "1" or parent in {os.path.realpath(st.dev) for st in STORES}:
         return "Entwickler-DB"
-    if os.path.dirname(mount) == os.path.realpath(MASTER):
+    if parent in {os.path.realpath(st.master) for st in STORES}:
         return "Master-DB"
-    base = os.path.realpath(BASE)
-    if mount == base or mount.startswith(base + os.sep):
-        return "Sonstiger"
+    for st in STORES:
+        base = os.path.realpath(st.base)
+        if mount == base or mount.startswith(base + os.sep):
+            return "Sonstiger"
     return None   # Container, die nichts mit zeitkapsel zu tun haben, bleiben unsichtbar
 
 
@@ -2022,7 +2088,7 @@ def api_release_create(sid):
     if not RE_RELEASE.match(name):
         raise UserError("Release-Name: Buchstaben, Ziffern, Punkt, Bindestrich, Unterstrich; "
                         "höchstens 40 Zeichen, beginnt mit Buchstabe oder Ziffer.")
-    if (GOLDEN / sid / name).exists():
+    if (golden_dir(sid) / name).exists():
         raise UserError(f"Release „{name}“ gibt es für {sid} schon.")
     description = text_field(data.get("description"), "Beschreibung")
     source = (data.get("source") or "").strip()
@@ -2040,10 +2106,10 @@ def api_release_create(sid):
 @bp.patch("/api/db/<sid>/releases/<name>")
 def api_release_update(sid, name):
     need_sid(sid)
-    if not RE_RELEASE.match(name) or not (GOLDEN / sid / name).is_dir():
+    if not RE_RELEASE.match(name) or not (golden_dir(sid) / name).is_dir():
         raise UserError("Release nicht gefunden.")
     data = request.get_json(force=True)
-    meta = release_meta(sid, name) or dict(name=name, created=(subvol_info(GOLDEN / sid / name) or {}).get("created"))
+    meta = release_meta(sid, name) or dict(name=name, created=(subvol_info(golden_dir(sid) / name) or {}).get("created"))
     meta["description"] = text_field(data.get("description"), "Beschreibung")
     write_json(release_meta_file(sid, name), meta)
     return jsonify(ok=True)
@@ -2052,7 +2118,7 @@ def api_release_update(sid, name):
 @bp.delete("/api/db/<sid>/releases/<name>")
 def api_release_delete(sid, name):
     need_sid(sid)
-    path = GOLDEN / sid / name
+    path = golden_dir(sid) / name
     if not RE_RELEASE.match(name) or not path.is_dir():
         raise UserError("Release nicht gefunden.")
     with _lock:
@@ -2080,11 +2146,11 @@ def api_dev_create(sid):
     if not RE_OWNER.match(owner):
         raise UserError("„Für wen“: höchstens 40 Zeichen, keine Sonderzeichen außer . @ -")
     did = f"{sid}-{name}"
-    if (DEV / did).exists() or any(c["name"] == did.lower() for c in containers()):
+    if (dev_dir(did)).exists() or any(c["name"] == did.lower() for c in containers()):
         raise UserError(f"Eine Entwickler-DB „{name}“ gibt es für {sid} schon.")
     image = (data.get("image") or "").strip()
     if image:
-        if engine_of(MASTER / sid) != PG:
+        if engine_of(master_dir(sid)) != PG:
             raise UserError("Eine Version lässt sich nur bei PostgreSQL-Datenbanken wählen.")
         image = check_pg_image(image)
     job = start_job(f"Entwickler-DB {name} ({sid}) anlegen", sid, f"dev:{did}",
@@ -2137,7 +2203,7 @@ def api_devsnap_create(did):
     if not RE_RELEASE.match(snap):
         raise UserError("Snapshot-Name: Buchstaben, Ziffern, Punkt, Bindestrich, Unterstrich; "
                         "höchstens 40 Zeichen, beginnt mit Buchstabe oder Ziffer.")
-    if (DEVSNAPS / did / snap).exists():
+    if (devsnaps_dir(did) / snap).exists():
         raise UserError(f"Snapshot „{snap}“ gibt es für {dev['name']} schon.")
     description = text_field(data.get("description"), "Beschreibung")
     consistent = bool(data.get("consistent"))
@@ -2305,7 +2371,7 @@ def api_schedule_run(sched_id):
 
 
 def leftovers() -> dict:
-    builds = [str(p) for p in sorted(BUILD.glob("*")) if subvol_info(p) is not None]
+    builds = [str(p) for st in STORES for p in sorted(st.build.glob("*")) if subvol_info(p) is not None]
     cs = [c["name"] for c in containers() if c["name"].startswith("release-build-") and not c["running"]]
     with _lock:
         running = any(k.startswith("release:") for k in _busy)
@@ -2314,8 +2380,8 @@ def leftovers() -> dict:
 
 @bp.get("/api/admin")
 def api_admin():
-    du = shutil.disk_usage(BASE)
-    return jsonify(host=DB_HOST, image=IMAGE, base=str(BASE), server_time=now_iso(),
+    du = shutil.disk_usage(ORA_STORE.base)
+    return jsonify(host=DB_HOST, image=IMAGE, base=str(ORA_STORE.base), pg_base=str(PG_STORE.base), meta=str(META), server_time=now_iso(),
                    disk=dict(total=du.total, used=du.used, free=du.free),
                    ports=f"{hs('dev_port_start')}–{hs('dev_port_end')}", ready_timeout=READY_TIMEOUT,
                    release_sql=RELEASE_SQL_FILE or "(eingebaut)", leftovers=leftovers(),
@@ -2428,16 +2494,16 @@ def detect_db(vol: Path) -> dict | None:
     e = read_volume_env(vol)
     return dict(sid=sid, sids=sids, ok=not problems, problems=problems, fixes=fixes,
                 type=e.get("ZK_DB_TYPE", ""), service=e.get("ZK_SERVICE") or e.get("ZK_PDB") or sid,
-                exists=(MASTER / sid).exists())
+                exists=(master_dir(sid)).exists())
 
 
 def classify_subvolume(path: Path) -> str | None:
     parent = path.parent
-    if parent == MASTER:
+    if parent in {st.master for st in STORES}:
         return "master" if RE_SID.match(path.name) else "other"
-    if parent == BUILD:
+    if parent in {st.build for st in STORES}:
         return "build"
-    if parent == IMPORT:
+    if parent == ORA_STORE.import_dir:
         return "import"
     return None
 
@@ -2447,13 +2513,13 @@ def job_adopt(job: Job, src: Path, port: int) -> None:
     if not det or not det["ok"]:
         raise RuntimeError("Keine startbare Datenbank: " + "; ".join((det or {}).get("problems", ["nichts gefunden"])))
     sid = det["sid"]
-    dst = MASTER / sid
-    if dst.exists():
+    dst = ORA_STORE.master / sid
+    if master_dir(sid).exists():
         raise RuntimeError(f"Eine Master-DB {sid} gibt es auf diesem Host schon; erst die vorhandene löschen oder umbenennen.")
     if port_in_use(port, containers()):
         raise RuntimeError(f"Port {port} ist belegt.")
     info = subvol_info(src) or {}
-    if src.parent == MASTER and not info.get("readonly"):
+    if src.parent == ORA_STORE.master and not info.get("readonly"):
         job.log(f"{src.name} → {sid} umbenennen")
         job.run(["mv", str(src), str(dst)])
         sv_forget(src)
@@ -2500,33 +2566,33 @@ def api_snapshots():
                          readonly=info["readonly"], container=c["name"] if c else None,
                          container_running=bool(c and c["running"]), usage=u, usage_pending=pending, **extra))
 
-    for p in sorted(MASTER.glob("*")):
+    for p in sorted(x for st in STORES for x in st.master.glob("*")):
         if RE_SID.match(p.name):
             add("Master-DB", p.name, p.name, p, delete="subvolume")
         else:   # z. B. DLHTEST.neu/.alt beim Umkopieren
             add("Sonstiges Subvolume", p.name.split(".")[0], p.name, p, delete="subvolume", detected=detect_db(p))
-    for p in sorted(IMPORT.glob("*")):
+    for p in sorted(ORA_STORE.import_dir.glob("*")):
         det = detect_db(p)
         add("Import", det["sid"] if det and det.get("sid") else "–", p.name, p, delete="subvolume", detected=det)
-    for p in sorted(GOLDEN.glob("*/*")):
+    for p in sorted(x for st in STORES for x in st.golden.glob("*/*")):
         add("Release", p.parent.name, p.name, p, delete="release", release=p.name)
-    for p in sorted(DEV.glob("*")):
+    for p in sorted(x for st in STORES for x in st.dev.glob("*")):
         d = devs.get(p.name, {})
         add("Entwickler-DB", p.name.partition("-")[0], p.name.partition("-")[2], p, delete="devdb",
             dev_id=p.name, owner=d.get("owner", ""))
-    for p in sorted(DEVSNAPS.glob("*/*")):
+    for p in sorted(x for st in STORES for x in st.devsnaps.glob("*/*")):
         d = devs.get(p.parent.name, {})
         add("Entwickler-Snapshot", p.parent.name.partition("-")[0], f"{p.parent.name.partition('-')[2]} / {p.name}", p,
             delete="devsnap", dev_id=p.parent.name, snap=p.name, owner=d.get("owner", ""))
-    for p in sorted(BUILD.glob("*")):
+    for p in sorted(x for st in STORES for x in st.build.glob("*")):
         add("Zwischenstand", p.name.partition("-")[0], p.name, p, delete="subvolume")
-    return jsonify(rows=rows, compsize=bool(shutil.which("compsize")), import_dir=str(IMPORT))
+    return jsonify(rows=rows, compsize=bool(shutil.which("compsize")), import_dir=str(ORA_STORE.import_dir))
 
 
 @bp.get("/api/usage")
 def api_usage():
     path = os.path.realpath(request.args.get("path", ""))
-    roots = [os.path.realpath(r) for r in (MASTER, GOLDEN, DEV, DEVSNAPS, BUILD, IMPORT)]
+    roots = [os.path.realpath(r) for st in STORES for r in (st.master, st.golden, st.dev, st.devsnaps, st.build)] + [os.path.realpath(ORA_STORE.import_dir)]
     if not any(path.startswith(r + os.sep) for r in roots) or subvol_info(Path(path)) is None:
         raise UserError("Ungültiger Pfad.")
     u, pending = usage_get(path, force=True)
@@ -2609,16 +2675,30 @@ def prepare_new_volume(job: Job, vol: Path) -> None:
         job.run(["chattr", "-C", str(vol)])
 
 
+def fs_info(path: Path) -> dict:
+    """Dateisystem eines (ggf. noch nicht vorhandenen) Pfads: Typ, Mount-Optionen, UUID, Mountpunkt."""
+    probe = Path(path)
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    p = sh(["findmnt", "-no", "FSTYPE,UUID,TARGET,OPTIONS", "-T", str(probe)], check=False)
+    parts = p.stdout.split()
+    if len(parts) < 4:
+        return dict(fstype="", uuid="", target="", compress="")
+    fstype, uuid, target, opts = parts[0], parts[1], parts[2], parts[-1]
+    compress = next((o for o in opts.split(",") if o.startswith("compress")), "")
+    return dict(fstype=fstype, uuid=uuid, target=target, compress=compress)
+
+
 def storage_info() -> dict:
-    p = sh(["findmnt", "-no", "FSTYPE,OPTIONS", "-T", str(BASE)], check=False)
-    fstype, _, opts = p.stdout.strip().partition(" ")
-    compress = next((o for o in opts.strip().split(",") if o.startswith("compress")), "")
+    fi = fs_info(ORA_STORE.base)
+    fstype, compress = fi["fstype"], fi["compress"]
     nocow = []
     for sid in master_sids():
-        vol = MASTER / sid
+        vol = master_dir(sid)
         if is_nocow(vol) or is_nocow(vol / sid):
             nocow.append(sid)
-    return dict(fstype=fstype, compress=compress, nocow_setting=NOCOW, nocow_dbs=nocow)
+    return dict(fstype=fstype, compress=compress, nocow_setting=NOCOW, nocow_dbs=nocow,
+                stores=[dict(engine=st.engine, base=str(st.base), **fs_info(st.base)) for st in STORES])
 
 
 # --------------------------------------------------------------------------- Master-DB starten und stoppen
@@ -2638,7 +2718,7 @@ def port_in_use(port: int, cs: list[dict]) -> bool:
 
 
 def master_run_cmd(sid: str, port: int) -> list[str]:
-    vol = MASTER / sid
+    vol = master_dir(sid)
     if engine_of(vol) == PG:
         return pg_run_cmd(sid.lower(), vol, port, db_meta(sid).get("container") or {}, restart=True)
     cmd = ["docker", "run", "-d", "--name", sid.lower(), "--init", "--restart", "unless-stopped",
@@ -2650,7 +2730,7 @@ def master_run_cmd(sid: str, port: int) -> list[str]:
 
 
 def job_master_start(job: Job, sid: str, port: int | None = None) -> None:
-    vol = MASTER / sid
+    vol = master_dir(sid)
     check_volume(vol, sid)
     cs = containers()
     c = master_container(sid, cs)
@@ -2734,9 +2814,9 @@ def settings_target(kind: str, ident: str) -> tuple[str, dict | None, dict, Path
 def settings_view(kind: str, ident: str) -> dict:
     sid, c, saved, _ = settings_target(kind, ident)
     running = bool(c and c["running"])
-    eng = engine_of((MASTER / sid) if kind == "master" else (DEV / ident))
+    eng = engine_of((master_dir(sid)) if kind == "master" else (dev_dir(ident)))
     ora = oracle_params(c["name"]) if running and eng == ORA else {}
-    env_shm = read_volume_env((MASTER / sid) if kind == "master" else (DEV / ident)).get("ZK_SHM_SIZE", "")
+    env_shm = read_volume_env((master_dir(sid)) if kind == "master" else (dev_dir(ident))).get("ZK_SHM_SIZE", "")
     return dict(kind=kind, id=ident, sid=sid, container=c["name"] if c else None, running=running,
                 saved=saved, env_shm=env_shm, engine=eng,
                 actual=dict(memory=c["mem_limit"], cpus=c["nano_cpus"] / 1e9 if c else 0, shm=c["shm_size"]) if c else None,
@@ -2963,7 +3043,7 @@ def job_dev_port(job: Job, dev: dict, port: int) -> None:
         if dev["state"] in ("bereit", "startet", "startet neu"):
             job.run(["docker", "stop", "-t", "600", dev["container"]], timeout=700)
         job.run(["docker", "rm", dev["container"]])
-    check_volume(DEV / did, sid)
+    check_volume(dev_dir(did), sid)
     with _port_lock:
         t0 = time.time()
         job.run(dev_run_cmd(did, sid, port, dev["release"], dev["owner"], dev["created"] or now_iso(), dev["base"]))
@@ -3080,7 +3160,7 @@ echo "ZK_DONE=1"
 
 def job_newdb(job: Job, sid: str, pdb: str, password: str, charset: str, port: int,
               memory_mb: int = 2048, ncharset: str = "AL16UTF16", start: bool = True) -> None:
-    vol = MASTER / sid
+    vol = master_dir(sid)
     reason = image_can_create()
     if reason:
         raise RuntimeError(f"Das Image {IMAGE} kann keine neuen Datenbanken anlegen ({reason}). "
@@ -3300,7 +3380,7 @@ def probe_source(src: dict) -> dict:
         problems.append(f"Das Image ({img}) ist älter als die Quelle ({ver}); erst ein passendes Image bauen.")
     elif vtuple(img) > vtuple(ver):
         warnings.append(f"Das Image ({img}) ist neuer als die Quelle ({ver}); nach dem Import läuft datapatch.")
-    if (MASTER / sid).exists():
+    if (master_dir(sid)).exists():
         problems.append(f"Auf diesem Host gibt es bereits eine Datenbank {sid}.")
     return dict(source=src, version=ver, image_version=img, status=one("ZK_STATUS"), cdb=cdb, pdbs=pdbs,
                 charset=one("ZK_CHARSET"), logmode=one("ZK_LOGMODE"), banner=banner, edition=edition,
@@ -3371,7 +3451,7 @@ def cdb_open_pdbs_and_restart(job: Job, sid: str, cname: str) -> None:
 
 def job_import(job: Job, src: dict, port: int, restart_source: bool) -> None:
     sid = src["sid"]
-    vol = MASTER / sid
+    vol = master_dir(sid)
     job.log(f"Quelle {src['user']}@{src['host']} prüfen")
     plan = probe_source(src)
     if plan["problems"]:
@@ -3603,7 +3683,8 @@ PG_LOCALES = ["C.UTF-8", "en_US.UTF-8", "C"]
 
 def job_newdb_pg(job: Job, sid: str, image: str, dbname: str, user: str, password: str, locale: str,
                  checksums: bool, port: int) -> None:
-    vol = MASTER / sid
+    vol = PG_STORE.master / sid
+    PG_STORE.master.mkdir(parents=True, exist_ok=True)
     pg_pull(job, image, always=True)
     major = image_pg_major(image)
     job.log(f"PostgreSQL {major} aus {image}")
@@ -3637,9 +3718,9 @@ def job_newdb_pg(job: Job, sid: str, image: str, dbname: str, user: str, passwor
         wait_ready(job, cname, t0)
     except Exception:
         sh(["docker", "rm", "-f", cname], check=False)
+        db_meta_file(sid).unlink(missing_ok=True)       # vor dem Löschen: danach zeigt meta_dir auf die Oracle-Ablage
         sh(["btrfs", "subvolume", "delete", str(vol)], check=False)
         sv_forget(vol)
-        db_meta_file(sid).unlink(missing_ok=True)
         raise
     finally:
         pwfile.unlink(missing_ok=True)
@@ -3656,7 +3737,7 @@ def newdb_pg_request(data: dict):
     port = int(data.get("port") or 0)
     if not RE_PGNAME.match(sid):
         raise UserError("Name: Großbuchstaben, Ziffern, Unterstrich; beginnt mit einem Buchstaben, höchstens 16 Zeichen.")
-    if (MASTER / sid).exists() or any(c["name"] == sid.lower() for c in containers()):
+    if (master_dir(sid)).exists() or any(c["name"] == sid.lower() for c in containers()):
         raise UserError(f"Eine Datenbank {sid} gibt es auf diesem Host schon.")
     if not RE_PGIDENT.match(dbname) or not RE_PGIDENT.match(user):
         raise UserError("Datenbank- und Benutzername: Kleinbuchstaben, Ziffern, Unterstrich; beginnt mit Buchstabe oder _.")
@@ -3673,11 +3754,11 @@ def newdb_pg_request(data: dict):
 # --------------------------------------------------------------------------- PostgreSQL: Version wechseln
 def job_pg_image(job: Job, kind: str, ident: str, image: str) -> None:
     if kind == "master":
-        sid, vol, c = ident, MASTER / ident, master_container(ident, containers())
+        sid, vol, c = ident, master_dir(ident), master_container(ident, containers())
         cname, label = c["name"] if c else ident.lower(), f"Master-DB {ident}"
     else:
         dev = find_dev(ident)
-        sid, vol, cname, label = dev["sid"], DEV / ident, dev["container"], f"Entwickler-DB {dev['name']}"
+        sid, vol, cname, label = dev["sid"], dev_dir(ident), dev["container"], f"Entwickler-DB {dev['name']}"
     old = read_volume_env(vol).get("ZK_IMAGE", "")
     pg_pull(job, image, always=True)
     have, want = data_pg_major(vol), image_pg_major(image)
@@ -3713,12 +3794,12 @@ def start_image_job(kind: str, ident: str):
     data = request.get_json(force=True) or {}
     image = check_pg_image(data.get("image"))
     if kind == "master":
-        vol = MASTER / need_sid(ident)
+        vol = master_dir(need_sid(ident))
     else:
         dev = find_dev(ident)
         if not dev["container"] or not dev["port"]:
             raise UserError("Zu dieser Entwickler-DB gibt es keinen Container; sie lässt sich nur löschen.")
-        vol = DEV / dev["id"]
+        vol = dev_dir(dev["id"])
     if engine_of(vol) != PG:
         raise UserError("Die Version lässt sich nur bei PostgreSQL-Datenbanken wählen.")
     if read_volume_env(vol).get("ZK_IMAGE") == image:
@@ -3777,6 +3858,219 @@ def api_registry_tags():
     return jsonify(registry_tags(force=request.args.get("refresh") == "1"))
 
 
+# --------------------------------------------------------------------------- Ablagepfade (in der Oberfläche einstellbar)
+RE_STOREPATH = re.compile(r"^/[A-Za-z0-9._/-]{1,200}$")
+
+
+def store_by_engine(engine: str) -> Store:
+    return PG_STORE if engine == PG else ORA_STORE
+
+
+def store_dbs(st: Store) -> list[dict]:
+    """Datenbanken, deren Master-Subvolume in dieser Ablage liegt (mit ihrer tatsächlichen Art)."""
+    out = []
+    if st.master.is_dir():
+        for p in sorted(st.master.iterdir()):
+            if p.is_dir() and RE_SID.match(p.name) and subvol_info(p) is not None:
+                out.append(dict(sid=p.name, engine=engine_of(p)))
+    return out
+
+
+def storage_view() -> dict:
+    stores = []
+    for st in STORES:
+        dbs = store_dbs(st)
+        misplaced = [d["sid"] for st2 in STORES if st2 is not st for d in store_dbs(st2) if d["engine"] == st.engine]
+        stores.append(dict(engine=st.engine, label=engine_label(st.engine), base=str(st.base), default=str(st.default),
+                           backups=str(st.backups), dbs=[d["sid"] for d in dbs if d["engine"] == st.engine],
+                           misplaced=misplaced, **fs_info(st.base)))
+    return dict(stores=stores, meta=str(META), busy=bool(_busy))
+
+
+def check_store_path(engine: str, path: str) -> Path:
+    path = (path or "").strip().rstrip("/")
+    if not RE_STOREPATH.match(path) or "/../" in path + "/" or "/./" in path + "/":
+        raise UserError("Absoluten Pfad angeben, z. B. /srv/postgres (Buchstaben, Ziffern, . _ - /).")
+    new = Path(path)
+    if str(new) in ("/", "/srv", "/var", "/home", "/root", "/etc", "/usr", "/opt", "/tmp"):
+        raise UserError(f"{new} ist als Ablage zu allgemein; ein eigenes Verzeichnis darunter wählen, z. B. {new}/postgres.")
+    other = ORA_STORE if engine == PG else PG_STORE
+    o = str(other.base)
+    if str(new) == o or str(new).startswith(o + "/") or o.startswith(str(new) + "/"):
+        raise UserError(f"Die Ablage darf nicht in der von {engine_label(other.engine)} ({o}) liegen und umgekehrt.")
+    m = str(META)
+    if m.startswith(str(new) + "/") and engine == PG:
+        raise UserError(f"In {new} liegen die Angaben von zeitkapsel ({m}); einen anderen Pfad wählen.")
+    fi = fs_info(new)
+    if fi["fstype"] != "btrfs":
+        raise UserError(f"{new} liegt nicht auf btrfs ({fi['fstype'] or 'unbekannt'}); Snapshots brauchen btrfs.")
+    if new.exists() and not new.is_dir():
+        raise UserError(f"{new} ist kein Verzeichnis.")
+    return new
+
+
+def move_subvolume(job: Job, src: Path, dst: Path) -> None:
+    """Subvolume innerhalb desselben btrfs verschieben – nie kopieren (os.rename statt mv)."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        raise RuntimeError(f"Ziel {dst} gibt es schon.")
+    job.log(f"  {src} → {dst}")
+    try:
+        os.rename(src, dst)
+    except OSError as e:
+        info = subvol_info(src) or {}
+        if not info.get("readonly"):
+            raise RuntimeError(f"{src} ließ sich nicht verschieben: {e}") from None
+        sh(["btrfs", "property", "set", "-ts", str(src), "ro", "false"])   # schreibgeschützte Snapshots kurz freigeben
+        try:
+            os.rename(src, dst)
+        finally:
+            sh(["btrfs", "property", "set", "-ts", str(dst if dst.exists() else src), "ro", "true"], check=False)
+    sv_forget(src)
+    sv_forget(dst)
+    usage_forget(str(src))
+
+
+def move_plain(job: Job, src: Path, dst: Path) -> None:
+    """Gewöhnliche Dateien und Verzeichnisse (Angaben, Sicherungen): umbenennen, sonst reflink-Kopie und löschen."""
+    if not src.exists():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    job.log(f"  {src} → {dst}")
+    try:
+        if dst.exists():
+            raise OSError("exists")
+        os.rename(src, dst)
+        return
+    except OSError:
+        pass
+    dst.mkdir(parents=True, exist_ok=True)
+    job.run(["cp", "-a", "--reflink=auto", f"{src}/.", f"{dst}/"], timeout=86400)
+    shutil.rmtree(src)
+
+
+def rmdir_quiet(p: Path) -> None:
+    try:
+        p.rmdir()
+    except OSError:
+        pass
+
+
+def job_relocate(job: Job, engine: str, new_base: Path) -> None:
+    """Alle Datenbanken einer Art in die (neue) Ablage verschieben und ihre Container neu erzeugen."""
+    st = store_by_engine(engine)
+    target = Store(engine, new_base, st.backups_env)
+    sources = [s2 for s2 in {str(x.base): x for x in (*STORES, st)}.values()]
+    sids = [d["sid"] for s2 in sources for d in store_dbs(s2) if d["engine"] == engine and s2.base != target.base]
+    want_uuid = fs_info(new_base)["uuid"]
+    for sid in sids:
+        if fs_info(master_dir(sid))["uuid"] != want_uuid:
+            raise RuntimeError(f"{master_dir(sid)} liegt auf einem anderen Dateisystem als {new_base}; Subvolumes lassen sich "
+                               "nur innerhalb desselben btrfs verschieben (sonst per btrfs send/receive von Hand).")
+    for d in target.dirs():
+        d.mkdir(parents=True, exist_ok=True)
+    if engine == ORA:
+        target.devdumps.mkdir(parents=True, exist_ok=True)
+    cs = containers()
+    devs_all = devdbs(cs)
+    restart: list[tuple] = []
+    for sid in sids:
+        src_st = next(x for x in sources if (x.master / sid).is_dir())
+        job.log(f"{sid}: von {src_st.base} nach {new_base}")
+        mc = master_container(sid, cs)
+        devs = [d for d in devs_all if d["sid"] == sid]
+        for c_name, running, kind, ref in ([(mc["name"], mc["running"], "master", sid)] if mc else []) + \
+                [(d["container"], d["state"] in ("bereit", "startet", "startet neu"), "dev", d) for d in devs if d["container"]]:
+            if running:
+                job.log(f"  Container {c_name} sauber herunterfahren")
+                job.run(["docker", "stop", "-t", "600", c_name], timeout=700)
+            job.run(["docker", "rm", c_name])
+            restart.append((kind, ref, running, (mc["port"] if kind == "master" else ref["port"])))
+        move_subvolume(job, src_st.master / sid, target.master / sid)
+        for p in sorted((src_st.golden / sid).glob("*")) if (src_st.golden / sid).is_dir() else []:
+            move_subvolume(job, p, target.golden / sid / p.name)
+        rmdir_quiet(src_st.golden / sid)
+        for p in sorted(src_st.dev.glob(f"{sid}-*")):
+            move_subvolume(job, p, target.dev / p.name)
+        for d in sorted(src_st.devsnaps.glob(f"{sid}-*")):
+            for p in sorted(d.iterdir()):
+                move_subvolume(job, p, target.devsnaps / d.name / p.name)
+            rmdir_quiet(d)
+        for p in sorted(src_st.devdumps.glob(f"{sid}-*")):
+            move_plain(job, p, target.devdumps / p.name)
+        move_plain(job, src_st.meta / sid, target.meta / sid)
+        if src_st.backups != target.backups:
+            move_plain(job, src_st.backups / sid, target.backups / sid)
+    if st.base != new_base:
+        conf = {}
+        try:
+            conf = json.loads(STORAGE_FILE.read_text())
+        except (OSError, ValueError):
+            pass
+        conf[engine] = str(new_base)
+        write_json(STORAGE_FILE, conf)
+        st.set_base(new_base)
+        job.log(f"Ablage für {engine_label(engine)}: {new_base}")
+    for kind, ref, running, port in restart:
+        if kind == "master":
+            cmd, name, label = master_run_cmd(ref, int(port or db_meta(ref).get("port"))), ref.lower(), f"Master-DB {ref}"
+        else:
+            cmd = dev_run_cmd(ref["id"], ref["sid"], ref["port"], ref["release"], ref["owner"], ref["created"] or now_iso(), ref["base"])
+            name, label = ref["id"].lower(), f"Entwickler-DB {ref['name']}"
+        if running:
+            job.log(f"{label} mit neuem Pfad starten")
+            t0 = time.time()
+            job.run(cmd)
+            wait_ready(job, name, t0)
+        else:   # war gestoppt: Container nur anlegen, nicht starten
+            job.log(f"{label}: Container mit neuem Pfad anlegen (bleibt gestoppt)")
+            job.run(["docker", "create"] + cmd[3:])
+    for sid in sids:
+        tl_add(sid, "storage", f"Datenbank {sid} nach {new_base} verschoben")
+    job.log(f"{len(sids)} Datenbank(en) verschoben." if sids else "Keine Datenbanken zu verschieben.")
+
+
+@bp.get("/api/storage")
+def api_storage():
+    return jsonify(storage_view())
+
+
+@bp.put("/api/storage")
+def api_storage_set():
+    data = request.get_json(force=True) or {}
+    engine = data.get("engine")
+    if engine not in (ORA, PG):
+        raise UserError("Datenbank-Art wählen.")
+    st = store_by_engine(engine)
+    new = check_store_path(engine, data.get("path"))
+    view = next(x for x in storage_view()["stores"] if x["engine"] == engine)
+    has_data = bool(view["dbs"] or view["misplaced"])
+    if new == st.base and not view["misplaced"]:
+        raise UserError("Das ist bereits die Ablage.")
+    if not has_data and not any(any(d.iterdir()) for d in st.dirs() if d.is_dir()):
+        new.mkdir(parents=True, exist_ok=True)
+        conf = {}
+        try:
+            conf = json.loads(STORAGE_FILE.read_text())
+        except (OSError, ValueError):
+            pass
+        conf[engine] = str(new)
+        write_json(STORAGE_FILE, conf)
+        st.set_base(new)
+        for d in st.dirs():
+            d.mkdir(parents=True, exist_ok=True)
+        log.info("Ablage %s → %s von %s", engine, new, actor())
+        return jsonify(ok=True, moved=False, storage=storage_view())
+    if not data.get("move"):
+        raise UserError("In der Ablage liegen Datenbanken; zum Ändern „Umziehen“ bestätigen.")
+    with _lock:
+        if _busy:
+            raise UserError("Es laufen noch Vorgänge; der Umzug startet erst, wenn alle fertig sind.")
+    new.mkdir(parents=True, exist_ok=True)
+    job = start_job(f"{engine_label(engine)}-Datenbanken nach {new} umziehen", None, "storage", job_relocate, engine, new)
+    return jsonify(job=job.as_dict(), moved=True)
+
+
 # --------------------------------------------------------------------------- Routen für Master, Neuanlage, Import
 @bp.get("/api/summary")
 def api_summary():
@@ -3785,7 +4079,7 @@ def api_summary():
     for d in devdbs(cs):   # kurz für die Seitenleiste: Name, Zustand, Port, Besitzer
         devs_by_sid.setdefault(d["sid"], []).append(dict(id=d["id"], name=d["name"], state=d["state"],
                                                          port=d["port"], owner=d["owner"]))
-    du = shutil.disk_usage(BASE)
+    du = shutil.disk_usage(ORA_STORE.base)
     with _lock:
         running = sum(1 for j in JOBS.values() if j.status == "läuft")
     return jsonify(host=DB_HOST, image=IMAGE, running_jobs=running,
@@ -3863,7 +4157,7 @@ def api_newdb():
         raise UserError("Zeichensatz nicht unterstützt.")
     if not 1024 <= port <= 65535:
         raise UserError("Port: 1024 bis 65535.")
-    if (MASTER / sid).exists():
+    if (master_dir(sid)).exists():
         raise UserError(f"Eine Datenbank {sid} gibt es auf diesem Host schon.")
     job = start_job(f"Neue Datenbank {sid} anlegen", sid, f"newdb:{sid}", job_newdb, sid, pdb, pwd, charset, port,
                     memory_mb)
@@ -3887,7 +4181,7 @@ def api_import():
     port = int(data.get("port") or 0)
     if not 1024 <= port <= 65535:
         raise UserError("Port: 1024 bis 65535.")
-    if (MASTER / src["sid"]).exists():
+    if (master_dir(src["sid"])).exists():
         raise UserError(f"Eine Datenbank {src['sid']} gibt es auf diesem Host schon.")
     job = start_job(f"Datenbank {src['sid']} von {src['host']} importieren", src["sid"], f"import:{src['sid']}",
                     job_import, src, port, bool(data.get("restart_source")))
@@ -3953,7 +4247,7 @@ def validate_local(data: dict) -> dict:
     if not RE_SID.match(src["sid"]):
         raise UserError("SID ungültig.")
     real = os.path.realpath(src["path"])
-    for managed in (MASTER, GOLDEN, DEV, DEVSNAPS, BUILD):
+    for managed in (r for st in STORES for r in (st.master, st.golden, st.dev, st.devsnaps, st.build)):
         m = os.path.realpath(managed)
         if real == m or real.startswith(m + os.sep):
             raise UserError("Das Verzeichnis gehört zur Ablage von zeitkapsel; dafür „Als Master-DB übernehmen“ in „Alle Snapshots“ nutzen.")
@@ -4058,7 +4352,7 @@ def probe_local(src: dict) -> dict:
         if c["running"] and c["mount"] and (c["mount"] == real or real.startswith(c["mount"] + os.sep)
                                              or c["mount"].startswith(real + os.sep)):
             problems.append(f"Der Container {c['name']} benutzt das Verzeichnis und läuft noch.")
-    if (MASTER / sid).exists():
+    if (master_dir(sid)).exists():
         problems.append(f"Auf diesem Host gibt es bereits eine Master-DB {sid}.")
 
     needs = {}
@@ -4130,7 +4424,7 @@ echo "ZK_DONE=1"
 
 def job_local_import(job: Job, src: dict, port: int, opts: dict) -> None:
     sid = src["sid"]
-    vol = MASTER / sid
+    vol = master_dir(sid)
     plan = probe_local(src)
     if plan["problems"]:
         raise RuntimeError("Import nicht möglich: " + " ".join(plan["problems"]))
@@ -4248,7 +4542,7 @@ def api_local_import():
         raise UserError("Speicher: 1024 bis 262144 MB.")
     if opts["sys_password"] and not RE_DBPWD.match(opts["sys_password"]):
         raise UserError("SYS-Passwort: 8–30 Zeichen mit Groß- und Kleinbuchstaben und Ziffer; erlaubt sind A–Z, a–z, 0–9, _ # $.")
-    if (MASTER / src["sid"]).exists():
+    if (master_dir(src["sid"])).exists():
         raise UserError(f"Eine Datenbank {src['sid']} gibt es auf diesem Host schon.")
     job = start_job(f"Datenbank {src['sid']} aus {src['path']} importieren", src["sid"], f"import:{src['sid']}",
                     job_local_import, src, port, opts)
@@ -4369,7 +4663,7 @@ def probe_dp(src: dict, target_sid: str = "") -> dict:
     if not schemas:
         problems.append("Keine Anwendungs-Schemas gefunden.")
     target = dict(sid=target_sid, exists=False, resume=False)
-    if target_sid and RE_SID.match(target_sid) and (MASTER / target_sid).exists():
+    if target_sid and RE_SID.match(target_sid) and (master_dir(target_sid)).exists():
         target.update(exists=True, resume=bool(db_meta(target_sid).get("dp_pending")))
         if target["resume"]:
             warnings.append(f"Die Datenbank {target_sid} stammt aus einem abgebrochenen Versuch und wird weiterverwendet; "
@@ -4432,7 +4726,7 @@ def job_dp_import(job: Job, src: dict, tgt: dict) -> None:
     if charset not in CHARSETS:
         job.log(f"Zeichensatz der Quelle {charset} wird übernommen")
     cname = sid.lower()
-    if (MASTER / sid).exists():
+    if (master_dir(sid)).exists():
         if not db_meta(sid).get("dp_pending"):
             raise RuntimeError(f"Eine Datenbank {sid} gibt es schon und stammt nicht aus einem abgebrochenen Data-Pump-Versuch.")
         job.log(f"Datenbank {sid} aus dem abgebrochenen Versuch wird weiterverwendet (keine Neuanlage)")
@@ -4459,7 +4753,7 @@ def job_dp_import(job: Job, src: dict, tgt: dict) -> None:
         # schon jetzt als fortsetzbar markieren: scheitert danach etwas (z. B. ein Port), entfällt beim nächsten Versuch dbca
         db_meta_update(sid, dp_pending=True, dp_source=f"{src['host']}:{src['port']}/{src['service']}")
         job_master_start(job, sid, tgt["port"])
-    edition = read_volume_env(MASTER / sid).get("ZK_EDITION", "enterprise")
+    edition = read_volume_env(master_dir(sid)).get("ZK_EDITION", "enterprise")
     parallel = tgt["parallel"] if edition == "enterprise" else 1
     try:
         job.run(["docker", "exec", cname, "mkdir", "-p", "/opt/oracle/oradata/zk_import"])
@@ -4611,7 +4905,7 @@ def api_dp_import():
                keep_link=bool(data.get("keep_link")))
     if not RE_NEWSID.match(tgt["sid"]):
         raise UserError("Neue SID: Großbuchstaben und Ziffern, beginnt mit einem Buchstaben, höchstens 8 Zeichen.")
-    resume = (MASTER / tgt["sid"]).exists()
+    resume = (master_dir(tgt["sid"])).exists()
     if resume and not db_meta(tgt["sid"]).get("dp_pending"):
         raise UserError(f"Eine Datenbank {tgt['sid']} gibt es auf diesem Host schon.")
     if not resume and not 1024 <= tgt["port"] <= 65535:
@@ -4632,7 +4926,6 @@ def api_dp_import():
 
 
 # --------------------------------------------------------------------------- Sicherungen per expdp, Import per impdp
-BACKUPS = Path(env("BACKUP_DIR", str(BASE / "backups")))
 RE_STAMP = re.compile(r"^\d{8}-\d{6}$")
 
 DB_INFO_SQL = r"""
@@ -4659,14 +4952,14 @@ def db_target(kind: str, ident: str) -> tuple[str, dict | None, Path, str]:
     cs = containers()
     if kind == "master":
         need_sid(ident)
-        if engine_of(MASTER / ident) == PG:
+        if engine_of(master_dir(ident)) == PG:
             raise UserError("Sicherungen und Data-Pump-Importe gibt es nur für Oracle-Datenbanken.")
-        return ident, master_container(ident, cs), MASTER / ident, f"Master-DB {ident}"
+        return ident, master_container(ident, cs), master_dir(ident), f"Master-DB {ident}"
     dev = find_dev(ident)
     if dev.get("engine") == PG:
         raise UserError("Sicherungen und Data-Pump-Importe gibt es nur für Oracle-Datenbanken.")
     c = next((x for x in cs if x["name"] == dev["container"]), None)
-    return dev["sid"], c, DEV / ident, f"Entwickler-DB {dev['name']}"
+    return dev["sid"], c, dev_dir(ident), f"Entwickler-DB {dev['name']}"
 
 
 def sqlplus_in(cname: str, sql: str, timeout: int = 300) -> subprocess.CompletedProcess:
@@ -4740,7 +5033,7 @@ def job_backup(job: Job, kind: str, ident: str, full: bool, schemas: list[str], 
             raise RuntimeError("Unbekannte oder keine Schemas: " + ", ".join(unknown or ["–"]))
     host_tmp = vol / "zk_backup" / stamp
     inner = f"/opt/oracle/oradata/zk_backup/{stamp}"
-    dest = BACKUPS / sid / stamp
+    dest = ORA_STORE.backups / sid / stamp
     job.on_cancel(lambda: shutil.rmtree(host_tmp, ignore_errors=True))
     done = False
     try:
@@ -4783,13 +5076,14 @@ def job_backup(job: Job, kind: str, ident: str, full: bool, schemas: list[str], 
 
 def list_backups() -> list[dict]:
     out = []
-    for f in BACKUPS.glob("*/*/backup.json"):
+    for f in (x for st in STORES for x in st.backups.glob("*/*/backup.json")):
         try:
             m = json.loads(f.read_text())
         except (OSError, ValueError):
             continue
         m.pop("verify_functions", None)
-        m["has_log"] = (f.parent / "export.log").exists()
+        m["has_log"] = (f.parent / "export.log").exists() or (f.parent / "dump.log").exists()
+        m.setdefault("engine", ORA)
         out.append(m)
     return sorted(out, key=lambda m: m.get("created") or "", reverse=True)
 
@@ -4797,10 +5091,11 @@ def list_backups() -> list[dict]:
 def backup_dir(sid: str, stamp: str) -> Path:
     if not RE_SID.match(sid or "") or not RE_STAMP.match(stamp or ""):
         raise UserError("Sicherung nicht gefunden.")
-    d = BACKUPS / sid / stamp
-    if not (d / "backup.json").exists():
-        raise UserError("Sicherung nicht gefunden.")
-    return d
+    for st in STORES:
+        d = st.backups / sid / stamp
+        if (d / "backup.json").exists():
+            return d
+    raise UserError("Sicherung nicht gefunden.")
 
 
 def retention_backups(job: Job, sid: str, sched_id: str, keep: int) -> None:
@@ -4809,7 +5104,7 @@ def retention_backups(job: Job, sid: str, sched_id: str, keep: int) -> None:
     mine = [b for b in list_backups() if b["sid"] == sid and b.get("schedule") == sched_id]
     for b in mine[keep:]:
         job.log(f"Aufbewahrung: Sicherung {b['stamp']} löschen")
-        shutil.rmtree(BACKUPS / sid / b["stamp"], ignore_errors=True)
+        shutil.rmtree(backup_dir(sid, b["stamp"]), ignore_errors=True)
 
 
 # --- Import aus Dump-Dateien
@@ -4818,6 +5113,8 @@ def validate_dump_source(data: dict) -> dict:
         sid, _, stamp = str(data["backup"]).partition("/")
         d = backup_dir(sid, stamp)
         meta = json.loads((d / "backup.json").read_text())
+        if meta.get("engine") == PG:
+            raise UserError("Das ist eine PostgreSQL-Sicherung; „Wiederherstellen“ öffnet dafür den PostgreSQL-Import.")
         return dict(kind="backup", backup=f"{sid}/{stamp}", dir=str(d), files=meta.get("files") or [], meta=meta)
     path = (data.get("path") or "").strip().rstrip("/")
     if not RE_ABSPATH.match(path or "x") or not Path(path).is_dir():
@@ -4954,14 +5251,14 @@ def job_dump_import(job: Job, src: dict, tgt: dict) -> None:
         if tgt.get("snapshot_before"):
             name = f"vor-import-{stamp}"
             if kind == "master":
-                (GOLDEN / sid).mkdir(parents=True, exist_ok=True)
-                job.run(["btrfs", "subvolume", "snapshot", "-r", str(vol), str(GOLDEN / sid / name)])
+                (golden_dir(sid)).mkdir(parents=True, exist_ok=True)
+                job.run(["btrfs", "subvolume", "snapshot", "-r", str(vol), str(golden_dir(sid) / name)])
                 write_json(release_meta_file(sid, name), dict(name=name, created=now_iso(), origin="Sicherung vor Import",
                                                              description=f"Automatisch vor dem Import aus {src['dir']} angelegt."))
                 tl_add(sid, "release", f"Release {name} (Stand vor dem Import)", ref=name)
             else:
-                (DEVSNAPS / ident).mkdir(parents=True, exist_ok=True)
-                job.run(["btrfs", "subvolume", "snapshot", "-r", str(vol), str(DEVSNAPS / ident / name)])
+                (devsnaps_dir(ident)).mkdir(parents=True, exist_ok=True)
+                job.run(["btrfs", "subvolume", "snapshot", "-r", str(vol), str(devsnaps_dir(ident) / name)])
                 write_json(devsnap_meta_file(sid, ident, name), dict(name=name, created=now_iso(), consistent=False,
                                                                      description="Automatisch vor dem Import angelegt."))
             job.log(f"Stand vor dem Import gesichert als {name} (im laufenden Betrieb, absturzkonsistent)")
@@ -5032,6 +5329,21 @@ def job_dump_import(job: Job, src: dict, tgt: dict) -> None:
 # --- Routen: Sicherungen und Import aus Dumps
 def start_backup(kind: str, ident: str):
     data = request.get_json(force=True) or {}
+    vol = master_dir(need_sid(ident)) if kind == "master" else dev_dir(find_dev(ident)["id"])
+    if engine_of(vol) == PG:
+        mode = data.get("mode") or "dump"
+        if mode not in PG_MODES:
+            raise UserError("Art der Sicherung: pg_dump oder pg_dumpall.")
+        dbs = [d.strip() for d in data.get("databases") or [] if d.strip()]
+        if any(not RE_PGDB.match(d) for d in dbs):
+            raise UserError("Ungültiger Datenbankname.")
+        sid, c, _, label = pg_target(kind, ident)
+        if not c or not c["running"]:
+            raise UserError(f"Die {label} läuft nicht.")
+        key = f"backup:{sid}" if kind == "master" else f"dev:{ident}"
+        job = start_job(f"Sicherung der {label} ({'pg_dumpall' if mode == 'dumpall' else 'pg_dump'})", sid, key,
+                        job_pg_backup, kind, ident, mode, dbs)
+        return jsonify(job=job.as_dict())
     full = bool(data.get("full", True))
     schemas = [s.strip().upper() for s in data.get("schemas") or [] if s.strip()]
     if not full and (not schemas or any(not RE_SCHEMA.match(s) for s in schemas)):
@@ -5057,15 +5369,16 @@ def api_dev_backup(did):
 
 @bp.get("/api/backups")
 def api_backups():
-    du = shutil.disk_usage(BACKUPS) if BACKUPS.exists() else None
-    return jsonify(backups=list_backups(), dir=str(BACKUPS), free=du.free if du else None)
+    du = shutil.disk_usage(ORA_STORE.backups) if ORA_STORE.backups.exists() else None
+    return jsonify(backups=list_backups(), dir=str(ORA_STORE.backups), pg_dir=str(PG_STORE.backups),
+                   free=du.free if du else None, pg_modes=PG_MODES)
 
 
 @bp.get("/api/backups/<sid>/<stamp>/log")
 def api_backup_log(sid, stamp):
     d = backup_dir(sid, stamp)
     try:
-        lines = (d / "export.log").read_text(errors="replace").splitlines()
+        lines = ((d / "export.log") if (d / "export.log").exists() else (d / "dump.log")).read_text(errors="replace").splitlines()
     except OSError:
         lines = []
     return jsonify(lines=lines[-5000:])
@@ -5097,7 +5410,7 @@ def api_dump_import():
                    ncharset=data.get("ncharset") or meta.get("ncharset") or "AL16UTF16")
         if not RE_NEWSID.match(tgt["sid"]):
             raise UserError("Neue SID: Großbuchstaben und Ziffern, beginnt mit einem Buchstaben, höchstens 8 Zeichen.")
-        if (MASTER / tgt["sid"]).exists():
+        if (master_dir(tgt["sid"])).exists():
             raise UserError(f"Eine Datenbank {tgt['sid']} gibt es auf diesem Host schon.")
         check_new_port(tgt["port"], None)
         if not RE_DBPWD.match(tgt["password"]):
@@ -5124,6 +5437,333 @@ def api_dump_import():
     return jsonify(job=job.as_dict())
 
 
+# --------------------------------------------------------------------------- PostgreSQL: Sichern (pg_dump / pg_dumpall) und Wiederherstellen
+PG_MODES = {"dump": "pg_dump je Datenbank (Custom-Format) plus Rollen", "dumpall": "pg_dumpall (ganzer Cluster als SQL)"}
+RE_PGDB = re.compile(r"^[A-Za-z_][A-Za-z0-9_$-]{0,62}$")
+
+
+def pg_target(kind: str, ident: str) -> tuple[str, dict | None, Path, str]:
+    cs = containers()
+    if kind == "master":
+        need_sid(ident)
+        vol, c, label = master_dir(ident), master_container(ident, cs), f"Master-DB {ident}"
+        sid = ident
+    else:
+        dev = find_dev(ident)
+        vol, sid, label = dev_dir(ident), dev["sid"], f"Entwickler-DB {dev['name']}"
+        c = next((x for x in cs if x["name"] == dev["container"]), None)
+    if engine_of(vol) != PG:
+        raise UserError(f"Die {label} ist keine PostgreSQL-Datenbank.")
+    return sid, c, vol, label
+
+
+def pg_exec(cname: str, user: str, *args: str) -> list[str]:
+    return ["docker", "exec", "-u", "postgres", cname, *args[:1], "-U", user, *args[1:]]
+
+
+def pg_query(cname: str, user: str, sql: str, db: str = "postgres") -> list[list[str]]:
+    p = sh(pg_exec(cname, user, "psql", "-X", "-q", "-At", "-F", "\t", "-d", db, "-c", sql), check=False, timeout=120)
+    if p.returncode:
+        raise RuntimeError((p.stderr or p.stdout).strip()[-300:] or "psql fehlgeschlagen")
+    return [line.split("\t") for line in p.stdout.splitlines() if line]
+
+
+def pg_databases(cname: str, user: str) -> list[dict]:
+    rows = pg_query(cname, user, "select datname, pg_database_size(datname) from pg_database "
+                                 "where not datistemplate and datallowconn order by 1")
+    return [dict(name=r[0], size=int(r[1])) for r in rows]
+
+
+def shq(args: list[str]) -> str:
+    return " ".join(shlex.quote(a) for a in args)
+
+
+def job_pg_backup(job: Job, kind: str, ident: str, mode: str, dbs: list[str], schedule: str = "") -> None:
+    sid, c, vol, label = pg_target(kind, ident)
+    if not c or not c["running"]:
+        raise RuntimeError(f"Die {label} läuft nicht; gesichert wird aus der laufenden Datenbank.")
+    user = read_volume_env(vol).get("ZK_PG_USER", "postgres")
+    cname = c["name"]
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = PG_STORE.backups / sid / stamp
+    version = pg_query(cname, user, "show server_version")[0][0]
+    all_dbs = pg_databases(cname, user)
+    names = [d["name"] for d in all_dbs]
+    if mode == "dump":
+        sel = dbs or names
+        unknown = [d for d in sel if d not in names]
+        if unknown:
+            raise RuntimeError("Unbekannte Datenbanken: " + ", ".join(unknown))
+    else:
+        sel = names
+    dest.mkdir(parents=True, exist_ok=True)
+    logf = dest / "dump.log"
+    job.on_cancel(lambda: shutil.rmtree(dest, ignore_errors=True))
+    done = False
+    files: list[str] = []
+    try:
+        def pipe(cmd: list[str], out: str, gz: bool):
+            files.append(out)
+            script = "set -o pipefail; " + shq(cmd) + f" 2>>{shlex.quote(str(logf))}" + \
+                     (" | gzip -6" if gz else "") + f" > {shlex.quote(str(dest / out))}"
+            job.run(["bash", "-c", script], timeout=86400)
+        if mode == "dumpall":
+            job.log(f"pg_dumpall: alle Datenbanken, Rollen und Tablespaces als SQL ({', '.join(sel)}); die Datenbank läuft weiter")
+            pipe(pg_exec(cname, user, "pg_dumpall"), "all.sql.gz", True)
+        else:
+            job.log("Rollen und Tablespaces (pg_dumpall --globals-only)")
+            pipe(pg_exec(cname, user, "pg_dumpall", "--globals-only"), "globals.sql.gz", True)
+            for db in sel:
+                job.log(f"pg_dump {db} (Custom-Format)")
+                pipe(pg_exec(cname, user, "pg_dump", "-Fc", "-d", db), f"{db}.dump", False)
+        size = sum((dest / f).stat().st_size for f in files)
+        meta = dict(id=f"{sid}/{stamp}", sid=sid, stamp=stamp, created=now_iso(), by=actor(), source=label, kind=kind,
+                    ident=ident, engine=PG, mode=mode, databases=sel, database_sizes={d["name"]: d["size"] for d in all_dbs},
+                    full=mode == "dumpall" or set(sel) == set(names), version=version, image=c["image"], user=user,
+                    files=files, size=size, consistent=True, schedule=schedule)
+        write_json(dest / "backup.json", meta)
+        done = True
+    finally:
+        if not done:
+            shutil.rmtree(dest, ignore_errors=True)
+    tl_add(sid, "backup", f"Sicherung {stamp} der {label} ({PG_MODES[mode].split(' (')[0]}, {size / 1024 ** 2:.0f} MB)",
+           ref=f"{sid}/{stamp}")
+    job.log(f"Sicherung fertig: {len(files)} Dateien, {size / 1024 ** 2:.1f} MB in {dest}")
+
+
+# --- Quelle einer Wiederherstellung
+def sniff_dump(path: Path) -> dict:
+    """Art einer Dump-Datei: custom (pg_dump -Fc), dumpall (SQL des ganzen Clusters) oder plain (SQL einer DB)."""
+    import gzip
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+        if head[:2] == b"\x1f\x8b":
+            with gzip.open(path, "rb") as f:
+                head = f.read(65536)
+            gz = True
+        else:
+            gz = False
+    except OSError as e:
+        raise UserError(f"{path}: {e}") from None
+    if head.startswith(b"PGDMP"):
+        return dict(format="custom", gz=gz)
+    text = head.decode("utf-8", "replace")
+    ver = re.search(r"-- Dumped from database version (\S+)", text)
+    if "PostgreSQL database cluster dump" in text:
+        return dict(format="dumpall", gz=gz, version=ver.group(1) if ver else "")
+    if "PostgreSQL database dump" in text:
+        return dict(format="plain", gz=gz, version=ver.group(1) if ver else "")
+    raise UserError(f"{path.name} ist kein erkennbarer PostgreSQL-Dump (pg_dump -Fc, pg_dump als SQL oder pg_dumpall).")
+
+
+def dumpall_databases(path: Path, gz: bool) -> list[str]:
+    import gzip
+    out = []
+    opener = gzip.open if gz else open
+    with opener(path, "rt", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = re.match(r'^CREATE DATABASE ("(?:[^"]|"")+"|\w+)', line)
+            if m:
+                out.append(m.group(1).strip('"').replace('""', '"'))
+    return out
+
+
+def pg_restore_source(data: dict) -> dict:
+    """Liste der Wiederherstellungs-Schritte aus einer Sicherung von zeitkapsel oder einer Datei auf dem Host."""
+    items: list[dict] = []
+    if data.get("backup"):
+        sid, _, stamp = str(data["backup"]).partition("/")
+        d = backup_dir(sid, stamp)
+        meta = json.loads((d / "backup.json").read_text())
+        if meta.get("engine") != PG:
+            raise UserError("Das ist eine Oracle-Sicherung; dafür den Import-Assistenten für Oracle nutzen.")
+        for f in meta.get("files") or []:
+            p = d / f
+            if f == "all.sql.gz":
+                items.append(dict(file=str(p), format="dumpall", gz=True, databases=meta.get("databases") or []))
+            elif f == "globals.sql.gz":
+                items.append(dict(file=str(p), format="globals", gz=True))
+            elif f.endswith(".dump"):
+                items.append(dict(file=str(p), format="custom", gz=False, database=f[:-5], target=f[:-5]))
+        return dict(kind="backup", backup=f"{sid}/{stamp}", label=f"Sicherung {sid}/{stamp}", version=meta.get("version", ""),
+                    items=items, meta=meta)
+    path = Path((data.get("path") or "").strip())
+    if not RE_ABSPATH.match(str(path)) or not path.exists():
+        raise UserError("Datei oder Verzeichnis auf dem Host angeben (absoluter Pfad).")
+    files = [path] if path.is_file() else sorted(p for p in path.iterdir() if p.is_file() and p.suffix in (".dump", ".sql", ".gz", ".backup"))
+    version = ""
+    for p in files:
+        try:
+            info = sniff_dump(p)
+        except UserError:
+            if path.is_file():
+                raise
+            continue
+        version = version or info.get("version", "")
+        stem = re.sub(r"\.(sql|dump|backup)$", "", p.name.removesuffix(".gz"))
+        if p.name.startswith("globals"):
+            info["format"] = "globals"
+        if info["format"] == "dumpall":
+            info["databases"] = None        # wird erst beim Überschreiben ermittelt (ganze Datei lesen)
+        elif info["format"] in ("custom", "plain"):
+            info.update(database=stem, target=re.sub(r"[^A-Za-z0-9_]", "_", stem)[:63] or "restored")
+        items.append(dict(file=str(p), **info))
+    if not items:
+        raise UserError("Keine PostgreSQL-Dumps gefunden (.dump, .sql, .sql.gz).")
+    items.sort(key=lambda i: {"globals": 0, "dumpall": 1}.get(i["format"], 2))   # Rollen zuerst
+    return dict(kind="path", label=str(path), version=version, items=items, meta=None)
+
+
+@bp.post("/api/import/pg/probe")
+def api_pg_probe():
+    src = pg_restore_source(request.get_json(force=True) or {})
+    src["formats"] = sorted({i["format"] for i in src["items"]})
+    return jsonify(src)
+
+
+# --- Wiederherstellen
+def pg_drop_db(job: Job, cname: str, user: str, db: str) -> None:
+    q = '"' + db.replace('"', '""') + '"'
+    job.log(f"  Datenbank {db} entfernen (Verbindungen werden getrennt)")
+    job.run(pg_exec(cname, user, "psql", "-X", "-q", "-d", "template1", "-c",
+                    f"select pg_terminate_backend(pid) from pg_stat_activity where datname = '{db.replace(chr(39), chr(39) * 2)}' "
+                    "and pid <> pg_backend_pid()"), allow_fail=True)
+    job.run(pg_exec(cname, user, "psql", "-X", "-q", "-d", "template1", "-c", f"drop database if exists {q}"))
+
+
+def pg_feed(job: Job, item: dict, cmd: list[str], errors: list[str]) -> None:
+    """Datei per stdin in einen Befehl im Container schicken; Fehlermeldungen sammeln statt abbrechen."""
+    reader = f"gzip -dc {shlex.quote(item['file'])}" if item.get("gz") else f"cat {shlex.quote(item['file'])}"
+    script = f"set -o pipefail; {reader} | docker exec -i {shq(cmd[2:])}"
+    p = job.run(["bash", "-c", script], timeout=86400, allow_fail=True, quiet=True)
+    out = (p.stdout or "") + (p.stderr or "")
+    errs = [l.strip() for l in out.splitlines() if "ERROR:" in l or "error:" in l.lower() and "pg_restore" in l]
+    benign = [e for e in errs if re.search(r'role "[^"]+" already exists|database "[^"]+" already exists', e)]
+    real = [e for e in errs if e not in benign]
+    errors += real
+    if p.returncode == 0:      # bei Exit-Code ≠ 0 hat job.run die letzten Zeilen schon protokolliert
+        for e in real[:15]:
+            job.log("  " + e[:300])
+    job.log(f"  {len(real)} Fehler" + (f", {len(benign)} erwartete Meldungen (Rolle bzw. Datenbank existiert schon)" if benign else ""))
+
+
+def pg_restore_into(job: Job, cname: str, user: str, src: dict, overwrite: bool, renames: dict) -> list[str]:
+    errors: list[str] = []
+    for item in src["items"]:
+        fmt = item["format"]
+        name = Path(item["file"]).name
+        if fmt in ("globals", "dumpall"):
+            if fmt == "dumpall" and overwrite:
+                dbs = item.get("databases")
+                if dbs is None:
+                    job.log(f"{name}: enthaltene Datenbanken ermitteln")
+                    dbs = dumpall_databases(Path(item["file"]), item.get("gz"))
+                for db in dbs:
+                    pg_drop_db(job, cname, user, db)
+                job.log("  Datenbank postgres leeren (pg_dumpall spielt ihren Inhalt ein)")
+                pg_drop_db(job, cname, user, "postgres")
+                job.run(pg_exec(cname, user, "psql", "-X", "-q", "-d", "template1", "-c", "create database postgres"))
+            job.log(f"{name}: {'Rollen und Tablespaces' if fmt == 'globals' else 'ganzer Cluster'} mit psql einspielen")
+            pg_feed(job, item, ["docker", "exec", "-u", "postgres", cname, "psql", "-X", "-q", "-U", user, "-d", "postgres"], errors)
+            continue
+        target = renames.get(item["database"], item.get("target") or item["database"])
+        if not RE_PGDB.match(target):
+            raise RuntimeError(f"Ungültiger Datenbankname: {target}")
+        pg_drop_db(job, cname, user, target)          # leer neu anlegen, auch „postgres“
+        qt = '"' + target.replace('"', '""') + '"'
+        job.run(pg_exec(cname, user, "psql", "-X", "-q", "-d", "template1", "-c", f"create database {qt}"))
+        if fmt == "custom":
+            job.log(f"{name} → Datenbank {target} (pg_restore)")
+            pg_feed(job, item, ["docker", "exec", "-u", "postgres", cname, "pg_restore", "-U", user, "-d", target,
+                                "--no-password"], errors)
+        else:
+            job.log(f"{name} → Datenbank {target} (psql)")
+            pg_feed(job, item, ["docker", "exec", "-u", "postgres", cname, "psql", "-X", "-q", "-U", user, "-d", target], errors)
+    return errors
+
+
+def job_pg_restore(job: Job, src: dict, tgt: dict) -> None:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    if tgt["mode"] == "new":
+        sid = tgt["sid"]
+        job_newdb_pg(job, sid, tgt["image"], "postgres", tgt["user"], tgt["password"], tgt["locale"], True, tgt["port"])
+        cname, user, label, overwrite = sid.lower(), tgt["user"], f"neue Datenbank {sid}", False
+    else:
+        kind, ident = tgt["kind"], tgt["ident"]
+        sid, c, vol, label = pg_target(kind, ident)
+        if not c or not c["running"]:
+            raise RuntimeError(f"Die {label} läuft nicht.")
+        cname, user, overwrite = c["name"], read_volume_env(vol).get("ZK_PG_USER", "postgres"), True
+        if tgt.get("snapshot_before"):
+            name = f"vor-import-{stamp}"
+            pg_checkpoint(cname)
+            if kind == "master":
+                golden_dir(sid).mkdir(parents=True, exist_ok=True)
+                job.run(["btrfs", "subvolume", "snapshot", "-r", str(vol), str(golden_dir(sid) / name)])
+                write_json(release_meta_file(sid, name), dict(name=name, created=now_iso(), origin="Sicherung vor Import",
+                                                             description=f"Automatisch vor dem Import aus {src['label']} angelegt."))
+                tl_add(sid, "release", f"Release {name} (Stand vor dem Import)", ref=name)
+            else:
+                devsnaps_dir(ident).mkdir(parents=True, exist_ok=True)
+                job.run(["btrfs", "subvolume", "snapshot", "-r", str(vol), str(devsnaps_dir(ident) / name)])
+                write_json(devsnap_meta_file(sid, ident, name), dict(name=name, created=now_iso(), consistent=False,
+                                                                     description="Automatisch vor dem Import angelegt."))
+            job.log(f"Stand vor dem Import gesichert als {name}")
+    job.log(f"Einspielen aus {src['label']} in die {label}")
+    errors = pg_restore_into(job, cname, user, src, overwrite, tgt.get("renames") or {})
+    if tgt["mode"] == "new":
+        vol = master_dir(sid)
+        restored = [d["name"] for d in pg_databases(cname, user) if d["name"] != "postgres"]
+        if restored:
+            update_volume_env(vol, ZK_PG_DB=restored[0], ZK_SERVICE=restored[0])
+            job.log(f"JDBC-URL zeigt auf die Datenbank {restored[0]}")
+    tl_add(sid, "import", f"Import aus {src['label']}" + (f" mit {len(errors)} Fehlern" if errors else ""))
+    if errors:
+        job.log(f"Import abgeschlossen, aber mit {len(errors)} Fehlermeldungen (siehe oben).")
+
+
+@bp.post("/api/import/pg")
+def api_pg_import():
+    data = request.get_json(force=True) or {}
+    src = pg_restore_source(data)
+    mode = data.get("target_mode")
+    renames = {k: v for k, v in (data.get("renames") or {}).items() if isinstance(v, str) and v}
+    for v in renames.values():
+        if not RE_PGDB.match(v):
+            raise UserError(f"Ungültiger Datenbankname: {v}")
+    if mode == "new":
+        tgt = dict(mode="new", sid=(data.get("target_sid") or "").strip().upper(), image=check_pg_image(data.get("image")),
+                   port=int(data.get("target_port") or 0), user=(data.get("user") or "postgres").strip(),
+                   password=data.get("target_password") or "", locale=data.get("locale") or PG_LOCALES[0], renames=renames)
+        if not RE_PGNAME.match(tgt["sid"]):
+            raise UserError("Name: Großbuchstaben, Ziffern, Unterstrich; höchstens 16 Zeichen.")
+        if master_dir(tgt["sid"]).exists() or any(c["name"] == tgt["sid"].lower() for c in containers()):
+            raise UserError(f"Eine Datenbank {tgt['sid']} gibt es auf diesem Host schon.")
+        if not RE_PGIDENT.match(tgt["user"]):
+            raise UserError("Superuser: Kleinbuchstaben, Ziffern, Unterstrich.")
+        if not 8 <= len(tgt["password"]) <= 100:
+            raise UserError("Passwort: 8 bis 100 Zeichen.")
+        if tgt["locale"] not in PG_LOCALES:
+            raise UserError("Locale nicht unterstützt.")
+        check_new_port(tgt["port"], None)
+        key, sid, title = f"newdb:{tgt['sid']}", tgt["sid"], f"neue PostgreSQL-DB {tgt['sid']}"
+    elif mode == "overwrite":
+        kind, ident = data.get("target_kind"), (data.get("target_ident") or "").strip()
+        if kind not in ("master", "dev"):
+            raise UserError("Ziel wählen.")
+        sid, c, _, label = pg_target(kind, ident)
+        expected = ident if kind == "master" else ident.partition("-")[2]
+        if (data.get("confirm") or "").strip() != expected:
+            raise UserError(f"Zur Bestätigung „{expected}“ eingeben – die betroffenen Datenbanken der {label} werden ersetzt.")
+        tgt = dict(mode="overwrite", kind=kind, ident=ident, snapshot_before=bool(data.get("snapshot_before", True)), renames=renames)
+        key, title = (f"master:{ident}" if kind == "master" else f"dev:{ident}"), f"{label} (überschreiben)"
+    else:
+        raise UserError("Ziel wählen: neue Datenbank oder vorhandene überschreiben.")
+    job = start_job(f"Import aus {src['label']} → {title}", sid, key, job_pg_restore, src, tgt)
+    return jsonify(job=job.as_dict())
+
+
 # --------------------------------------------------------------------------- Start
 def start_agent() -> None:
     """Verzeichnisse anlegen und den Zeitplaner starten (einmal pro Prozess)."""
@@ -5131,8 +5771,12 @@ def start_agent() -> None:
         raise SystemExit("ZK_AGENT_TOKEN ist nicht gesetzt – Agent kann nicht starten.")
     if os.geteuid() != 0:
         log.warning("Agent läuft nicht als root; btrfs- und docker-Befehle werden scheitern.")
-    for d in (MASTER, GOLDEN, DEV, DEVSNAPS, BUILD, DEVDUMPS, IMPORT, META, BACKUPS):
-        d.mkdir(parents=True, exist_ok=True)
+    META.mkdir(parents=True, exist_ok=True)
+    for st in STORES:
+        for d in st.dirs():
+            d.mkdir(parents=True, exist_ok=True)
+    ORA_STORE.devdumps.mkdir(parents=True, exist_ok=True)
+    ORA_STORE.import_dir.mkdir(parents=True, exist_ok=True)
     jobs_housekeeping()
     threading.Thread(target=scheduler_loop, daemon=True, name="zeitplaner").start()
     threading.Thread(target=usage_worker, daemon=True, name="platzermittlung").start()

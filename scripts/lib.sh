@@ -18,6 +18,11 @@ zk_read_env /etc/zeitkapsel.env
 BASE=${ZK_BASE:-${ZKV[ZK_BASE]:-/srv/oradb}}
 IMAGE=${ZK_IMAGE:-${ZKV[ZK_IMAGE]:-oracle/database:19.30.0-ee}}
 MASTER_DUMPS=${ZK_MASTER_DUMPS:-${ZKV[ZK_MASTER_DUMPS]:-/srv/oradumps}}
+# In der Oberfläche eingestellte Oracle-Ablage (Verwaltung → Ablage) hat Vorrang
+if [ -f "$BASE/meta/storage.json" ]; then
+  _ora=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("oracle",""))' "$BASE/meta/storage.json" 2>/dev/null || true)
+  [ -n "$_ora" ] && BASE=$_ora
+fi
 
 zk_extra_args() {   # zusätzliche docker-run-Argumente aus <vol>/zeitkapsel.env nach EXTRA
   local vol=$1 m
