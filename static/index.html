@@ -756,6 +756,7 @@ function renderDb(db) {
         ${isAdmin() ? `${m.state === "gestoppt" || m.state === "kein Container"
             ? `<button data-act="master-start" data-port="${m.port || ""}">Master starten</button>`
             : `<button data-act="master-stop">Master stoppen</button>`}
+          <button data-act="master-port" data-sid="${esc(db.sid)}" data-port="${m.port || ""}">Port ändern</button>
           <button data-act="note-add">Notiz hinzufügen</button>
           <button class="primary" data-act="release-new" ${db.release_busy ? 'disabled title="Ein Release wird gerade erstellt"' : ""}>${db.release_busy ? "Release wird erstellt …" : "Release erstellen"}</button>` : ""}
       </div>
@@ -928,6 +929,7 @@ function renderDevs(db) {
           : `<button class="quiet small" data-act="dev-start" data-id="${esc(d.id)}" ${working ? "disabled" : ""}>Starten</button>`}
         ${noCont ? "" : `<button class="quiet small" data-act="snap-new" data-id="${esc(d.id)}" ${working ? "disabled" : ""}>Snapshot erstellen</button>`}
         ${noCont ? "" : `<button class="quiet small" data-act="dev-reset" data-id="${esc(d.id)}" ${working || !d.base ? "disabled" : ""}>Auf Ausgangsstand zurücksetzen</button>`}
+        <button class="quiet small" data-act="dev-port" data-id="${esc(d.id)}" data-port="${d.port || ""}" ${working ? "disabled" : ""}>Port ändern</button>
         ${isAdmin() ? `<button class="quiet small" data-act="dev-owner" data-id="${esc(d.id)}">Besitzer ändern</button>` : ""}
         <button class="quiet small danger" data-act="dev-del" data-id="${esc(d.id)}" ${working ? "disabled" : ""}>Löschen</button>
       </div>` : ""}
@@ -1483,6 +1485,8 @@ function renderJobsPage() {
       <td><div class="acts">${ctMine(c) ? `
         ${c.running ? `<button class="quiet small" data-act="ct-stop" data-name="${esc(c.name)}" data-kind="${esc(c.kind)}">Stoppen</button>
         <button class="quiet small danger" data-act="ct-kill" data-name="${esc(c.name)}" data-kind="${esc(c.kind)}">Abschießen</button>` : ""}
+        ${c.kind === "Master-DB" ? `<button class="quiet small" data-act="master-port" data-sid="${esc(c.sid)}" data-port="${c.port || ""}">Port ändern</button>` : ""}
+        ${c.kind === "Entwickler-DB" && c.dev_id ? `<button class="quiet small" data-act="dev-port" data-id="${esc(c.dev_id)}" data-port="${c.port || ""}">Port ändern</button>` : ""}
         ${isAdmin() && !["Master-DB", "Entwickler-DB"].includes(c.kind) ? `<button class="quiet small danger" data-act="ct-remove" data-name="${esc(c.name)}">Entfernen</button>` : ""}` : ""}</div></td></tr>`).join("");
   const filters = { alle: () => true, laufend: j => j.status === "läuft", fehler: j => ["fehlgeschlagen", "abgebrochen", "unterbrochen"].includes(j.status), meine: j => j.actor === me };
   const jobs = jobsPage.jobs.filter(filters[jobsFilter] || filters.alle);
@@ -1566,6 +1570,21 @@ document.addEventListener("click", async ev => {
         let port = +b.dataset.port || 0;
         if (!port) { port = +prompt(`Port für die Master-DB ${db.sid}:`, "1521"); if (!port) return; }
         startedJob(await api("POST", `/api/db/${encodeURIComponent(db.sid)}/master/start`, { port })); await refresh();
+        break;
+      }
+      case "master-port":
+      case "dev-port": {
+        const isMaster = act === "master-port";
+        const cur = +b.dataset.port || 0;
+        let suggestion = "";
+        try { suggestion = (await api("GET", "/api/ports/free?start=" + (isMaster ? 1521 : 15211))).port; } catch {}
+        const what = isMaster ? `Master-DB ${b.dataset.sid}` : `Entwickler-DB ${b.dataset.id.split("-").slice(1).join("-")}`;
+        const answer = prompt(`Neuer Port für die ${what}${cur ? ` (bisher ${cur})` : ""}:\n\nDer Container wird dafür sauber heruntergefahren und mit dem neuen Port neu erzeugt; die Daten bleiben unverändert. Verbindungen über den alten Port funktionieren danach nicht mehr.`, String(suggestion || ""));
+        const port = +answer;
+        if (!answer) return;
+        if (!port) { toast("Ungültiger Port"); return; }
+        const url = isMaster ? `/api/db/${encodeURIComponent(b.dataset.sid)}/master/port` : `/api/devdbs/${encodeURIComponent(b.dataset.id)}/port`;
+        startedJob(await api("POST", url, { port })); await refresh(); if (view.kind === "jobs") await loadJobsPage();
         break;
       }
       case "dev-owner": {

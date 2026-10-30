@@ -2137,7 +2137,8 @@ def job_master_start(job: Job, sid: str, port: int | None = None) -> None:
         if any(x["name"] == sid.lower() for x in cs):
             raise RuntimeError(f"Ein anderer Container heißt bereits „{sid.lower()}“.")
         if port_in_use(int(port), cs):
-            raise RuntimeError(f"Port {port} ist belegt.")
+            raise RuntimeError(f"Port {port} ist belegt; bei der Datenbank über „Port ändern“ einen freien wählen. "
+                               "Die Datenbank selbst ist unverändert.")
         job.run(master_run_cmd(sid, int(port)))
         db_meta_update(sid, port=int(port))
     wait_ready(job, c["name"] if c else sid.lower(), t0)
@@ -2151,6 +2152,82 @@ def job_master_stop(job: Job, sid: str) -> None:
         return
     job.run(["docker", "stop", "-t", "600", c["name"]], timeout=700)
     tl_add(sid, "master", f"Master-DB {sid} gestoppt")
+
+
+# --------------------------------------------------------------------------- Port ändern
+def free_port(start: int, cs: list[dict] | None = None) -> int:
+    cs = cs if cs is not None else containers()
+    for port in range(max(1024, start), 65536):
+        if not port_in_use(port, cs):
+            return port
+    raise RuntimeError("Kein freier Port gefunden.")
+
+
+def check_new_port(port: int, own_container: str | None) -> None:
+    if not 1024 <= port <= 65535:
+        raise UserError("Port: 1024 bis 65535.")
+    others = [c for c in containers() if c["name"] != own_container]
+    if port_in_use(port, others):
+        raise UserError(f"Port {port} ist belegt (von einem Container oder einem anderen Dienst auf dem Host).")
+
+
+def job_master_port(job: Job, sid: str, port: int) -> None:
+    """Docker kann die Portzuordnung eines Containers nicht ändern: Container mit neuem Port neu erzeugen."""
+    c = master_container(sid, containers())
+    old = (c["port"] if c else None) or db_meta(sid).get("port")
+    if c:
+        if c["running"]:
+            job.log(f"Master-DB {sid} sauber herunterfahren")
+            job.run(["docker", "stop", "-t", "600", c["name"]], timeout=700)
+        job.run(["docker", "rm", c["name"]])
+    db_meta_update(sid, port=port)
+    tl_add(sid, "master-port", f"Port der Master-DB {sid}: {old or '–'} → {port}")
+    job_master_start(job, sid, port)
+
+
+def job_dev_port(job: Job, dev: dict, port: int) -> None:
+    did, sid = dev["id"], dev["sid"]
+    if dev["container"]:
+        if dev["state"] in ("bereit", "startet", "startet neu"):
+            job.run(["docker", "stop", "-t", "600", dev["container"]], timeout=700)
+        job.run(["docker", "rm", dev["container"]])
+    check_volume(DEV / did, sid)
+    with _port_lock:
+        t0 = time.time()
+        job.run(dev_run_cmd(did, sid, port, dev["release"], dev["owner"], dev["created"] or now_iso(), dev["base"]))
+    tl_add(sid, "dev-port", f"Port der Entwickler-DB {dev['name']}: {dev['port'] or '–'} → {port}", ref=did)
+    wait_ready(job, did.lower(), t0)
+
+
+@bp.get("/api/ports/free")
+def api_free_port():
+    return jsonify(port=free_port(int(request.args.get("start") or 1521)))
+
+
+@bp.post("/api/db/<sid>/master/port")
+def api_master_port(sid):
+    need_sid(sid)
+    port = int((request.get_json(force=True) or {}).get("port") or 0)
+    c = master_container(sid, containers())
+    if c and c["port"] == port:
+        raise UserError(f"Die Master-DB läuft bereits auf Port {port}.")
+    check_new_port(port, c["name"] if c else None)
+    job = start_job(f"Port der Master-DB {sid} auf {port} ändern", sid, f"master:{sid}", job_master_port, sid, port)
+    return jsonify(job=job.as_dict())
+
+
+@bp.post("/api/devdbs/<did>/port")
+def api_dev_port(did):
+    dev = find_dev(did)
+    port = int((request.get_json(force=True) or {}).get("port") or 0)
+    if dev["port"] == port:
+        raise UserError(f"Die Entwickler-DB läuft bereits auf Port {port}.")
+    if not (DEV_PORT_START <= port <= DEV_PORT_END):
+        raise UserError(f"Entwickler-DBs nutzen Ports von {DEV_PORT_START} bis {DEV_PORT_END}.")
+    check_new_port(port, dev["container"])
+    job = start_job(f"Port der Entwickler-DB {dev['name']} auf {port} ändern", dev["sid"], f"dev:{did}",
+                    job_dev_port, dev, port)
+    return jsonify(job=job.as_dict())
 
 
 # --------------------------------------------------------------------------- neue Datenbank anlegen
@@ -2230,7 +2307,7 @@ echo "ZK_DONE=1"
 
 
 def job_newdb(job: Job, sid: str, pdb: str, password: str, charset: str, port: int,
-              memory_mb: int = 2048, ncharset: str = "AL16UTF16") -> None:
+              memory_mb: int = 2048, ncharset: str = "AL16UTF16", start: bool = True) -> None:
     vol = MASTER / sid
     reason = image_can_create()
     if reason:
@@ -2269,7 +2346,8 @@ def job_newdb(job: Job, sid: str, pdb: str, password: str, charset: str, port: i
         raise
     db_meta_update(sid, port=port, origin="neu angelegt", created=now_iso())
     tl_add(sid, "db-created", f"Datenbank {sid} neu angelegt" + (f" (PDB {pdb})" if pdb else " (Non-CDB)"))
-    job_master_start(job, sid, port)
+    if start:
+        job_master_start(job, sid, port)
 
 
 # --------------------------------------------------------------------------- Import per SSH
@@ -3227,8 +3305,10 @@ def job_dp_import(job: Job, src: dict, tgt: dict) -> None:
                                " | ".join(dict.fromkeys(re.findall(r"(ORA-\d{5}[^\n]*)", p.stdout)))[:300])
     else:
         job.log(f"Neue Datenbank {sid} anlegen (Zeichensatz {charset}, national {plan['ncharset']})")
-        job_newdb(job, sid, "", tgt["password"], charset, tgt["port"], tgt["memory_mb"], plan["ncharset"])
+        job_newdb(job, sid, "", tgt["password"], charset, tgt["port"], tgt["memory_mb"], plan["ncharset"], start=False)
+        # schon jetzt als fortsetzbar markieren: scheitert danach etwas (z. B. ein Port), entfällt beim nächsten Versuch dbca
         db_meta_update(sid, dp_pending=True, dp_source=f"{src['host']}:{src['port']}/{src['service']}")
+        job_master_start(job, sid, tgt["port"])
     edition = read_volume_env(MASTER / sid).get("ZK_EDITION", "enterprise")
     parallel = tgt["parallel"] if edition == "enterprise" else 1
     try:

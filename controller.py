@@ -202,9 +202,9 @@ def agent_call(host: dict, method: str, path: str, body=None, user: str = "", qu
 
 # --------------------------------------------------------------------------- Rechte
 USER_GET = (r"state", r"jobs", r"jobs/[^/]+", r"snapshots", r"usage", r"devdbs/[^/]+",
-            r"containers", r"containers/[^/]+")
+            r"containers", r"containers/[^/]+", r"ports/free")
 OWNER_ACTIONS = (
-    ("POST", r"devdbs/([^/]+)/(start|stop|reset)"),
+    ("POST", r"devdbs/([^/]+)/(start|stop|reset|port)"),
     ("DELETE", r"devdbs/([^/]+)"),
     ("POST", r"devdbs/([^/]+)/snapshots"),
     ("POST", r"devdbs/([^/]+)/snapshots/[^/]+/restore"),

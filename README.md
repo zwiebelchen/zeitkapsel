@@ -115,6 +115,10 @@ Jedes DB-Subvolume enthält die Markierungsdateien, ohne die das Startskript des
 
 Weil die Datei im Subvolume liegt, wandert sie mit jedem Release und jeder Entwickler-DB mit; Oberfläche und Skripte setzen die Angaben bei jedem `docker run` um.
 
+## Port ändern
+
+Docker kann die Portzuordnung eines bestehenden Containers nicht ändern. „Port ändern“ (beim Kopf einer Datenbank, bei jeder Entwickler-DB und auf der Seite „Vorgänge und Container“) fährt den Container deshalb sauber herunter, entfernt ihn und erzeugt ihn mit dem neuen Port neu; die Daten im Subvolume bleiben unverändert. Das geht auch für eine Master-DB ohne Container, etwa wenn ihr gespeicherter Port inzwischen belegt ist. Der Dialog schlägt einen freien Port vor; Entwickler-DBs bleiben im Bereich `ZK_DEV_PORT_START` bis `ZK_DEV_PORT_END`. Master-Ports ändern Administratoren, Entwickler-DB-Ports auch ihre Besitzer.
+
 ## Vorgänge und Container
 
 Lange Aktionen laufen als Vorgänge auf dem Agenten des Hosts. Das Fenster „Vorgänge“ unten rechts zeigt die letzten; es lässt sich jederzeit ausblenden, auch während etwas läuft – dann bleibt ein kleiner Knopf mit der Zahl der laufenden Vorgänge, der es wieder öffnet.
