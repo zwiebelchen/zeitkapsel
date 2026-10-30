@@ -39,7 +39,7 @@ import logging
 import math
 import shlex
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, has_request_context, jsonify, request
 
 # --------------------------------------------------------------------------- Konfiguration
 def env(name: str, default: str = "") -> str:
@@ -330,6 +330,21 @@ def next_port(cs: list[dict]) -> int:
 
 
 # --------------------------------------------------------------------------- Jobs
+SECRET_HINT = re.compile(r"pass(word)?|pwd|secret|token", re.I)
+
+
+def capture_retry() -> dict | None:
+    """Merkt sich den API-Aufruf, der den Vorgang gestartet hat – ohne Passwörter (die Historie liegt auf der Platte)."""
+    if not has_request_context() or not request.path.startswith("/agent/api/"):
+        return None
+    body = request.get_json(silent=True) if request.method in ("POST", "PUT", "PATCH") else None
+    body = body if isinstance(body, dict) else {}
+    secrets = sorted(k for k in body if SECRET_HINT.search(k) and body.get(k))
+    clean = {k: v for k, v in body.items() if not SECRET_HINT.search(k)}
+    path = request.full_path.rstrip("?")
+    return dict(method=request.method, path=path[len("/agent/api/"):], body=clean, secrets=secrets)
+
+
 class JobCancelled(Exception):
     """Vorgang wurde abgebrochen."""
 
@@ -350,6 +365,8 @@ class Job:
         self.cancelled_by = ""
         self.proc: subprocess.Popen | None = None
         self.cleanups: list = []              # bei Abbruch sofort auszuführen (z. B. Container entfernen)
+        self.retry: dict | None = capture_retry()
+        self.retry_of: str | None = getattr(_ctx, "retry_of", None)
         self._lock = threading.Lock()
         JOBS_DIR.mkdir(parents=True, exist_ok=True)
         self.save()
@@ -460,7 +477,8 @@ class Job:
     def as_dict(self, with_log: bool = False) -> dict:
         d = dict(id=self.id, title=self.title, sid=self.sid, status=self.status, error=self.error,
                  started=self.started, ended=self.ended, actor=self.actor,
-                 cancel_requested=self.cancel_requested, cancelled_by=self.cancelled_by)
+                 cancel_requested=self.cancel_requested, cancelled_by=self.cancelled_by,
+                 retry=self.retry, retry_of=self.retry_of)
         if with_log:
             d["log"] = self.lines
         return d
@@ -1397,6 +1415,33 @@ def api_job(jid):
     if not d["log"] and job:
         d["log"] = job.lines
     return jsonify(d)
+
+
+RETRYABLE = ("fehlgeschlagen", "abgebrochen", "unterbrochen")
+
+
+@bp.post("/api/jobs/<jid>/retry")
+def api_job_retry(jid):
+    info = job_info(jid)
+    spec = info.get("retry")
+    if not spec:
+        raise UserError("Dieser Vorgang lässt sich nicht automatisch wiederholen (z. B. von einem Zeitplan gestartet).")
+    if info.get("status") not in RETRYABLE:
+        raise UserError("Nur fehlgeschlagene, abgebrochene oder unterbrochene Vorgänge lassen sich wiederholen.")
+    given = (request.get_json(silent=True) or {}).get("secrets") or {}
+    body = dict(spec.get("body") or {})
+    for k in spec.get("secrets") or []:
+        body[k] = given.get(k, "")
+    headers = {"X-Zeitkapsel-Token": AGENT_TOKEN, "X-Zeitkapsel-User": actor()}
+    _ctx.retry_of = jid
+    try:
+        with current_app.test_request_context("/agent/api/" + spec["path"], method=spec["method"],
+                                              json=body if spec["method"] in ("POST", "PUT", "PATCH") else None,
+                                              headers=headers):
+            resp = current_app.full_dispatch_request()
+    finally:
+        _ctx.retry_of = None
+    return resp
 
 
 @bp.post("/api/jobs/<jid>/cancel")

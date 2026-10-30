@@ -225,6 +225,17 @@ def authorize(host: dict, method: str, path: str, body):
         body = dict(body or {})
         body["owner"] = g.user               # Benutzer legen immer für sich selbst an
         return body
+    hit = re.fullmatch(r"jobs/([^/]+)/retry", path)
+    if method == "POST" and hit:
+        status, job = agent_call(host, "GET", f"jobs/{hit.group(1)}", user=g.user)
+        if status != 200:
+            raise BadRequest(job.get("error", "Vorgang nicht gefunden."))
+        if job.get("actor") != g.user:
+            raise Denied("Nur eigene Vorgänge lassen sich wiederholen.")
+        spec = job.get("retry") or {}
+        if spec:   # dieselbe Prüfung wie beim ursprünglichen Aufruf – Rechte können sich geändert haben
+            authorize(host, spec.get("method", "POST"), spec.get("path", "").split("?")[0], spec.get("body"))
+        return body
     hit = re.fullmatch(r"jobs/([^/]+)/cancel", path)
     if method == "POST" and hit:
         status, job = agent_call(host, "GET", f"jobs/{hit.group(1)}", user=g.user)
@@ -499,7 +510,7 @@ def api_audit():
 
 
 # --------------------------------------------------------------------------- Weiterleitung an Agenten
-LONG_CALLS = (r"import/probe", r"import/local/probe", r"import/dp/probe", r"usage", r"newdb/check", r"schedules/[^/]+/run")
+LONG_CALLS = (r"jobs/[^/]+/retry", r"import/probe", r"import/local/probe", r"import/dp/probe", r"usage", r"newdb/check", r"schedules/[^/]+/run")
 
 
 @bp.route("/api/hosts/<int:hid>/<path:path>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])

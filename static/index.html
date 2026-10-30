@@ -551,6 +551,17 @@ label.field textarea { min-height: 84px; resize: vertical; }
   </form>
 </dialog>
 
+<!-- Vorgang erneut ausführen -->
+<dialog id="dlgRetry">
+  <form method="dialog" id="fRetry">
+    <h2>Vorgang erneut ausführen</h2>
+    <p class="lead js-lead"></p>
+    <div class="js-fields" style="display:grid;gap:12px"></div>
+    <p class="form-error"></p>
+    <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button class="primary" value="ok">Erneut ausführen</button></div>
+  </form>
+</dialog>
+
 <!-- Notiz -->
 <dialog id="dlgNote">
   <form method="dialog" id="fNote">
@@ -1415,6 +1426,14 @@ function renderSnapshots() {
 
 const JOB_KLS = { "läuft": "warn", "fertig": "ok", "fehlgeschlagen": "err", "abgebrochen": "err", "unterbrochen": "err" };
 const canCancel = j => j.status === "läuft" && !j.cancel_requested && (isAdmin() || (O && j.actor === O.me.username));
+const canRetry = j => j.retry && ["fehlgeschlagen", "abgebrochen", "unterbrochen"].includes(j.status) && (isAdmin() || (O && j.actor === O.me.username));
+function secretLabel(key, spec) {
+  if (key === "password") return spec.path.startsWith("import/dp") ? "Passwort der Quelle" : "Passwort der neuen DB";
+  return { target_password: "Passwort der neuen DB (nur nötig, wenn sie neu angelegt wird)", sys_password: "SYS-Passwort für die neue Passwortdatei" }[key] || key;
+}
+function retryButton(j) {
+  return canRetry(j) ? `<button class="quiet small" data-act="job-retry" data-id="${esc(j.id)}">Erneut ausführen</button>` : "";
+}
 function renderJobs() {
   const box = $("#jobs");
   const jobs = S.jobs.slice(0, 8);
@@ -1432,6 +1451,7 @@ function renderJobs() {
     </button>
     ${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}
     ${canCancel(j) ? `<div class="job-acts"><button class="quiet small danger" data-act="job-cancel" data-id="${esc(j.id)}" data-title="${esc(j.title)}">Abbrechen</button></div>` : ""}
+    ${canRetry(j) ? `<div class="job-acts">${retryButton(j)}</div>` : ""}
     ${j.cancel_requested && j.status === "läuft" ? '<div class="job-acts muted-note">wird abgebrochen …</div>' : ""}
     ${openJobs.has(j.id) ? `<pre id="log-${j.id}">${esc((jobLogs[j.id] || []).join("\n")) || "…"}</pre>` : ""}
   </li>`).join("");
@@ -1492,13 +1512,14 @@ function renderJobsPage() {
   const jobs = jobsPage.jobs.filter(filters[jobsFilter] || filters.alle);
   const running = jobsPage.jobs.filter(j => j.status === "läuft").length;
   const jobRows = jobs.map(j => `<tr>
-      <td>${esc(j.title)}${j.error && j.status !== "abgebrochen" ? `<div class="bad">${esc(j.error)}</div>` : ""}</td>
+      <td>${esc(j.title)}${j.retry_of ? ' <span class="tag">Wiederholung</span>' : ""}${j.error && j.status !== "abgebrochen" ? `<div class="bad">${esc(j.error)}</div>` : ""}</td>
       <td class="nw">${pillPlain(j.cancel_requested && j.status === "läuft" ? "wird abgebrochen" : j.status, JOB_KLS[j.status])}</td>
       <td class="nw">${esc(j.actor || "–")}${j.cancelled_by ? `<div class="muted-note">abgebrochen von ${esc(j.cancelled_by)}</div>` : ""}</td>
       <td class="nw">${fmtTime(j.started)}</td><td class="nw">${fmtDuration(j.started, j.ended)}</td>
       <td><div class="acts">
         <button class="quiet small" data-act="pjob-log" data-id="${esc(j.id)}" aria-expanded="${openPageLogs.has(j.id)}">${openPageLogs.has(j.id) ? "Protokoll ausblenden" : "Protokoll"}</button>
-        ${canCancel(j) ? `<button class="quiet small danger" data-act="job-cancel" data-id="${esc(j.id)}" data-title="${esc(j.title)}">Abbrechen</button>` : ""}</div></td></tr>
+        ${canCancel(j) ? `<button class="quiet small danger" data-act="job-cancel" data-id="${esc(j.id)}" data-title="${esc(j.title)}">Abbrechen</button>` : ""}
+        ${retryButton(j)}</div></td></tr>
     ${openPageLogs.has(j.id) ? `<tr class="logrow"><td colspan="6"><pre id="plog-${esc(j.id)}">${esc((pageLogs[j.id] || ["…"]).join("\n"))}</pre></td></tr>` : ""}`).join("");
   main.innerHTML = `
     <section class="dbhead"><h1>Vorgänge und Container</h1>
@@ -1811,6 +1832,26 @@ document.addEventListener("click", async ev => {
         ev.preventDefault();
         const el = document.getElementById("dev-" + b.dataset.id);
         if (el) { el.scrollIntoView({ block: "center" }); history.replaceState(null, "", location.hash); el.setAttribute("tabindex", "-1"); el.focus(); }
+        break;
+      }
+      case "job-retry": {
+        const j = (jobsPage && jobsPage.jobs.find(x => x.id === b.dataset.id)) || S.jobs.find(x => x.id === b.dataset.id)
+          || await api("GET", `/api/jobs/${encodeURIComponent(b.dataset.id)}`);
+        const spec = j.retry || {};
+        const go = async secrets => {
+          startedJob(await api("POST", `/api/jobs/${encodeURIComponent(j.id)}/retry`, { secrets }));
+          await refresh(); if (view.kind === "jobs") await loadJobsPage();
+        };
+        if (!(spec.secrets || []).length) {
+          if (!confirm(`„${j.title}“ mit denselben Angaben erneut ausführen?`)) return;
+          await go({});
+          break;
+        }
+        openDialog("dlgRetry", f => {
+          $(".js-lead", f).textContent = `„${j.title}“ wird mit denselben Angaben erneut gestartet. Passwörter werden aus Sicherheitsgründen nicht gespeichert und müssen neu eingegeben werden.`;
+          $(".js-fields", f).innerHTML = spec.secrets.map(k => `<label class="field">${esc(secretLabel(k, spec))}
+            <input type="password" name="${esc(k)}" autocomplete="off"></label>`).join("");
+        }, async v => { await go(Object.fromEntries(spec.secrets.map(k => [k, v[k] || ""]))); });
         break;
       }
       case "job-cancel":

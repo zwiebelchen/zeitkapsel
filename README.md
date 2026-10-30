@@ -130,6 +130,8 @@ Die Seite „Vorgänge und Container“ je Host zeigt:
 
 „Abbrechen“ beendet den laufenden Befehl des Vorgangs und entfernt sofort Hilfscontainer (dbca-Anlage, Prüfstart, Release-Zwischen-DB) bzw. beendet den Data-Pump-Job über `DBMS_DATAPUMP`; danach räumt der Vorgang wie bei einem Fehler auf (halbfertige Subvolumes werden gelöscht, eine für den Import heruntergefahrene Quelle wieder gestartet). Benutzer können eigene Vorgänge abbrechen und die Container ihrer eigenen Entwickler-DBs stoppen oder abschießen, Administratoren alles.
 
+„Erneut ausführen“ gibt es bei fehlgeschlagenen, abgebrochenen und unterbrochenen Vorgängen. Jeder Vorgang merkt sich den Aufruf, der ihn gestartet hat (Aktion und Angaben); die Wiederholung schickt genau diesen Aufruf noch einmal, ohne dass der Assistent erneut durchlaufen werden muss. Passwörter werden dabei nicht gespeichert – die Historie liegt auf der Platte –, sondern vor dem Wiederholen neu abgefragt. Die Rechte werden wie beim ersten Aufruf geprüft; Benutzer wiederholen nur eigene Vorgänge. Vorgänge, die ein Zeitplan gestartet hat, wiederholt man mit „Jetzt ausführen“ beim Zeitplan.
+
 ## Alle Snapshots: Platz, Löschen, Übernehmen
 
 Die Seite „Alle Snapshots“ listet jedes Subvolume eines Hosts. Der Platz wird im Hintergrund ermittelt und eine Viertelstunde zwischengespeichert (`ZK_USAGE_MAX_AGE`, Sekunden): „Exklusiv“ (`btrfs filesystem du`, ohne Kompression gezählt) ist der Platz, der beim Löschen frei würde; „Auf Platte“ (`compsize`, wenn installiert) der tatsächlich belegte Platz nach Kompression.
