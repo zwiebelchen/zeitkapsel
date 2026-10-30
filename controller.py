@@ -518,7 +518,27 @@ def api_audit():
 
 
 # --------------------------------------------------------------------------- Weiterleitung an Agenten
-LONG_CALLS = (r"jobs/[^/]+/retry", r"import/dump/probe", r"import/probe", r"import/local/probe", r"import/dp/probe", r"usage", r"newdb/check", r"schedules/[^/]+/run", r"registry", r"registry/tags", r"import/pg/probe")
+LONG_CALLS = (r"jobs/[^/]+/retry", r"import/dump/probe", r"import/probe", r"import/local/probe", r"import/dp/probe", r"usage", r"newdb/check", r"schedules/[^/]+/run", r"registry", r"registry/tags", r"import/pg/probe", r"db/[^/]+/ship/probe")
+
+
+def ship_target(src_hid: int, body: dict) -> dict:
+    """Übertragung auf einen anderen Host: Adresse und Token des Ziel-Agenten ergänzen (nur der Controller kennt sie)."""
+    from urllib.parse import urlsplit
+    tid = int(body.get("target_host") or 0)
+    if tid == src_hid:
+        raise BadRequest("Quelle und Ziel sind derselbe Host.")
+    t = get_host(tid)
+    status, summ = agent_call(t, "GET", "summary", user=g.user, timeout=10)
+    if status != 200:
+        raise BadRequest(summ.get("error") or f"Zielhost {t['name']} antwortet nicht.")
+    addr = (body.get("ssh_host") or "").strip() or summ.get("host") or urlsplit(t["url"]).hostname
+    u = urlsplit(t["url"])
+    url = t["url"]
+    if u.hostname in ("127.0.0.1", "localhost", "::1"):   # eigener Agent im kombinierten Betrieb: für andere Hosts erreichbar machen
+        url = f"{u.scheme}://{addr}:{u.port or 80}{u.path}"
+    body = {k: v for k, v in body.items() if k != "target"}
+    body["target"] = dict(url=url, token=t["token"], name=t["name"], ssh_host=addr, ssh_port=int(body.get("ssh_port") or 22))
+    return body
 
 
 @bp.route("/api/hosts/<int:hid>/<path:path>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
@@ -526,6 +546,8 @@ def api_proxy(hid, path):
     host = get_host(hid)
     body = request.get_json(silent=True) if request.method in ("POST", "PUT", "PATCH") else None
     body = authorize(host, request.method, path, body)
+    if request.method == "POST" and re.fullmatch(r"db/[^/]+/ship(/probe)?", path):
+        body = ship_target(hid, body or {})
     timeout = 960 if any(re.fullmatch(p, path) for p in LONG_CALLS) else 30
     status, res = agent_call(host, request.method, path, body, user=g.user,
                              query=request.query_string.decode(), timeout=timeout)

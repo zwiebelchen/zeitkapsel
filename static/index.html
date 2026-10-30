@@ -405,6 +405,32 @@ form.hset label.field input, form.hset label.field textarea { width: 100%; box-s
   </form>
 </dialog>
 
+<!-- Datenbank auf einen anderen Host übertragen -->
+<dialog id="dlgShip" style="width:min(700px, calc(100vw - 24px))">
+  <form method="dialog" id="fShip">
+    <h2>Auf anderen Host: <span class="js-name"></span></h2>
+    <div class="row2">
+      <label class="field">Zielhost <select name="target_host" required></select></label>
+      <label class="field">Adresse für SSH <input name="ssh_host" required autocomplete="off"><small>vom Quellhost als root erreichbar, Port 22</small></label>
+    </div>
+    <div class="days"><label><input type="radio" name="mode" value="move" checked>Verschieben</label><label><input type="radio" name="mode" value="copy">Kopie übertragen</label></div>
+    <small class="muted-note js-mode-hint"></small>
+    <div class="days" style="margin-top:8px"><label><input type="radio" name="method" value="send" checked>btrfs send/receive</label><label><input type="radio" name="method" value="rsync">rsync über SSH</label></div>
+    <small class="muted-note js-method-hint"></small>
+    <div class="row2" style="margin-top:8px">
+      <label class="field">Name auf dem Ziel <input name="target_name" required maxlength="16" pattern="[A-Za-z][A-Za-z0-9_]*" autocomplete="off"><small class="js-name-hint"></small></label>
+      <label class="field">Port auf dem Ziel <input type="number" name="port" min="1024" max="65535"><small>leer = bisheriger, falls dort frei</small></label>
+    </div>
+    <label class="check js-rel"><input type="checkbox" name="releases" value="1" checked><span>Releases mitnehmen <small class="js-rel-hint"></small></span></label>
+    <label class="check js-comp" hidden><input type="checkbox" name="compressed" value="1" checked><span>Komprimierte Daten unverändert übertragen <small>btrfs send --compressed-data: spart Leitung und CPU, weil die Ablage komprimiert ist</small></span></label>
+    <label class="check"><input type="checkbox" name="start" value="1" checked><span>Auf dem Ziel starten</span></label>
+    <label class="check js-del"><input type="checkbox" name="delete_source" value="1"><span>Quelle danach löschen <small class="js-del-hint">Master-DB, Releases und Angaben auf diesem Host; ohne Haken bleibt sie gestoppt liegen</small></span></label>
+    <div class="js-check"></div>
+    <p class="form-error"></p>
+    <div class="dlg-actions"><button value="cancel" formnovalidate>Abbrechen</button><button type="button" class="js-probe">Prüfen</button><button class="primary js-go" value="ok" disabled>Übertragen</button></div>
+  </form>
+</dialog>
+
 <!-- PostgreSQL-Dump importieren -->
 <dialog id="dlgPgImport" style="width:min(700px, calc(100vw - 24px))">
   <form method="dialog" id="fPgImport">
@@ -1045,6 +1071,8 @@ function renderDb(db) {
         ${m.port ? `<span>Port ${m.port}</span>` : ""}
         ${m.container && m.state !== "gestoppt" && m.state !== "kein Container" ? sessBadge(m.container, isAdmin()) : ""}
         ${m.type === "cdb" ? `<span>Container-DB, PDB ${esc(m.pdb)}</span>` : ""}
+        ${m.migrated_to ? `<span class="tag" title="Die Datenbank läuft jetzt dort; dieser Stand bleibt gestoppt liegen">verschoben nach ${esc(m.migrated_to)}</span>` : ""}
+        ${m.migrated_from ? `<span class="tag">übernommen von ${esc(m.migrated_from)}</span>` : ""}
         ${isPg(m) ? `<span class="tag pg" title="${esc(m.image)}">PostgreSQL ${esc(imgTag(m.image))}</span>${m.pg_user ? `<span>Superuser ${esc(m.pg_user)}</span>` : ""}` : ""}
         ${m.jdbc ? jdbcField(m.jdbc) : (m.container ? "" : `<span>Master-Container nicht gefunden</span>`)}
       </div>
@@ -1055,6 +1083,7 @@ function renderDb(db) {
           <button data-act="master-port" data-sid="${esc(db.sid)}" data-port="${m.port || ""}">Port ändern</button>
           <button data-act="settings" data-kind="master" data-id="${esc(db.sid)}">Einstellungen</button>
           ${isPg(m) ? `<button data-act="pg-image" data-kind="master" data-id="${esc(db.sid)}">Version ändern</button>` : ""}
+          ${O.hosts.length > 1 ? `<button data-act="ship">Auf anderen Host …</button>` : ""}
           ${m.state === "bereit" && !isPg(m) ? `<button data-act="backup" data-kind="master" data-id="${esc(db.sid)}" data-label="Master-DB ${esc(db.sid)}">Sichern</button>` : ""}
           <button data-act="note-add">Notiz hinzufügen</button>
           <button class="primary" data-act="release-new" ${db.release_busy ? 'disabled title="Ein Release wird gerade erstellt"' : ""}>${db.release_busy ? "Release wird erstellt …" : "Release erstellen"}</button>` : ""}
@@ -1988,6 +2017,74 @@ async function fillVersions(root, opts = {}) {
   } catch (e) { sel.innerHTML = ""; if (info) info.textContent = e.message; }
 }
 
+/* ------------------------------------------------------------ Auf anderen Host übertragen */
+function openShip(db) {
+  const m = db.master;
+  const others = O.hosts.filter(h => h.id !== view.hid);
+  openDialog("dlgShip", f => {
+    $(".js-name", f).textContent = db.sid;
+    f.target_host.innerHTML = others.map(h => `<option value="${h.id}" ${h.ok ? "" : "disabled"}>${esc(h.name)}${h.host ? " – " + esc(h.host) : ""}${h.ok ? "" : " (nicht erreichbar)"}</option>`).join("");
+    const firstOk = others.find(h => h.ok); if (firstOk) f.target_host.value = firstOk.id;
+    const fillAddr = () => { const h = others.find(x => String(x.id) === f.target_host.value); f.ssh_host.value = h ? (h.host || "") : ""; };
+    fillAddr();
+    f.target_name.value = db.sid; f.target_name.readOnly = !isPg(m);
+    $(".js-name-hint", f).textContent = isPg(m) ? "bei PostgreSQL frei wählbar" : "Oracle behält die SID";
+    $(".js-rel-hint", f).textContent = db.releases.length ? `${db.releases.length} Release(s) als Kette: zuerst das älteste vollständig, danach nur Änderungen` : "keine vorhanden";
+    const devs = db.devdbs.length;
+    const running = m.state === "bereit";
+    const sync = () => {
+      const mode = f.querySelector("input[name=mode]:checked").value, method = f.querySelector("input[name=method]:checked").value;
+      $(".js-mode-hint", f).textContent = mode === "move"
+        ? (running ? "Überträgt zuerst im laufenden Betrieb; erst danach wird die DB hier kurz gestoppt und nur noch der Rest übertragen. Die Ausfallzeit ist also kurz. Danach läuft sie auf dem Ziel; hier bleibt sie gestoppt (oder wird gelöscht)."
+                   : "Die DB ist gestoppt und wird vollständig übertragen; hier bleibt sie gestoppt liegen (oder wird gelöscht).")
+        : "Die DB läuft hier unverändert weiter; das Ziel bekommt eine unabhängige Kopie des aktuellen Stands (wie ein Snapshot im laufenden Betrieb, beim ersten Start mit Recovery).";
+      $(".js-method-hint", f).textContent = method === "send"
+        ? "Empfohlen: überträgt die Subvolumes blockweise, ohne Dateien einzeln anzufassen; Releases lassen sich mitnehmen."
+        : "Für Fälle, in denen btrfs send nicht geht (z. B. alte btrfs-progs). Nur die Master-DB, ohne Releases; beim Verschieben zwei Durchgänge (im Betrieb, dann gestoppt).";
+      $(".js-rel", f).hidden = method !== "send" || !db.releases.length;
+      $(".js-del", f).hidden = mode !== "move";
+      f.delete_source.disabled = devs > 0;
+      if (devs) { f.delete_source.checked = false; $(".js-del-hint", f).textContent = `Geht nicht: ${devs} Entwickler-DB(s) hängen hier noch an der Datenbank.`; }
+      $(".js-go", f).disabled = true; $(".js-check", f).innerHTML = "";
+    };
+    f.querySelectorAll("input[name=mode], input[name=method]").forEach(r => { r.onchange = sync; });
+    f.target_host.onchange = () => { fillAddr(); sync(); };
+    f.target_name.oninput = sync; f.ssh_host.oninput = sync; f.port.oninput = sync; f.releases.onchange = sync;
+    sync();
+    $(".js-probe", f).onclick = async () => {
+      const box = $(".js-check", f); box.innerHTML = '<p class="muted-note">Prüfe Quelle und Ziel …</p>';
+      try {
+        const r = await api("POST", `/api/db/${encodeURIComponent(db.sid)}/ship/probe`, shipBody(f));
+        $(".js-comp", f).hidden = !(r.compressed_send && f.querySelector("input[name=method]:checked").value === "send");
+        if (!f.port.value && r.target.port) f.port.value = r.target.port;
+        box.innerHTML = `<dl class="facts-list" style="margin:8px 0">
+            <dt>Umfang</dt><dd>${r.size ? fmtBytes(r.size) + " (belegt auf der Platte)" : "unbekannt (Platzermittlung läuft noch)"}${r.releases.length ? ` plus Änderungen von ${r.releases.length} Release(s)` : ""}</dd>
+            <dt>Ziel</dt><dd>${esc(r.target.host || "")}, Ablage ${esc(r.target.base || "")}, ${r.target.free ? fmtBytes(r.target.free) + " frei" : ""}</dd>
+            <dt>Port</dt><dd>${r.target.port || "–"}</dd></dl>
+          ${r.problems.map(x => `<p class="form-error">${esc(x)}</p>`).join("")}
+          ${r.warnings.map(x => `<p class="hint-box">${esc(x)}</p>`).join("")}
+          ${r.problems.length ? "" : '<p class="muted-note">Beim Start trägt der Zielhost den SSH-Schlüssel dieses Hosts ein – beschränkt auf btrfs receive und rsync in sein Empfangsverzeichnis.</p>'}`;
+        $(".js-go", f).disabled = r.problems.length > 0;
+      } catch (e) { box.innerHTML = `<p class="form-error">${esc(e.message)}</p>`; }
+    };
+  }, async () => {
+    const f = $("#fShip");
+    const body = shipBody(f);
+    if (body.mode === "move" && !confirm(`${db.sid} nach ${f.target_host.selectedOptions[0].textContent} verschieben?`
+      + (m.state === "bereit" ? "\n\nGegen Ende wird die DB hier kurz gestoppt; Verbindungen brechen ab." : "")
+      + (body.delete_source ? "\n\nDanach werden Master-DB und Releases hier gelöscht." : ""))) throw Object.assign(new Error(""), { keepOpen: true });
+    startedJob(await api("POST", `/api/db/${encodeURIComponent(db.sid)}/ship`, body));
+  });
+}
+function shipBody(f) {
+  const v = n => f.elements[n];
+  return { target_host: +v("target_host").value, ssh_host: v("ssh_host").value.trim(),
+    mode: f.querySelector("input[name=mode]:checked").value, method: f.querySelector("input[name=method]:checked").value,
+    target_name: v("target_name").value.trim(), port: +v("port").value || null, releases: v("releases").checked && !v("releases").closest("label").hidden,
+    compressed: v("compressed").checked && !v("compressed").closest("label").hidden, start: v("start").checked,
+    delete_source: v("delete_source").checked && !v("delete_source").disabled };
+}
+
 /* ------------------------------------------------------------ PostgreSQL-Dump importieren */
 const PG_FMT = { custom: "pg_dump, Custom-Format", plain: "pg_dump als SQL", dumpall: "pg_dumpall (ganzer Cluster)", globals: "Rollen und Tablespaces" };
 function openPgImport(preset = {}) {
@@ -2882,6 +2979,9 @@ document.addEventListener("click", async ev => {
       case "backup-restore":
         if (b.dataset.engine === "postgres") openPgImport({ backup: b.dataset.id });
         else openImportDialog({ mode: "dump", backup: b.dataset.id });
+        break;
+      case "ship":
+        openShip(db);
         break;
       case "pg-import":
         openPgImport();

@@ -9,6 +9,7 @@ zeitkapsel verwaltet Oracle- und PostgreSQL-Datenbanken, die als Container (Orac
 | Hosts | mehrere DB-Hosts in einer Oberfläche; auf jedem läuft ein Agent |
 | Datenbanken | Master-DBs je Host mit Status, Port und JDBC-URL; starten und stoppen |
 | Neue Datenbank | leere Oracle-DB (Non-CDB oder CDB mit PDB) oder PostgreSQL-Cluster in wählbarer Version mit eigenem Container anlegen |
+| Auf anderen Host | Master-DBs mit ihren Releases zwischen zeitkapsel-Hosts verschieben oder kopieren (btrfs send/receive oder rsync über SSH), bei laufender DB mit kurzer Ausfallzeit |
 | PostgreSQL | Versionen aus einer Registry (Docker Hub oder eigene); Version je Master- und Entwickler-DB innerhalb der Hauptversion wechseln |
 | Import | bestehende DB von einem anderen Server per SSH übernehmen, inklusive spfile und Passwortdatei |
 | Releases | aus der Master-DB, aus einem Entwickler-Snapshot oder von einem Release abgeleitet (wie ein Git-Branch) |
@@ -248,6 +249,23 @@ PostgreSQL-Datenbanken laufen auf demselben Host neben den Oracle-DBs und nutzen
 **Wiederherstellen und importieren.** „Wiederherstellen …“ auf der Seite „Sicherungen“ oder „Verwaltung“ → „PostgreSQL-Dump importieren“ (Datei oder Verzeichnis auf dem Host: `.dump` im Custom-Format, `.sql`/`.sql.gz` von pg_dump oder pg_dumpall; `globals*.sql` wird zuerst eingespielt). Ziel ist entweder eine neue Datenbank in wählbarer Version – so lässt sich auch eine Hauptversion anheben, z. B. ein Dump aus 15 in einen neuen 17er-Cluster – oder eine vorhandene Master- bzw. Entwickler-DB. Beim Überschreiben werden nur die Datenbanken ersetzt, die der Dump enthält (bei pg_dumpall auch `postgres`); vorher sichert zeitkapsel auf Wunsch den Stand als Release bzw. Snapshot `vor-import-…`. Einzelne Dumps lassen sich beim Einspielen umbenennen. Fehler stehen gezählt im Vorgangsprotokoll; „Rolle existiert schon“ gilt als erwartet. Rollen aus einem Dump bringen ihr Passwort mit, auch der Superuser.
 
 **Noch nicht für PostgreSQL:** der Import laufender Server per SSH und die Shell-Skripte. Speicherparameter wie `shared_buffers` setzt man mit `ALTER SYSTEM` in der Datenbank; sie stehen in `postgresql.auto.conf` und wandern mit jedem Snapshot mit.
+
+## Auf einen anderen Host verschieben oder kopieren
+
+Bei mehreren zeitkapsel-Hosts bietet die Master-DB „Auf anderen Host …“ (Administrator). Zur Wahl stehen:
+
+- **Verschieben:** Läuft die DB, überträgt zeitkapsel zuerst einen Snapshot im laufenden Betrieb. Erst danach wird die DB kurz sauber heruntergefahren und nur noch der Rest übertragen; die Ausfallzeit hängt also nur an den Änderungen seit dem ersten Durchgang. Auf dem Ziel startet sie mit Port, Angaben, Timeline und Releases. Hier bleibt sie gestoppt (ohne Neustart-Richtlinie, mit Hinweis „verschoben nach …“) oder wird auf Wunsch gelöscht – das geht nur ohne Entwickler-DBs.
+- **Kopie übertragen:** Die DB läuft hier unverändert weiter; das Ziel bekommt eine unabhängige Kopie des aktuellen Stands (absturzkonsistent wie ein Snapshot im Betrieb, bei PostgreSQL nach einem `CHECKPOINT`).
+- **btrfs send/receive** (empfohlen): Releases lassen sich als Kette mitnehmen (das älteste vollständig, danach nur Änderungen), und mit `--compressed-data` gehen die schon komprimierten Blöcke unverändert über die Leitung, wenn beide Seiten das können (btrfs-progs/Kernel ≥ 6.0).
+- **rsync über SSH:** für Fälle, in denen btrfs send nicht geht; nur die Master-DB. Gelesen wird aus einem lokalen Snapshot, beim Verschieben folgt ein zweiter Durchgang mit gestoppter DB.
+
+PostgreSQL-DBs lassen sich dabei umbenennen, Oracle-DBs behalten ihre SID. „Prüfen“ zeigt vorher Umfang, freien Platz und Port auf dem Ziel und meldet Hindernisse (Name belegt, Oracle-Image fehlt, Ablage nicht auf btrfs, rsync fehlt).
+
+**SSH ohne Handarbeit.** Die Daten laufen per SSH als root vom Quell- zum Zielhost (Port 22, `PermitRootLogin prohibit-password`). Beim Start trägt der Ziel-Agent den Schlüssel des Quellhosts (`/root/.ssh/zeitkapsel_ed25519.pub`) selbst in `/root/.ssh/authorized_keys` ein – mit `restrict` und dem erzwungenen Befehl `scripts/peer-ssh.sh`, der nur `btrfs receive` und `rsync --server` (mit einer Liste erlaubter Optionen) in ein vorher angelegtes Empfangsverzeichnis `<Ablage>/incoming/<id>/` zulässt. Adresse und Token des Ziel-Agenten gibt nur der Controller an den Quell-Agenten weiter; sie landen nicht in der Vorgangshistorie. Ist ein Host im Controller als `http://127.0.0.1:…` eingetragen (eigener Agent im kombinierten Betrieb), nimmt zeitkapsel für die anderen Hosts seinen Namen bzw. die im Dialog angegebene Adresse.
+
+**Bricht etwas ab,** räumt das Ziel sein Empfangsverzeichnis auf und eine vorher gestoppte Quelle wird wieder gestartet. Schlägt nur der Start auf dem Ziel fehl, liegt die Datenbank dort bereits vollständig vor und die Meldung sagt das.
+
+Entwickler-DBs werden nicht mit übertragen; sie bleiben auf dem Quellhost und laufen dort unabhängig weiter.
 
 ## Ablage einstellen
 

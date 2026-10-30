@@ -485,7 +485,7 @@ def next_port(cs: list[dict]) -> int:
 
 
 # --------------------------------------------------------------------------- Jobs
-SECRET_HINT = re.compile(r"pass(word)?|pwd|secret|token", re.I)
+SECRET_HINT = re.compile(r"pass(word)?|pwd|secret|token|^target$", re.I)   # target enthält das Token des Zielhosts
 
 
 def capture_retry() -> dict | None:
@@ -964,7 +964,8 @@ def master_info(sid: str, cs: list[dict]) -> dict:
                 type=e.get("ZK_DB_TYPE", "noncdb") if eng == ORA else "", pdb=e.get("ZK_PDB", ""),
                 jdbc=jdbc(port, service, eng) if c else None, origin=db_meta(sid).get("origin", ""),
                 engine=eng, image=e.get("ZK_IMAGE", "") if eng == PG else IMAGE,
-                pg_major=data_pg_major(master_dir(sid)) if eng == PG else "", pg_user=e.get("ZK_PG_USER", ""))
+                pg_major=data_pg_major(master_dir(sid)) if eng == PG else "", pg_user=e.get("ZK_PG_USER", ""),
+                migrated_to=db_meta(sid).get("migrated_to", ""), migrated_from=db_meta(sid).get("migrated_from", ""))
 
 
 def timeline(sid: str, rels: list[dict], devs: list[dict]) -> list[dict]:
@@ -5761,6 +5762,435 @@ def api_pg_import():
     else:
         raise UserError("Ziel wählen: neue Datenbank oder vorhandene überschreiben.")
     job = start_job(f"Import aus {src['label']} → {title}", sid, key, job_pg_restore, src, tgt)
+    return jsonify(job=job.as_dict())
+
+
+# --------------------------------------------------------------------------- Datenbanken zwischen zeitkapsel-Hosts übertragen
+# Ablauf (Quelle steuert, Ziel führt aus):
+#   1. Quelle → Ziel-Agent  POST peer/prepare: Name frei?, SSH-Schlüssel der Quelle eingeschränkt eintragen,
+#      Empfangsverzeichnis <Ablage>/incoming/<id> anlegen
+#   2. Quelle → Ziel per SSH: btrfs send | btrfs receive (Releases als Kette, dann die DB; beim Verschieben
+#      einer laufenden DB zuerst im Betrieb, dann kurz gestoppt nur noch der Rest) – oder rsync in zwei Durchgängen
+#   3. Quelle → Ziel-Agent  POST peer/finish: Vorgang auf dem Ziel legt Master-DB und Releases an und startet sie
+PEER_SCRIPT = Path(__file__).resolve().parent / "scripts" / "peer-ssh.sh"
+AUTH_KEYS = Path(env("PEER_AUTHORIZED_KEYS", "/root/.ssh/authorized_keys"))
+RE_TRANSFER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+SHIP_TIMEOUT = 7 * 86400
+
+
+def incoming_dir(engine: str, tid: str) -> Path:
+    if not RE_TRANSFER.match(tid or ""):
+        raise UserError("Ungültige Übertragungs-ID.")
+    return store_by_engine(engine).base / "incoming" / tid
+
+
+def peer_call(target: dict, method: str, path: str, body=None, timeout: int = 60) -> dict:
+    import urllib.error
+    import urllib.request
+    url = target["url"].rstrip("/") + "/agent/api/" + path
+    req = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None, method=method,
+                                 headers={"X-Zeitkapsel-Token": target["token"], "X-Zeitkapsel-User": actor(),
+                                          "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read() or b"{}").get("error")
+        except ValueError:
+            msg = None
+        raise RuntimeError(f"Zielhost {target['name']}: {msg or f'HTTP {e.code}'}") from None
+    except OSError as e:
+        raise RuntimeError(f"Zielhost {target['name']} ({target['url']}) nicht erreichbar: {getattr(e, 'reason', e)}") from None
+
+
+def authorize_peer_key(pubkey: str, source: str) -> None:
+    """Schlüssel eines Quellhosts eintragen – nur mit dem erzwungenen Befehl peer-ssh.sh nutzbar."""
+    parts = pubkey.split()
+    if len(parts) < 2 or parts[0] not in ("ssh-ed25519", "ecdsa-sha2-nistp256", "ssh-rsa") or not re.match(r"^[A-Za-z0-9+/=]+$", parts[1]):
+        raise UserError("Ungültiger SSH-Schlüssel.")
+    tag = "zeitkapsel-peer:" + re.sub(r"[^A-Za-z0-9._-]", "_", source)[:60]
+    line = f'restrict,command="{PEER_SCRIPT}" {parts[0]} {parts[1]} {tag}'
+    AUTH_KEYS.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    old = AUTH_KEYS.read_text().splitlines() if AUTH_KEYS.exists() else []
+    keep = [l for l in old if parts[1] not in l]
+    if line in old and len(keep) == len(old) - 1:
+        return
+    AUTH_KEYS.write_text("\n".join(keep + [line]) + "\n")
+    AUTH_KEYS.chmod(0o600)
+    log.info("SSH-Schlüssel von %s für Übertragungen eingetragen", source)
+
+
+def peer_problems(engine: str, name: str, port: int | None, size: int | None,
+                  method: str = "send") -> tuple[list[str], list[str], dict]:
+    problems, warnings = [], []
+    if method == "rsync" and not shutil.which("rsync"):
+        problems.append("rsync fehlt auf dem Zielhost (dnf install rsync).")
+    st = store_by_engine(engine)
+    if master_dir(name).exists() or any(c["name"] == name.lower() for c in containers()):
+        problems.append(f"Auf diesem Host gibt es schon eine Datenbank {name}.")
+    fi = fs_info(st.base)
+    if fi["fstype"] != "btrfs":
+        problems.append(f"Die {engine_label(engine)}-Ablage {st.base} liegt nicht auf btrfs.")
+    probe = st.base if st.base.exists() else st.base.parent
+    free = shutil.disk_usage(probe).free if probe.exists() else 0
+    if size and free and size > free * 0.9:
+        problems.append(f"Zu wenig Platz: {size / 1024 ** 3:.1f} GB nötig, {free / 1024 ** 3:.1f} GB frei.")
+    if engine == ORA and sh(["docker", "image", "inspect", IMAGE], check=False).returncode:
+        problems.append(f"Das Oracle-Image {IMAGE} fehlt auf diesem Host.")
+    if not PEER_SCRIPT.exists():
+        problems.append(f"{PEER_SCRIPT} fehlt (zeitkapsel aktualisieren).")
+    if not shutil.which("btrfs"):
+        problems.append("btrfs-progs fehlen.")
+    suggestion = None
+    if port:
+        try:
+            check_new_port(int(port), None)
+            suggestion = int(port)
+        except UserError:
+            warnings.append(f"Port {port} ist hier belegt.")
+    if not suggestion:
+        suggestion = free_port(PG_PORT if engine == PG else 1521)
+    return problems, warnings, dict(host=DB_HOST, base=str(st.base), free=free, port=suggestion, fs=fi,
+                                   compressed_send=send_supports_compressed())
+
+
+def send_supports_compressed() -> bool:
+    """btrfs send --compressed-data (Stream v2): komprimierte Extents gehen unverändert über die Leitung."""
+    p = sh(["btrfs", "send", "--help"], check=False)
+    return "--compressed-data" in p.stdout + p.stderr
+
+
+@bp.post("/api/peer/check")
+def api_peer_check():
+    d = request.get_json(force=True) or {}
+    engine = PG if d.get("engine") == PG else ORA
+    name = (d.get("name") or "").strip()
+    if not RE_SID.match(name):
+        raise UserError("Ungültiger Name.")
+    problems, warnings, info = peer_problems(engine, name, d.get("port"), d.get("size"), d.get("method") or "send")
+    return jsonify(problems=problems, warnings=warnings, **info)
+
+
+@bp.post("/api/peer/prepare")
+def api_peer_prepare():
+    d = request.get_json(force=True) or {}
+    engine = PG if d.get("engine") == PG else ORA
+    name, tid = (d.get("name") or "").strip(), d.get("transfer") or ""
+    if not RE_SID.match(name):
+        raise UserError("Ungültiger Name.")
+    problems, _, info = peer_problems(engine, name, None, d.get("size"))
+    if problems:
+        raise UserError(" ".join(problems))
+    authorize_peer_key(d.get("pubkey") or "", d.get("source") or "unbekannt")
+    stg = incoming_dir(engine, tid)
+    stg.mkdir(parents=True, exist_ok=True)
+    if d.get("method") == "rsync" and not (stg / "master").exists():
+        sh(["btrfs", "subvolume", "create", str(stg / "master")])
+        if NOCOW:
+            sh(["chattr", "+C", str(stg / "master")], check=False)
+    return jsonify(staging=str(stg), **info)
+
+
+def clear_incoming(stg: Path) -> None:
+    if not stg.is_dir():
+        return
+    for p in sorted(stg.iterdir()):
+        if subvol_info(p) is not None:
+            sh(["btrfs", "property", "set", "-ts", str(p), "ro", "false"], check=False)
+            sh(["btrfs", "subvolume", "delete", str(p)], check=False)
+            sv_forget(p)
+        elif p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            p.unlink(missing_ok=True)
+    rmdir_quiet(stg)
+
+
+@bp.post("/api/peer/abort")
+def api_peer_abort():
+    d = request.get_json(force=True) or {}
+    clear_incoming(incoming_dir(PG if d.get("engine") == PG else ORA, d.get("transfer") or ""))
+    return jsonify(ok=True)
+
+
+def job_peer_finish(job: Job, d: dict) -> None:
+    engine, name, tid = d["engine"], d["name"], d["transfer"]
+    st = store_by_engine(engine)
+    stg = incoming_dir(engine, tid)
+    final = stg / d["final"]
+    if not final.is_dir():
+        raise RuntimeError(f"Empfangener Stand {final} fehlt.")
+    if master_dir(name).exists():
+        raise RuntimeError(f"Eine Datenbank {name} gibt es hier schon.")
+    created = False
+    try:
+        st.master.mkdir(parents=True, exist_ok=True)
+        if (subvol_info(final) or {}).get("readonly"):
+            job.log("Master-DB als beschreibbaren Snapshot des empfangenen Stands anlegen")
+            job.run(["btrfs", "subvolume", "snapshot", str(final), str(st.master / name)])
+        else:
+            move_subvolume(job, final, st.master / name)
+        created = True
+        vol = st.master / name
+        for r in d.get("releases") or []:
+            src = stg / r["snap"]
+            if src.is_dir():
+                move_subvolume(job, src, st.golden / name / r["name"])
+                write_json(release_meta_file(name, r["name"]), dict(r.get("meta") or {}, name=r["name"]))
+        meta = dict(d.get("db_meta") or {})
+        meta.update(port=d["port"], origin=d["origin"], created=meta.get("created") or now_iso(), migrated_from=d["source"])
+        meta.pop("migrated_to", None)
+        write_json(db_meta_file(name), meta)
+        if d.get("timeline"):
+            tl_write(name, d["timeline"])
+        if engine == PG:
+            pg_pull(job, read_volume_env(vol)["ZK_IMAGE"])
+        check_volume(vol, name)
+    except Exception:
+        if created:
+            for r in d.get("releases") or []:
+                delete_release_subvol(st.golden / name / r["name"])
+            rmdir_quiet(st.golden / name)
+            shutil.rmtree(st.meta / name, ignore_errors=True)
+            sh(["btrfs", "subvolume", "delete", str(st.master / name)], check=False)
+            sv_forget(st.master / name)
+        raise
+    finally:
+        clear_incoming(stg)
+    tl_add(name, "migrated", f"Datenbank {name} von {d['source']} übernommen" + (f" (dort {d['source_sid']})" if d["source_sid"] != name else ""))
+    if d.get("start"):
+        try:
+            job_master_start(job, name, d["port"])
+        except Exception as e:
+            raise RuntimeError(f"Daten sind übernommen und liegen hier als {name}, aber der Start schlug fehl: {e}") from None
+    else:
+        job.log("Container anlegen (bleibt gestoppt)")
+        job.run(["docker", "create"] + master_run_cmd(name, d["port"])[3:])
+
+
+@bp.post("/api/peer/finish")
+def api_peer_finish():
+    d = request.get_json(force=True) or {}
+    d["engine"] = PG if d.get("engine") == PG else ORA
+    if not RE_SID.match(d.get("name") or "") or not RE_RELEASE.match(d.get("final") or ""):
+        raise UserError("Ungültige Angaben.")
+    for r in d.get("releases") or []:
+        if not RE_RELEASE.match(r.get("name") or "") or not RE_RELEASE.match(r.get("snap") or ""):
+            raise UserError("Ungültiger Release-Name.")
+    check_new_port(int(d.get("port") or 0), None)
+    job = start_job(f"Datenbank {d['name']} von {d.get('source')} übernehmen", d["name"], f"newdb:{d['name']}",
+                    job_peer_finish, d)
+    return jsonify(job=job.as_dict())
+
+
+# --- Quellseite
+def ship_ssh(target: dict) -> list[str]:
+    return ["ssh", *ssh_opts(int(target.get("ssh_port") or 22)), "-o", "ServerAliveInterval=30",
+            f"root@{target['ssh_host']}"]
+
+
+def ship_send(job: Job, target: dict, snap: Path, staging: str, parent: Path | None, compressed: bool) -> None:
+    send = ["btrfs", "send", *(["--proto", "2", "--compressed-data"] if compressed else []),
+            *(["-p", str(parent)] if parent else []), str(snap)]
+    recv = ship_ssh(target) + ["btrfs", "receive", staging.rstrip("/") + "/"]
+    job.log(f"Übertragen: {snap.name}" + (f" (nur Änderungen gegenüber {parent.name})" if parent else " (vollständig)"))
+    job.run(["bash", "-c", "set -o pipefail; " + shq(send) + " | " + shq(recv)], timeout=SHIP_TIMEOUT)
+
+
+def ship_rsync(job: Job, target: dict, vol: Path, staging: str, label: str) -> None:
+    ssh = " ".join(shlex.quote(x) for x in ship_ssh(target)[:-1])
+    job.log(f"rsync: {label}")
+    job.run(["rsync", "-aHAX", "--numeric-ids", "--sparse", "--delete", "-e", ssh, f"{vol}/",
+             f"root@{target['ssh_host']}:{staging.rstrip('/')}/master/"], timeout=SHIP_TIMEOUT)
+
+
+def ship_snapshot(job: Job, vol: Path, engine: str, cname: str | None, dst: Path) -> None:
+    if engine == PG and cname:
+        pg_checkpoint(cname)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    job.run(["btrfs", "subvolume", "snapshot", "-r", str(vol), str(dst)])
+
+
+def ship_plan(sid: str, opts: dict) -> dict:
+    vol = master_dir(sid)
+    engine = engine_of(vol)
+    name = (opts.get("target_name") or sid).strip()
+    if engine == ORA and name != sid:
+        raise UserError("Oracle-Datenbanken behalten ihre SID; nur PostgreSQL-DBs lassen sich beim Übertragen umbenennen.")
+    if not RE_SID.match(name):
+        raise UserError("Zielname: Buchstaben, Ziffern, Unterstrich.")
+    mode, method = opts.get("mode") or "copy", opts.get("method") or "send"
+    if mode not in ("copy", "move") or method not in ("send", "rsync"):
+        raise UserError("Ungültige Art der Übertragung.")
+    devs = [d for d in devdbs(containers()) if d["sid"] == sid]
+    if opts.get("delete_source") and (mode != "move" or devs):
+        raise UserError("Die Quelle lässt sich nur nach dem Verschieben löschen und nur, wenn sie keine Entwickler-DBs mehr hat.")
+    u, _ = usage_get(str(vol))
+    return dict(sid=sid, vol=vol, engine=engine, name=name, mode=mode, method=method, devs=len(devs),
+                releases=[r for r in releases(sid)][::-1] if opts.get("releases") and method == "send" else [],
+                size=(u or {}).get("disk") or (u or {}).get("total"))
+
+
+@bp.post("/api/db/<sid>/ship/probe")
+def api_ship_probe(sid):
+    need_sid(sid)
+    opts = request.get_json(force=True) or {}
+    target = opts.get("target") or {}
+    plan = ship_plan(sid, opts)
+    res = peer_call(target, "POST", "peer/check", dict(engine=plan["engine"], name=plan["name"], method=plan["method"],
+                                                       port=opts.get("port") or db_meta(sid).get("port"), size=plan["size"]))
+    ensure_ssh_key()
+    warnings = list(res.get("warnings") or [])
+    problems = list(res.get("problems") or [])
+    if plan["method"] == "rsync" and not shutil.which("rsync"):
+        problems.append("rsync fehlt auf diesem Host (dnf install rsync).")
+    if plan["devs"] and plan["mode"] == "move":
+        warnings.append(f"{plan['devs']} Entwickler-DB(s) bleiben auf diesem Host; sie laufen unabhängig weiter.")
+    local_cd = send_supports_compressed()
+    return jsonify(problems=problems, warnings=warnings, target=dict(host=res.get("host"), base=res.get("base"),
+                   free=res.get("free"), port=res.get("port")), size=plan["size"], engine=plan["engine"], name=plan["name"],
+                   releases=[r["name"] for r in plan["releases"]], compressed_send=bool(local_cd and res.get("compressed_send")))
+
+
+def job_ship(job: Job, sid: str, target: dict, opts: dict) -> None:
+    plan = ship_plan(sid, opts)
+    vol, engine, name, mode, method = plan["vol"], plan["engine"], plan["name"], plan["mode"], plan["method"]
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    tid = f"{sid}-{stamp}"
+    tmp = store_of(sid).build
+    snaps: list[Path] = []
+    c = master_container(sid, containers())
+    was_running = bool(c and c["running"])
+    stopped = False
+    finished = False
+    pubkey = ensure_ssh_key()
+    job.log(f"Ziel {target['name']} ({target['ssh_host']}) vorbereiten")
+    prep = peer_call(target, "POST", "peer/prepare", dict(engine=engine, name=name, transfer=tid, pubkey=pubkey,
+                                                          source=DB_HOST, method=method, size=plan["size"]))
+    staging = prep["staging"]
+    try:
+        p = job.run(ship_ssh(target) + ["zeitkapsel-peer-check"], allow_fail=True, timeout=60)
+        if p.returncode or "zeitkapsel-peer ok" not in p.stdout:
+            raise RuntimeError(f"SSH als root auf {target['ssh_host']} klappt nicht. Erlaubt sshd dort Root-Anmeldung mit Schlüssel "
+                               "(PermitRootLogin prohibit-password) und ist Port 22 offen?")
+        compressed = bool(opts.get("compressed")) and method == "send"
+        rel_info = []
+        if method == "send":
+            parent = None
+            for r in plan["releases"]:
+                src = golden_dir(sid) / r["name"]
+                ship_send(job, target, src, staging, parent, compressed)
+                rel_info.append(dict(name=r["name"], snap=r["name"], meta=release_meta(sid, r["name"])))
+                parent = src
+            s1 = tmp / f"zk-ship-{tid}-1"
+            job.log("Stand der Datenbank festhalten" + (" (im laufenden Betrieb)" if was_running else ""))
+            ship_snapshot(job, vol, engine, c["name"] if was_running else None, s1)
+            snaps.append(s1)
+            ship_send(job, target, s1, staging, parent, compressed)
+            final = s1
+            if mode == "move" and was_running:
+                job.log(f"Master-DB {sid} sauber herunterfahren – ab hier ist sie nicht erreichbar")
+                job.run(["docker", "stop", "-t", "600", c["name"]], timeout=700)
+                stopped = True
+                s2 = tmp / f"zk-ship-{tid}-2"
+                ship_snapshot(job, vol, engine, None, s2)
+                snaps.append(s2)
+                ship_send(job, target, s2, staging, s1, compressed)
+                final = s2
+            final_name = final.name
+        else:
+            # rsync liest aus einem lokalen Snapshot: so ist auch der Durchgang im laufenden Betrieb ein
+            # einheitlicher (absturzkonsistenter) Stand und nicht Dateien aus verschiedenen Zeitpunkten
+            s1 = tmp / f"zk-ship-{tid}-1"
+            ship_snapshot(job, vol, engine, c["name"] if was_running else None, s1)
+            snaps.append(s1)
+            ship_rsync(job, target, s1, staging, "erster Durchgang" + (" (Stand im laufenden Betrieb)" if was_running else ""))
+            if mode == "move" and was_running:
+                job.log(f"Master-DB {sid} sauber herunterfahren – ab hier ist sie nicht erreichbar")
+                job.run(["docker", "stop", "-t", "600", c["name"]], timeout=700)
+                stopped = True
+                ship_rsync(job, target, vol, staging, "zweiter Durchgang mit gestoppter DB (nur Änderungen)")
+            final_name = "master"
+        port = int(opts.get("port") or prep.get("port"))
+        res = peer_call(target, "POST", "peer/finish", dict(
+            engine=engine, name=name, transfer=tid, final=final_name, releases=rel_info, port=port,
+            start=bool(opts.get("start", True)), source=DB_HOST, source_sid=sid,
+            origin=f"{'verschoben' if mode == 'move' else 'kopiert'} von {DB_HOST}",
+            db_meta=db_meta(sid), timeline=tl_read(sid)))
+        rjid = res["job"]["id"]
+        job.log(f"Übernahme auf {target['name']} läuft (Vorgang {rjid[:8]})")
+        seen = 0
+        while True:
+            info = peer_call(target, "GET", f"jobs/{rjid}")
+            lines = info.get("log") or []
+            for line in lines[seen:]:
+                job.log(f"[{target['name']}] {line}")
+            seen = len(lines)
+            if info.get("status") != "läuft":
+                break
+            job.sleep(3)
+        if info.get("status") != "fertig":
+            raise RuntimeError(f"Übernahme auf {target['name']} fehlgeschlagen: {info.get('error') or info.get('status')}")
+        finished = True
+    except Exception:
+        if not finished:
+            try:
+                peer_call(target, "POST", "peer/abort", dict(engine=engine, transfer=tid))
+            except RuntimeError as e:
+                job.log(f"Aufräumen auf dem Ziel fehlgeschlagen: {e}")
+        if stopped:
+            job.log(f"Master-DB {sid} hier wieder starten")
+            t0 = time.time()
+            sh(["docker", "start", c["name"]], check=False)
+            try:
+                wait_ready(job, c["name"], t0)
+            except RuntimeError as e:
+                job.log(f"Neustart der Quelle: {e}")
+        raise
+    finally:
+        for s in snaps:
+            sh(["btrfs", "subvolume", "delete", str(s)], check=False)
+            sv_forget(s)
+    where = f"{target['name']} ({target['ssh_host']})"
+    if mode == "copy":
+        tl_add(sid, "shipped", f"Kopie nach {where} übertragen" + (f" als {name}" if name != sid else ""))
+        return
+    if c:
+        sh(["docker", "update", "--restart", "no", c["name"]], check=False)
+    db_meta_update(sid, migrated_to=where, migrated=now_iso())
+    tl_add(sid, "migrated", f"Datenbank nach {where} verschoben" + (f" als {name}" if name != sid else ""))
+    if opts.get("delete_source"):
+        job.log("Quelle löschen: Container, Master-DB und Releases")
+        if c:
+            job.run(["docker", "rm", "-f", c["name"]])
+        for r in releases(sid):
+            delete_release_subvol(golden_dir(sid) / r["name"])
+        rmdir_quiet(golden_dir(sid))
+        meta = meta_dir(sid)
+        job.run(["btrfs", "subvolume", "delete", str(vol)])
+        sv_forget(vol)
+        shutil.rmtree(meta, ignore_errors=True)
+
+
+def delete_release_subvol(p: Path) -> None:
+    sh(["btrfs", "subvolume", "delete", str(p)], check=False)
+    sv_forget(p)
+
+
+@bp.post("/api/db/<sid>/ship")
+def api_ship(sid):
+    need_sid(sid)
+    opts = request.get_json(force=True) or {}
+    target = opts.pop("target", None) or {}
+    if not target.get("url") or not target.get("token") or not target.get("ssh_host"):
+        raise UserError("Zielhost fehlt.")
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9.:-]{0,252}$", target["ssh_host"]):
+        raise UserError("Ungültige Adresse des Zielhosts.")
+    plan = ship_plan(sid, opts)
+    verb = "verschieben" if plan["mode"] == "move" else "kopieren"
+    job = start_job(f"{sid} nach {target.get('name')} {verb} ({'btrfs send' if plan['method'] == 'send' else 'rsync'})", sid,
+                    f"master:{sid}", job_ship, sid, target, opts)
     return jsonify(job=job.as_dict())
 
 
