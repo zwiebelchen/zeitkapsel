@@ -3158,12 +3158,16 @@ def job_import(job: Job, src: dict, port: int, restart_source: bool) -> None:
 @bp.get("/api/summary")
 def api_summary():
     cs = containers()
+    devs_by_sid: dict[str, list[dict]] = {}
+    for d in devdbs(cs):   # kurz für die Seitenleiste: Name, Zustand, Port, Besitzer
+        devs_by_sid.setdefault(d["sid"], []).append(dict(id=d["id"], name=d["name"], state=d["state"],
+                                                         port=d["port"], owner=d["owner"]))
     du = shutil.disk_usage(BASE)
     with _lock:
         running = sum(1 for j in JOBS.values() if j.status == "läuft")
     return jsonify(host=DB_HOST, image=IMAGE, running_jobs=running,
                    disk=dict(total=du.total, used=du.used, free=du.free),
-                   dbs=[dict(sid=sid, **master_info(sid, cs)) for sid in master_sids()])
+                   dbs=[dict(sid=sid, **master_info(sid, cs), devs=devs_by_sid.get(sid, [])) for sid in master_sids()])
 
 
 @bp.get("/api/devdbs/<did>")

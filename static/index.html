@@ -54,6 +54,21 @@ nav.side a:hover { background: var(--rule-soft); }
 nav.side a[aria-current="page"] { background: var(--sheet); box-shadow: inset 3px 0 0 var(--ink); font-weight: 600; }
 nav.side .port { color: var(--muted); font-size: 12.5px; }
 nav.side .sep { height: 1px; background: var(--rule); margin: 12px 6px; }
+nav.side .navdb { position: relative; display: grid; }
+nav.side .navdb > a { padding-right: 64px; }
+nav.side .navtoggle { position: absolute; right: 4px; top: 4px; height: 26px; min-width: 34px; padding: 0 6px; border: 0; background: transparent;
+  color: var(--muted); font-size: 12px; border-radius: 5px; display: inline-flex; align-items: center; gap: 3px; cursor: pointer; }
+nav.side .navtoggle:hover { background: var(--rule-soft); color: var(--ink); }
+nav.side .navtoggle span { font-size: 11.5px; }
+nav.side .navdb > a .port { margin-right: 4px; }
+nav.side .navdevs { display: grid; gap: 1px; margin: 0 0 4px 22px; padding-left: 8px; border-left: 1px solid var(--rule); }
+nav.side .navdevs[hidden] { display: none; }
+nav.side a.devlink { padding: 4px 8px; font-size: 13.5px; color: var(--muted); grid-template-columns: 10px 1fr auto; gap: 7px; }
+nav.side a.devlink .dot { width: 7px; height: 7px; }
+nav.side a.devlink.mine { color: var(--ink); }
+nav.side a.devlink[aria-current="page"] { background: var(--sheet); box-shadow: inset 2px 0 0 var(--ink); color: var(--ink); }
+.dev.flash { animation: devflash 1.6s ease-out; }
+@keyframes devflash { 0% { box-shadow: 0 0 0 3px var(--release); } 100% { box-shadow: 0 0 0 0 transparent; } }
 main { padding: 22px 28px 120px; min-width: 0; }
 
 .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; background: var(--off); flex: none; }
@@ -751,6 +766,7 @@ let openJobs = new Set();
 let jobsHidden = false;
 let snapRows = null;
 let jobsPage = null;          // { jobs, containers } der Seite „Vorgänge“
+const navClosed = new Set((() => { try { return JSON.parse(localStorage.getItem("zk.navClosed") || "[]"); } catch { return []; } })());
 let backupsPage = null;       // { backups, dir, free } der Seite „Sicherungen“
 let jobsFilter = "alle";
 const openPageLogs = new Set();
@@ -764,6 +780,7 @@ function parseHash() {
   if (p.has("zugang")) view = { kind: "access", hid };
   else if (p.has("snapshots")) view = { kind: "snapshots", hid };
   else if (p.has("vorgaenge")) view = { kind: "jobs", hid };
+  else if (p.get("dev") && p.get("db")) { view = { kind: "db", hid, sid: p.get("db"), dev: p.get("dev") }; }
   else if (p.has("sicherungen")) view = { kind: "backups", hid };
   else if (p.has("auslastung")) view = { kind: "load", hid };
   else if (p.has("verwaltung")) view = { kind: "admin", hid };
@@ -834,7 +851,13 @@ function render() {
   else if (view.kind === "load") renderLoadPage();
   else if (view.kind === "backups") renderBackupsPage();
   else if (view.kind === "admin") isAdmin() ? renderAdmin() : (location.hash = link({ h: view.hid }));
-  else renderDb(currentDb());
+  else {
+    renderDb(currentDb());
+    if (view.dev && !view.devShown) {   // aus der Seitenleiste: zur Entwickler-DB scrollen und kurz hervorheben
+      const el = document.getElementById("dev-" + view.dev);
+      if (el) { view.devShown = true; el.scrollIntoView({ behavior: "smooth", block: "center" }); el.classList.add("flash"); }
+    }
+  }
   if (S) renderJobs(); else $("#jobs").hidden = true;
 }
 
@@ -843,9 +866,23 @@ function renderNav() {
   const cur = (cond) => cond ? 'aria-current="page"' : "";
   const groups = O.hosts.map(h => {
     const here = h.id === view.hid;
-    const dbs = h.dbs.map(d => `<a href="${link({ h: h.id, db: d.sid })}" ${cur(here && view.kind === "db" && db && d.sid === db.sid)}>
-        <span class="dot ${STATE[d.state] || ""}" title="${esc(d.state)}"></span>
-        <span>${esc(d.sid)}</span><span class="port">${d.port ?? ""}</span></a>`).join("");
+    const dbs = h.dbs.map(d => {
+      const devs = d.devs || [];
+      const key = `${h.id}:${d.sid}`;
+      const open = devs.length && !navClosed.has(key);
+      const me = O.me.username;
+      const devLinks = devs.length ? `<div class="navdevs" ${open ? "" : "hidden"}>${[...devs]
+        .sort((a, b) => (b.owner === me) - (a.owner === me) || a.name.localeCompare(b.name)).map(x =>
+          `<a class="devlink ${x.owner === me ? "mine" : ""}" href="${link({ h: h.id, db: d.sid, dev: x.id })}" ${cur(here && view.dev === x.id)} title="${esc(x.name)} – ${esc(x.state)}, gehört ${esc(x.owner || "–")}">
+            <span class="dot ${STATE[x.state] || ""}"></span><span>${esc(x.name)}</span><span class="port">${x.port ?? ""}</span></a>`).join("")}</div>` : "";
+      return `<div class="navdb">
+        <a href="${link({ h: h.id, db: d.sid })}" ${cur(here && view.kind === "db" && db && d.sid === db.sid && !view.dev)}>
+          <span class="dot ${STATE[d.state] || ""}" title="${esc(d.state)}"></span>
+          <span>${esc(d.sid)}</span><span class="port">${d.port ?? ""}</span></a>
+        ${devs.length ? `<button class="navtoggle" data-act="nav-toggle" data-key="${esc(key)}" aria-expanded="${open ? "true" : "false"}"
+          title="${devs.length} Entwickler-DB${devs.length === 1 ? "" : "s"} ${open ? "einklappen" : "ausklappen"}">${open ? "▾" : "▸"}<span>${devs.length}</span></button>` : ""}
+        ${devLinks}</div>`;
+    }).join("");
     return `<div class="hostgroup ${here ? "here" : ""}">
       <a class="hostname" href="${link({ h: h.id })}"><span class="dot ${h.ok ? "ok" : "err"}" title="${h.ok ? "erreichbar" : esc(h.error || "nicht erreichbar")}"></span><span>${esc(h.name)}</span><span class="port">${h.running_jobs ? h.running_jobs + " ⟳" : ""}</span></a>
       ${dbs || (h.ok ? '<p class="port nav-empty">noch keine Datenbank</p>' : '<p class="port nav-empty">nicht erreichbar</p>')}
@@ -2397,6 +2434,13 @@ document.addEventListener("click", async ev => {
           dev_db_mb: +val("dev_db_mb") || 0, dev_port_start: +val("dev_port_start"), dev_port_end: +val("dev_port_end") };
         try { await api("PUT", "/api/host-settings", body); toast("Vorgaben gespeichert"); await loadAdmin(); }
         catch (e) { $("#fHset .form-error").textContent = e.message; }
+        break;
+      }
+      case "nav-toggle": {
+        const k = b.dataset.key;
+        navClosed.has(k) ? navClosed.delete(k) : navClosed.add(k);
+        try { localStorage.setItem("zk.navClosed", JSON.stringify([...navClosed])); } catch {}
+        renderNav();
         break;
       }
       case "host-range":
