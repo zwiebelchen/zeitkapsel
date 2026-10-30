@@ -3083,6 +3083,41 @@ def write_dbconfig(vol: Path, sid: str, edition: str, alias: str, service: str) 
     (vol / f".{sid}.created").touch()
 
 
+PDB_OPEN_SQL = """set heading off feedback off pagesize 0 linesize 200
+whenever sqlerror continue
+alter pluggable database all open;
+alter pluggable database all save state;
+select 'ZK_PDB='||name||':'||open_mode from v$pdbs where name <> 'PDB$SEED';
+exit
+"""
+
+
+def cdb_open_pdbs_and_restart(job: Job, sid: str, cname: str) -> None:
+    """Startprüfung des Images verlangt bei einer CDB mindestens eine PDB in READ WRITE.
+
+    Ist auf der Quelle kein „save state“ hinterlegt, bleiben die PDBs nach dem Start im Zustand MOUNTED
+    und das Image meldet „DATABASE SETUP WAS NOT SUCCESSFUL“, obwohl die CDB offen ist. Dann hier
+    die PDBs öffnen, den Zustand speichern (wandert mit allen Snapshots mit) und den Container neu starten.
+    """
+    running = sh(["docker", "inspect", "-f", "{{.State.Running}}", cname], check=False).stdout.strip()
+    if running != "true":
+        raise RuntimeError(f"Container {cname} läuft nicht, siehe „docker logs {cname}“.")
+    job.log("Startprüfung fehlgeschlagen – bei einer CDB meist PDBs ohne gespeicherten Zustand (MOUNTED). "
+            "PDBs öffnen und Zustand speichern")
+    p = sh(["docker", "exec", "-i", cname, "sqlplus", "-s", "-L", "/ as sysdba"], input=PDB_OPEN_SQL, check=False)
+    out = p.stdout + p.stderr
+    for line in out.splitlines():
+        if line.strip().startswith(("ZK_PDB=", "ORA-")):
+            job.log("  " + line.strip().removeprefix("ZK_PDB="))
+    if not re.search(r"ZK_PDB=[^:]+:READ WRITE", out):
+        raise RuntimeError(f"Keine PDB ließ sich READ WRITE öffnen, siehe Ausgabe oben und „docker logs {cname}“.")
+    job.log("Container neu starten, damit die Startprüfung sauber durchläuft")
+    t0 = time.time()
+    job.run(["docker", "restart", cname], timeout=900)
+    wait_ready(job, cname, t0)
+    tl_add(sid, "master", f"Master-DB {sid} gestartet (PDB-Zustand gespeichert)")
+
+
 def job_import(job: Job, src: dict, port: int, restart_source: bool) -> None:
     sid = src["sid"]
     vol = MASTER / sid
@@ -3142,8 +3177,13 @@ def job_import(job: Job, src: dict, port: int, restart_source: bool) -> None:
     if restart_source:
         job.log("Quell-DB wieder starten")
         ssh_run(src, oracle_env_script(src) + "sqlplus -s -L / as sysdba <<'EOF'\nstartup\nexit\nEOF\n", timeout=900)
-    job_master_start(job, sid, port)
     cname = sid.lower()
+    try:
+        job_master_start(job, sid, port)
+    except RuntimeError:
+        if not plan["cdb"]:
+            raise
+        cdb_open_pdbs_and_restart(job, sid, cname)
     if plan["local_listener_kind"] == "address":
         job.log("local_listener auf den Listener im Container umstellen")
         job.run(["docker", "exec", "-i", cname, "sqlplus", "-s", "/ as sysdba"],
