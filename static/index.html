@@ -256,6 +256,12 @@ table.snap td.num { text-align: right; white-space: nowrap; }
 table.snap tr.logrow td { background: #f0f3f1; padding: 0; }
 table.snap tr.logrow pre { margin: 0; padding: 10px 14px; font-size: 12px; line-height: 1.4; max-height: 420px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
 dialog.wide { width: min(1100px, calc(100vw - 24px)); }
+button.sess { font-size: 12.5px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--rule); background: transparent; color: var(--muted); cursor: pointer; }
+button.sess.busy { border-color: #b0731b; color: #b0731b; font-weight: 600; }
+button.sess.idle { border-color: var(--rule-soft); }
+button.sess[disabled] { cursor: default; }
+.sess-sum { margin: 0 0 10px; color: var(--muted); }
+table.snap tr.sess-local td { color: var(--muted); }
 .dlg-body { padding: 18px 20px; display: grid; gap: 12px; }
 .dlg-top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
 .dlg-top h2 { font-size: 18px; }
@@ -624,6 +630,19 @@ form.hset label.field input, form.hset label.field textarea { width: 100%; box-s
   </div>
 </dialog>
 
+<!-- Angemeldete Sitzungen einer DB -->
+<dialog id="dlgSessions" class="wide">
+  <div class="dlg-body">
+    <div class="dlg-top"><h2>Sitzungen: <span class="js-name"></span></h2><span class="grow"></span>
+      <label class="toggle"><input type="checkbox" class="js-local"> auch interne Sitzungen</label>
+      <label class="toggle"><input type="checkbox" class="js-auto" checked> automatisch aktualisieren</label>
+      <button class="small js-refresh" type="button">Aktualisieren</button>
+      <button class="small js-close" type="button">Schließen</button></div>
+    <p class="sess-sum js-sum"></p>
+    <div class="table-wrap js-table"></div>
+  </div>
+</dialog>
+
 <!-- Auslastung eines Containers -->
 <dialog id="dlgMetrics" class="wide">
   <div class="dlg-body">
@@ -916,6 +935,7 @@ function renderDb(db) {
       <div class="facts">
         ${pill(m.state)}
         ${m.port ? `<span>Port ${m.port}</span>` : ""}
+        ${m.container && m.state !== "gestoppt" && m.state !== "kein Container" ? sessBadge(m.container, isAdmin()) : ""}
         ${m.type === "cdb" ? `<span>Container-DB, PDB ${esc(m.pdb)}</span>` : ""}
         ${m.jdbc ? jdbcField(m.jdbc) : (m.container ? "" : `<span>Master-Container nicht gefunden</span>`)}
       </div>
@@ -1091,6 +1111,7 @@ function renderDevs(db) {
         <span>${d.base_label ? "aus " + esc(d.base_label) : "Ausgangsstand unbekannt"}</span>
         ${d.port ? `<span>Port ${d.port}</span>` : ""}
         ${d.created ? `<span>angelegt ${fmtTime(d.created, false)}</span>` : ""}
+        ${d.container && running ? sessBadge(d.container, mine) : ""}
       </div>
       ${d.jdbc ? jdbcField(d.jdbc) : ""}
       ${mine ? `<div class="acts">
@@ -1806,6 +1827,109 @@ function canLogs(name, db) {
   return !!(d && d.owner === O.me.username);
 }
 
+/* ------------------------------------------------------------ Sitzungen */
+const sessCache = {};   // je Host: { at, data: { <container>: {count, active, local, users, error} } }
+function sessInfo(name) {
+  const c = sessCache[view.hid];
+  if (!c || Date.now() - c.at > 25000) loadSessCounts();
+  return c && c.data[name];
+}
+let sessLoading = false;
+async function loadSessCounts(force) {
+  const c = sessCache[view.hid];
+  if (sessLoading || (!force && c && Date.now() - c.at < 25000)) return;
+  sessLoading = true;
+  const hid = view.hid;
+  try {
+    const r = await api("GET", "/api/sessions");
+    sessCache[hid] = { at: Date.now(), data: r.sessions || {} };
+    if (hid === view.hid) { if (view.kind === "db") render(); else if (view.kind === "jobs") renderJobsPage(); }
+  } catch { sessCache[hid] = { at: Date.now(), data: {} }; }
+  finally { sessLoading = false; }
+}
+function fmtSecs(s) {
+  if (s == null) return "–";
+  if (s < 60) return s + " s";
+  if (s < 3600) return Math.floor(s / 60) + " min";
+  if (s < 86400) return Math.floor(s / 3600) + " h " + Math.floor((s % 3600) / 60) + " min";
+  return Math.floor(s / 86400) + " d " + Math.floor((s % 86400) / 3600) + " h";
+}
+function sessText(i) {
+  if (!i) return "Sitzungen …";
+  if (i.error) return "Sitzungen ?";
+  if (!i.count) return "keine Sitzungen";
+  return `${i.count} ${i.count === 1 ? "Sitzung" : "Sitzungen"}${i.active ? `, ${i.active} aktiv` : ""}`;
+}
+function sessBadge(name, canOpen) {
+  if (!name) return "";
+  const i = sessInfo(name);
+  const kls = !i || i.error ? "" : i.count ? "busy" : "idle";
+  const title = i && i.error ? i.error : i && i.users && i.users.length ? "Benutzer: " + i.users.join(", ") : "";
+  return `<button class="sess ${kls}" type="button" ${canOpen ? `data-act="ct-sessions" data-name="${esc(name)}"` : "disabled"}
+    ${title ? `title="${esc(title)}"` : ""}>${esc(sessText(i))}</button>`;
+}
+/* Text für Stopp-Rückfragen; leer, wenn niemand angemeldet ist */
+async function sessWarning(name, canDetail) {
+  try {
+    let lines = [];
+    if (canDetail) {
+      const r = await api("GET", `/api/containers/${encodeURIComponent(name)}/sessions?fresh=1`);
+      if (r.error) return "";
+      const ext = r.sessions.filter(x => !x.local);
+      if (!ext.length) return "";
+      const by = {};
+      for (const x of ext) { const k = `${x.username} (${x.osuser}@${x.machine})`; by[k] = (by[k] || 0) + 1; }
+      lines = Object.entries(by).map(([k, n]) => `  • ${k}${n > 1 ? ` – ${n}×` : ""}`);
+      return `\n\nAchtung: ${ext.length} ${ext.length === 1 ? "Sitzung ist" : "Sitzungen sind"} angemeldet` +
+             `${ext.some(x => x.status === "ACTIVE") ? ", davon " + ext.filter(x => x.status === "ACTIVE").length + " gerade aktiv" : ""}:\n` +
+             lines.slice(0, 12).join("\n") + (lines.length > 12 ? `\n  … und ${lines.length - 12} weitere` : "");
+    }
+    await loadSessCounts(true);
+    const i = sessInfo(name);
+    return i && i.count ? `\n\nAchtung: ${sessText(i)} angemeldet (${(i.users || []).join(", ")}).` : "";
+  } catch { return ""; }
+}
+
+let sessTimer = null;
+function openSessions(name) {
+  const dlg = $("#dlgSessions");
+  $(".js-name", dlg).textContent = name;
+  let last = null;
+  const draw = () => {
+    const r = last;
+    if (!r) return;
+    if (r.error) { $(".js-sum", dlg).textContent = r.error; $(".js-table", dlg).innerHTML = ""; return; }
+    const showLocal = $(".js-local", dlg).checked;
+    const rows = r.sessions.filter(x => showLocal || !x.local);
+    $(".js-sum", dlg).textContent = (r.count ? `${sessText(r)} von außen` : "Keine Sitzungen von außen – die Datenbank kann gefahrlos angehalten werden.")
+      + (r.local ? ` · ${r.local} interne (Healthcheck, docker exec)` : "") + ` · Stand ${fmtTime(r.at)}`;
+    const cdb = new Set(r.sessions.map(x => x.container)).size > 1 || r.sessions.some(x => x.container === "CDB$ROOT");
+    $(".js-table", dlg).innerHTML = rows.length ? `<table class="snap"><thead><tr>
+        <th>DB-Benutzer</th>${cdb ? "<th>Container</th>" : ""}<th>Status</th><th>OS-Benutzer</th><th>Rechner</th><th>Programm</th><th>Modul</th>
+        <th class="num">angemeldet seit</th><th class="num">letzte Aktivität vor</th><th class="num">SID, Serial#</th></tr></thead><tbody>
+      ${rows.map(x => `<tr class="${x.local ? "sess-local" : ""}">
+        <td class="nw"><b>${esc(x.username)}</b>${x.local ? ' <span class="tag">intern</span>' : ""}</td>${cdb ? `<td class="nw">${esc(x.container)}</td>` : ""}
+        <td class="nw">${pillPlain(x.status === "ACTIVE" ? "aktiv" : "inaktiv", x.status === "ACTIVE" ? "warn" : "off")}</td>
+        <td class="nw">${esc(x.osuser)}</td><td class="nw">${esc(x.machine)}</td><td>${esc(x.program)}</td><td>${esc(x.module)}</td>
+        <td class="num nw">${fmtSecs(x.logon_secs)}</td><td class="num nw">${fmtSecs(x.idle_secs)}</td>
+        <td class="num nw">${x.sid}, ${x.serial}</td></tr>`).join("")}</tbody></table>` : "";
+  };
+  const load = async () => {
+    try { last = await api("GET", `/api/containers/${encodeURIComponent(name)}/sessions?fresh=1`); }
+    catch (e) { last = { error: e.message, sessions: [] }; }
+    draw();
+  };
+  $(".js-sum", dlg).textContent = "Lade …"; $(".js-table", dlg).innerHTML = "";
+  $(".js-refresh", dlg).onclick = load;
+  $(".js-local", dlg).onchange = draw;
+  $(".js-close", dlg).onclick = () => dlg.close();
+  dlg.onclose = () => { clearInterval(sessTimer); sessTimer = null; loadSessCounts(true); };
+  clearInterval(sessTimer);
+  sessTimer = setInterval(() => { if ($(".js-auto", dlg).checked) load(); }, 10000);
+  dlg.showModal();
+  load();
+}
+
 let logsTimer = null;
 function openLogs(name) {
   const dlg = $("#dlgLogs");
@@ -1994,6 +2118,7 @@ async function loadJobsPage() {
                                          api("GET", "/api/metrics").catch(() => ({ latest: {} }))]);
     jobsPage = { jobs: j.jobs, containers: c.containers };
     metricsLatest = m.latest || {};
+    loadSessCounts(true);
     for (const id of openPageLogs) {
       const job = jobsPage.jobs.find(x => x.id === id);
       if (!pageLogs[id] || (job && job.status === "läuft")) {
@@ -2024,6 +2149,7 @@ function renderJobsPage() {
       <td class="nw">${pillPlain(c.state, STATE[c.state] || (c.running ? "ok" : "off"))}</td>
       <td class="nw">${c.running ? fmtDuration(c.started) : "–"}</td><td class="nw">${c.port || "–"}</td>
       <td class="nw">${esc(c.owner || "–")}</td>
+      <td class="nw">${c.running && c.kind.endsWith("-DB") ? sessBadge(c.name, ctMine(c)) : "–"}</td>
       ${(() => { const m = c.running && metricsLatest && metricsLatest[c.name];
         return m ? `<td class="num nw">${fmtPct(m.cpu)}</td><td class="num nw">${fmtBytes(m.mem)}</td><td class="num nw">${fmtRate(m.rd + m.wr)}</td>`
                  : '<td class="num">–</td><td class="num">–</td><td class="num">–</td>'; })()}
@@ -2055,7 +2181,7 @@ function renderJobsPage() {
       <div class="actions"><button data-act="jobs-reload">Neu laden</button></div></section>
     <section style="margin-top:22px" aria-labelledby="h-ct">
       <div class="section-head"><h2 id="h-ct">Container</h2><span class="hint">nur Container von zeitkapsel; „Abschießen“ beendet sofort ohne sauberes Herunterfahren</span></div>
-      <div class="table-wrap"><table class="snap"><thead><tr><th>Name</th><th>Art</th><th>Datenbank</th><th>Status</th><th>Läuft seit</th><th>Port</th><th>Besitzer</th><th class="num">CPU</th><th class="num">RAM</th><th class="num">I/O</th><th></th></tr></thead>
+      <div class="table-wrap"><table class="snap"><thead><tr><th>Name</th><th>Art</th><th>Datenbank</th><th>Status</th><th>Läuft seit</th><th>Port</th><th>Besitzer</th><th>Sitzungen</th><th class="num">CPU</th><th class="num">RAM</th><th class="num">I/O</th><th></th></tr></thead>
         <tbody>${ctRows || '<tr><td colspan="11">Keine Container.</td></tr>'}</tbody></table></div>
     </section>
     <section style="margin-top:28px" aria-labelledby="h-jobs">
@@ -2144,10 +2270,12 @@ document.addEventListener("click", async ev => {
         await api("PATCH", `/api/devdbs/${encodeURIComponent(d.id)}`, { owner: who }); toast("Besitzer geändert"); await refresh();
         break;
       }
-      case "master-stop":
-        if (!confirm(`Master-DB ${db.sid} stoppen?\n\nWer gerade mit ihr arbeitet, verliert die Verbindung. Entwickler-DBs laufen weiter.`)) return;
+      case "master-stop": {
+        const warn = db.master.container ? await sessWarning(db.master.container, true) : "";
+        if (!confirm(`Master-DB ${db.sid} stoppen?\n\nWer gerade mit ihr arbeitet, verliert die Verbindung. Entwickler-DBs laufen weiter.${warn}`)) return;
         startedJob(await api("POST", `/api/db/${encodeURIComponent(db.sid)}/master/stop`)); await refresh();
         break;
+      }
       case "newdb": {
         const chk = await api("GET", "/api/newdb/check");
         openDialog("dlgNewDb", f => {
@@ -2314,9 +2442,15 @@ document.addEventListener("click", async ev => {
         await api("DELETE", `/api/db/${encodeURIComponent(db.sid)}/notes/${encodeURIComponent(b.dataset.id)}`);
         toast("Notiz gelöscht"); await refresh();
         break;
-      case "dev-start": case "dev-stop":
+      case "dev-start": case "dev-stop": {
+        const d = db.devdbs.find(x => x.id === b.dataset.id);
+        if (act === "dev-stop" && d && d.container) {
+          const warn = await sessWarning(d.container, true);
+          if (warn && !confirm(`Entwickler-DB „${d.name}“ stoppen?${warn}`)) return;
+        }
         startedJob(await api("POST", `/api/devdbs/${encodeURIComponent(b.dataset.id)}/${act.slice(4)}`)); await refresh();
         break;
+      }
       case "dev-reset": {
         const d = db.devdbs.find(x => x.id === b.dataset.id);
         if (!confirm(`„${d.name}“ auf den Ausgangsstand (${d.base_label}) zurücksetzen?\n\nAlle Änderungen in dieser Entwickler-DB gehen verloren. Ihre Snapshots bleiben erhalten.`)) return;
@@ -2364,6 +2498,9 @@ document.addEventListener("click", async ev => {
       }
       case "ct-logs":
         openLogs(b.dataset.name);
+        break;
+      case "ct-sessions":
+        openSessions(b.dataset.name);
         break;
       case "settings": {
         const kind = b.dataset.kind, id = b.dataset.id;
@@ -2488,10 +2625,13 @@ document.addEventListener("click", async ev => {
       case "jobs-reload":
         await loadJobsPage();
         break;
-      case "ct-stop":
-        if (!confirm(`Container „${b.dataset.name}“ sauber stoppen?${b.dataset.kind.endsWith("DB") ? "\n\nDie Datenbank wird heruntergefahren; das kann einige Minuten dauern." : ""}`)) return;
+      case "ct-stop": {
+        const isDb = b.dataset.kind.endsWith("DB");
+        const warn = isDb ? await sessWarning(b.dataset.name, true) : "";
+        if (!confirm(`Container „${b.dataset.name}“ sauber stoppen?${isDb ? "\n\nDie Datenbank wird heruntergefahren; das kann einige Minuten dauern." : ""}${warn}`)) return;
         startedJob(await api("POST", `/api/containers/${encodeURIComponent(b.dataset.name)}/stop`)); await loadJobsPage(); await refresh();
         break;
+      }
       case "ct-kill":
         if (!confirm(`Container „${b.dataset.name}“ abschießen?\n\nDer Container wird sofort beendet, ohne sauberes Herunterfahren${b.dataset.kind.endsWith("DB") ? ". Die Datenbank führt beim nächsten Start eine Instance Recovery aus" : ""}. Nur nutzen, wenn „Stoppen“ hängt.`)) return;
         await api("POST", `/api/containers/${encodeURIComponent(b.dataset.name)}/kill`);

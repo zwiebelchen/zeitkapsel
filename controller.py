@@ -203,7 +203,7 @@ def agent_call(host: dict, method: str, path: str, body=None, user: str = "", qu
 # --------------------------------------------------------------------------- Rechte
 USER_GET = (r"state", r"jobs", r"jobs/[^/]+", r"snapshots", r"usage", r"devdbs/[^/]+",
             r"containers", r"containers/[^/]+", r"ports/free", r"metrics", r"db/[^/]+/settings", r"devdbs/[^/]+/settings",
-            r"backups", r"backups/[^/]+/[^/]+/log", r"host-settings")
+            r"backups", r"backups/[^/]+/[^/]+/log", r"host-settings", r"sessions")
 OWNER_ACTIONS = (
     ("POST", r"devdbs/([^/]+)/(start|stop|reset|port|settings|backup)"),
     ("DELETE", r"devdbs/([^/]+)"),
@@ -221,12 +221,13 @@ def authorize(host: dict, method: str, path: str, body):
     if method == "GET":
         if any(re.fullmatch(p, path) for p in USER_GET):
             return body
-        hit = re.fullmatch(r"containers/([^/]+)/logs", path)
-        if hit:   # Logs: Benutzer nur für Container ihrer eigenen Entwickler-DBs
+        hit = re.fullmatch(r"containers/([^/]+)/(logs|sessions)", path)
+        if hit:   # Logs und Sitzungen: Benutzer nur für Container ihrer eigenen Entwickler-DBs
             status, row = agent_call(host, "GET", f"containers/{hit.group(1)}", user=g.user)
             if status == 200 and row.get("kind") == "Entwickler-DB" and row.get("owner") == g.user:
                 return body
-            raise Denied("Logs nur für Container der eigenen Entwickler-DBs.")
+            what = "Logs" if hit.group(2) == "logs" else "Sitzungen"
+            raise Denied(f"{what} nur für Container der eigenen Entwickler-DBs.")
         raise Denied()
     if method == "POST" and re.fullmatch(r"db/[^/]+/devdbs", path):
         body = dict(body or {})

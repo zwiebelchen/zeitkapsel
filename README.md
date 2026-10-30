@@ -12,6 +12,7 @@ zeitkapsel verwaltet Oracle-Datenbanken, die als Container (Oracle-Image aus `or
 | Import | bestehende DB von einem anderen Server per SSH übernehmen, inklusive spfile und Passwortdatei |
 | Releases | aus der Master-DB, aus einem Entwickler-Snapshot oder von einem Release abgeleitet (wie ein Git-Branch) |
 | Entwickler-DBs | aus einem Release oder Snapshot anlegen, starten, stoppen, zurücksetzen, snapshotten, löschen |
+| Sitzungen | angemeldete DB-Benutzer je laufender Master- und Entwickler-DB (Rechner, Programm, aktiv/inaktiv, letzte Aktivität); Warnung beim Stoppen |
 | Timeline | Baum je Datenbank mit Releases, Entwickler-DBs, Snapshots und Notizen |
 | Zeitpläne | täglich, stündlich, minütlich: Releases, Snapshots, Entwickler-DBs stoppen oder zurücksetzen |
 | Benutzer | Anmeldung, Rollen Administrator und Benutzer, Protokoll aller Änderungen |

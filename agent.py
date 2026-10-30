@@ -36,6 +36,7 @@ import uuid
 from pathlib import Path
 
 import collections
+import concurrent.futures
 import logging
 import math
 import shlex
@@ -1578,6 +1579,92 @@ def api_container_logs(name):
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
     lines = p.stdout.splitlines()
     return jsonify(name=name, tail=tail, lines=lines[-tail:])
+
+
+# --------------------------------------------------------------------------- Angemeldete DB-Sitzungen
+SESSIONS_SQL = r"""set heading off feedback off pagesize 0 linesize 4000 trimspool on verify off
+whenever sqlerror exit 1
+select 'ZKH'||chr(9)||sys_context('userenv','host') from dual;
+select 'ZKS'||chr(9)||s.sid||chr(9)||s.serial#||chr(9)||nvl(c.name,'-')||chr(9)||s.username
+  ||chr(9)||translate(nvl(s.osuser,'-'), chr(9)||chr(10)||chr(13), '   ')
+  ||chr(9)||translate(nvl(s.machine,'-'), chr(9)||chr(10)||chr(13), '   ')
+  ||chr(9)||translate(nvl(s.program,'-'), chr(9)||chr(10)||chr(13), '   ')
+  ||chr(9)||translate(nvl(s.module,'-'), chr(9)||chr(10)||chr(13), '   ')
+  ||chr(9)||s.status||chr(9)||round((sysdate - s.logon_time) * 86400)||chr(9)||s.last_call_et
+  from v$session s left join v$containers c on c.con_id = s.con_id
+ where s.type = 'USER' and s.username is not null
+   and s.sid <> to_number(sys_context('userenv','sid'))
+ order by s.status, s.username, s.logon_time;
+exit
+"""
+SESSION_FIELDS = ("sid", "serial", "container", "username", "osuser", "machine", "program", "module", "status",
+                  "logon_secs", "idle_secs")
+SESSIONS_TTL = 20
+_sessions_cache: dict[str, tuple[float, dict]] = {}
+_sessions_lock = threading.Lock()
+
+
+def db_sessions(name: str, fresh: bool = False) -> dict:
+    """Benutzersitzungen einer laufenden DB im Container (ohne die eigene Abfrage).
+
+    local: Sitzung kommt aus dem Container selbst (Healthcheck des Images, sqlplus per docker exec).
+    """
+    with _sessions_lock:
+        hit = _sessions_cache.get(name)
+    if hit and not fresh and time.time() - hit[0] < SESSIONS_TTL:
+        return hit[1]
+    try:
+        p = sh(["docker", "exec", "-i", name, "sqlplus", "-s", "-L", "/ as sysdba"], input=SESSIONS_SQL,
+               timeout=30, check=False)
+        out = p.stdout + p.stderr
+        rows, host = [], ""
+        for line in out.splitlines():
+            parts = line.rstrip("\r").split("\t")
+            if parts[0] == "ZKH" and len(parts) > 1:
+                host = parts[1].strip()
+            elif parts[0] == "ZKS" and len(parts) == len(SESSION_FIELDS) + 1:
+                r = dict(zip(SESSION_FIELDS, (x.strip() for x in parts[1:])))
+                for k in ("sid", "serial", "logon_secs", "idle_secs"):
+                    r[k] = int(r[k]) if r[k].lstrip("-").isdigit() else None
+                r["local"] = bool(host) and r["machine"].split(".")[0] == host.split(".")[0]
+                rows.append(r)
+        if p.returncode or not host:
+            err = next((l.strip() for l in out.splitlines() if re.match(r"\s*(ORA|SP2)-\d+", l)), "")
+            res = dict(name=name, error=err or "Datenbank nicht abfragbar (noch nicht offen?).", sessions=[])
+        else:
+            ext = [r for r in rows if not r["local"]]
+            res = dict(name=name, error="", sessions=rows, count=len(ext),
+                       active=sum(1 for r in ext if r["status"] == "ACTIVE"), local=len(rows) - len(ext),
+                       users=sorted({r["username"] for r in ext}))
+    except subprocess.TimeoutExpired:
+        res = dict(name=name, error="Zeitüberschreitung bei der Abfrage.", sessions=[])
+    res["at"] = now_iso()
+    with _sessions_lock:
+        _sessions_cache[name] = (time.time(), res)
+    return res
+
+
+@bp.get("/api/containers/<name>/sessions")
+def api_container_sessions(name):
+    row = find_container(name)
+    if row["kind"] not in ("Master-DB", "Entwickler-DB"):
+        raise UserError("Sitzungen gibt es nur bei Master- und Entwickler-DBs.")
+    if not row["running"]:
+        return jsonify(name=name, error="Der Container läuft nicht.", sessions=[], at=now_iso())
+    return jsonify(db_sessions(name, fresh=request.args.get("fresh") == "1"))
+
+
+@bp.get("/api/sessions")
+def api_sessions():
+    """Anzahl der Sitzungen je laufender Master- und Entwickler-DB (ohne Details)."""
+    names = [r["name"] for r in container_rows()
+             if r["kind"] in ("Master-DB", "Entwickler-DB") and r["running"] and r["state"] in ("bereit", "Fehler")]
+    out = {}
+    if names:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(names))) as ex:
+            for res in ex.map(db_sessions, names):
+                out[res["name"]] = {k: res.get(k) for k in ("count", "active", "local", "users", "error", "at")}
+    return jsonify(sessions=out)
 
 
 # --------------------------------------------------------------------------- Auslastung (CPU, RAM, I/O)
