@@ -240,6 +240,35 @@ table.snap td.num { text-align: right; white-space: nowrap; }
 .jobs-reopen .dot { background: #e0a43a; }
 table.snap tr.logrow td { background: #f0f3f1; padding: 0; }
 table.snap tr.logrow pre { margin: 0; padding: 10px 14px; font-size: 12px; line-height: 1.4; max-height: 420px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+dialog.wide { width: min(1100px, calc(100vw - 24px)); }
+.dlg-body { padding: 18px 20px; display: grid; gap: 12px; }
+.dlg-top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.dlg-top h2 { font-size: 18px; }
+.logbox { margin: 0; background: #12232a; color: #dfe8e5; font-size: 12px; line-height: 1.45; padding: 12px 14px; border-radius: 8px; height: min(65vh, 640px); overflow: auto; white-space: pre-wrap; word-break: break-word; }
+.charts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+@media (max-width: 1100px) { .charts { grid-template-columns: 1fr; } }
+.chart { background: var(--sheet); border: 1px solid var(--rule); border-radius: 8px; padding: 10px 12px 8px; }
+.chart h3 { font-size: 14px; font-weight: 600; margin: 0 0 4px; display: flex; justify-content: space-between; gap: 8px; }
+.chart h3 .now { font-weight: 400; color: var(--muted); font-variant-numeric: tabular-nums; }
+.chart svg { width: 100%; height: auto; display: block; }
+.chart .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12.5px; color: var(--muted); }
+.chart .legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+.chart-empty { color: var(--muted); font-size: 13px; padding: 30px 0; text-align: center; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 20px 0 16px; }
+.tile { background: var(--sheet); border: 1px solid var(--rule); border-radius: 8px; padding: 12px 14px; display: grid; gap: 4px; align-content: start; }
+.tile .k { font-size: 13px; color: var(--muted); }
+.tile .v { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.tile .s { font-size: 12.5px; color: var(--muted); }
+.tile .meterbar { height: 6px; background: var(--rule-soft); border-radius: 3px; overflow: hidden; }
+.tile .meterbar span { display: block; height: 100%; background: var(--ok); }
+.tile .meterbar span.hi { background: var(--warn); }
+.tile .meterbar span.crit { background: var(--err); }
+.tile.capacity { border-color: var(--ink); }
+.host-charts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@media (max-width: 1100px) { .host-charts { grid-template-columns: minmax(0, 1fr); } }
+.load-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin: 22px 0 10px; }
+.load-head h2 { font-size: 18px; font-weight: 650; }
+.load-head select { font-size: 13px; padding: 3px 6px; border: 1px solid var(--rule); border-radius: 5px; background: #fff; }
 .filters { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
 
 /* Dialoge */
@@ -551,6 +580,28 @@ label.field textarea { min-height: 84px; resize: vertical; }
   </form>
 </dialog>
 
+<!-- Container-Logs -->
+<dialog id="dlgLogs" class="wide">
+  <div class="dlg-body">
+    <div class="dlg-top"><h2>Logs: <span class="js-name"></span></h2><span class="grow"></span>
+      <label class="toggle">Zeilen <select class="js-tail"><option>200</option><option selected>500</option><option>2000</option><option>10000</option></select></label>
+      <label class="toggle"><input type="checkbox" class="js-auto" checked> automatisch aktualisieren</label>
+      <button class="small js-refresh" type="button">Aktualisieren</button>
+      <button class="small js-close" type="button">Schließen</button></div>
+    <pre class="logbox js-log">…</pre>
+  </div>
+</dialog>
+
+<!-- Auslastung eines Containers -->
+<dialog id="dlgMetrics" class="wide">
+  <div class="dlg-body">
+    <div class="dlg-top"><h2>Auslastung: <span class="js-name"></span></h2><span class="grow"></span>
+      <span class="days js-range"></span>
+      <button class="small js-close" type="button">Schließen</button></div>
+    <div class="js-charts"></div>
+  </div>
+</dialog>
+
 <!-- Vorgang erneut ausführen -->
 <dialog id="dlgRetry">
   <form method="dialog" id="fRetry">
@@ -653,6 +704,7 @@ function parseHash() {
   if (p.has("zugang")) view = { kind: "access", hid };
   else if (p.has("snapshots")) view = { kind: "snapshots", hid };
   else if (p.has("vorgaenge")) view = { kind: "jobs", hid };
+  else if (p.has("auslastung")) view = { kind: "load", hid };
   else if (p.has("verwaltung")) view = { kind: "admin", hid };
   else view = { kind: "db", hid, sid: p.get("db") };
 }
@@ -665,6 +717,7 @@ async function onHash() {
   if (view.kind === "snapshots") loadSnapshots();
   if (view.kind === "admin") loadAdmin();
   if (view.kind === "access") loadAccess();
+  if (view.kind === "load") loadLoadPage(true);
   render();
   if (view.hid !== before) refresh();
 }
@@ -716,6 +769,7 @@ function render() {
   else if (!host.ok || !S) $("#main").innerHTML = `<div class="empty-state"><p><b>${esc(host.name)}</b> ist nicht erreichbar.</p><p>${esc(host.error || "")}</p></div>`;
   else if (view.kind === "snapshots") renderSnapshots();
   else if (view.kind === "jobs") renderJobsPage();
+  else if (view.kind === "load") renderLoadPage();
   else if (view.kind === "admin") isAdmin() ? renderAdmin() : (location.hash = link({ h: view.hid }));
   else renderDb(currentDb());
   if (S) renderJobs(); else $("#jobs").hidden = true;
@@ -734,6 +788,7 @@ function renderNav() {
       ${dbs || (h.ok ? '<p class="port nav-empty">noch keine Datenbank</p>' : '<p class="port nav-empty">nicht erreichbar</p>')}
       ${here && h.ok ? `<a href="${link({ h: h.id, snapshots: 1 })}" ${cur(view.kind === "snapshots")} class="sub"><span></span><span>Alle Snapshots</span><span></span></a>
         <a href="${link({ h: h.id, vorgaenge: 1 })}" ${cur(view.kind === "jobs")} class="sub"><span></span><span>Vorgänge und Container</span><span></span></a>
+        <a href="${link({ h: h.id, auslastung: 1 })}" ${cur(view.kind === "load")} class="sub"><span></span><span>Auslastung des Hosts</span><span></span></a>
         ${isAdmin() ? `<a href="${link({ h: h.id, verwaltung: 1 })}" ${cur(view.kind === "admin")} class="sub"><span></span><span>Verwaltung</span><span></span></a>` : ""}` : ""}
     </div>`;
   }).join("");
@@ -772,6 +827,7 @@ function renderDb(db) {
           <button class="primary" data-act="release-new" ${db.release_busy ? 'disabled title="Ein Release wird gerade erstellt"' : ""}>${db.release_busy ? "Release wird erstellt …" : "Release erstellen"}</button>` : ""}
       </div>
     </section>
+    ${loadSectionHtml(db)}
     <div class="cols">
       <section aria-labelledby="h-tl">
         <div class="section-head"><h2 id="h-tl">Timeline</h2><span class="hint">${db.releases.length} ${db.releases.length === 1 ? "Release" : "Releases"}, neueste oben</span><span class="grow"></span>
@@ -1467,11 +1523,216 @@ async function loadJobLogs() {
   }
 }
 
+/* ------------------------------------------------------------ Auslastung und Logs */
+const metricsCache = {};       // "<hid>:<name>:<range>" -> { at, data }
+let metricsLatest = null;      // letzter Messwert je Container (Seite „Vorgänge und Container“)
+let loadSel = {};              // gewählter Container je DB in der Ansicht „Auslastung“
+let loadRange = 3600;
+const RANGES = [[3600, "1 h"], [21600, "6 h"], [86400, "24 h"]];
+const fmtRate = v => fmtBytes(v) + "/s";
+const fmtPct = v => (v == null ? "–" : v.toLocaleString("de-DE", { maximumFractionDigits: v < 10 ? 1 : 0 }) + " %");
+
+function niceMax(v) {
+  if (v <= 0) return 1;
+  const e = Math.pow(10, Math.floor(Math.log10(v))), f = v / e;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * e;
+}
+
+function chartSvg(points, series, fmt, interval, yFloor) {
+  if (!points.length) return '<div class="chart-empty">Noch keine Messwerte – der Agent erfasst alle 30 Sekunden.</div>';
+  const W = 600, H = 170, L = 62, R = 8, T = 8, B = 22;
+  const t0 = points[0].t, t1 = points[points.length - 1].t;
+  const ymax = niceMax(Math.max(yFloor || 0, ...points.flatMap(p => series.map(s => p[s.key] || 0))));
+  const x = t => L + (W - L - R) * (t1 === t0 ? 1 : (t - t0) / (t1 - t0));
+  const y = v => T + (H - T - B) * (1 - Math.min(v, ymax) / ymax);
+  const grid = [0, 0.5, 1].map(f => `<line x1="${L}" x2="${W - R}" y1="${y(ymax * f)}" y2="${y(ymax * f)}" stroke="var(--rule-soft)"/>
+    <text x="${L - 6}" y="${y(ymax * f) + 4}" text-anchor="end" font-size="11" fill="var(--muted)">${esc(fmt(ymax * f))}</text>`).join("");
+  const hhmm = t => new Date(t * 1000).toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
+  const lines = series.map(sr => {
+    let d = "", prev = null;
+    for (const p of points) {
+      const gap = prev && p.t - prev.t > (interval || 30) * 3;
+      d += `${!prev || gap ? "M" : "L"}${x(p.t).toFixed(1)},${y(p[sr.key] || 0).toFixed(1)}`;
+      prev = p;
+    }
+    return `<path d="${d}" fill="none" stroke="${sr.color}" stroke-width="1.8" stroke-linejoin="round"/>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(series.map(s => s.label).join(", "))}">${grid}${lines}
+    <text x="${L}" y="${H - 4}" font-size="11" fill="var(--muted)">${hhmm(t0)}</text>
+    <text x="${W - R}" y="${H - 4}" font-size="11" fill="var(--muted)" text-anchor="end">${hhmm(t1)}</text></svg>`;
+}
+
+function chartsHtml(data) {
+  const pts = data.points || [];
+  const last = pts[pts.length - 1] || {};
+  const limit = last.mem_limit || 0;
+  const card = (title, now, svg, legend) => `<div class="chart"><h3><span>${title}</span><span class="now">${now}</span></h3>${svg}
+    ${legend ? `<div class="legend">${legend}</div>` : ""}</div>`;
+  const lg = (color, text) => `<span><i style="background:${color}"></i>${esc(text)}</span>`;
+  return `<div class="charts">
+    ${card("CPU", fmtPct(last.cpu), chartSvg(pts, [{ key: "cpu", color: "var(--release)", label: "CPU" }], fmtPct, data.interval, 100),
+      `<span>100 % = ein Kern${data.cores ? `, Host: ${data.cores} Kerne` : ""}</span>`)}
+    ${card("Arbeitsspeicher", last.mem != null ? fmtBytes(last.mem) + (limit ? " von " + fmtBytes(limit) : "") : "–",
+      chartSvg(pts, [{ key: "mem", color: "var(--branch)", label: "RAM" }], fmtBytes, data.interval))}
+    ${card("Platten-I/O", last.rd != null ? `${fmtRate(last.rd)} / ${fmtRate(last.wr)}` : "–",
+      chartSvg(pts, [{ key: "rd", color: "var(--release)", label: "lesen" }, { key: "wr", color: "#b0731b", label: "schreiben" }], fmtRate, data.interval),
+      lg("var(--release)", "lesen") + lg("#b0731b", "schreiben"))}
+  </div>`;
+}
+
+async function loadMetrics(name, range, force) {
+  const key = `${view.hid}:${name}:${range}`;
+  const c = metricsCache[key];
+  if (!force && c && Date.now() - c.at < 25000) return c.data;
+  const data = await api("GET", `/api/metrics?name=${encodeURIComponent(name)}&range=${range}`);
+  metricsCache[key] = { at: Date.now(), data };
+  return data;
+}
+
+function loadSectionHtml(db) {
+  const opts = [];
+  if (db.master.container) opts.push([db.master.container, `Master-DB ${db.sid}`]);
+  for (const d of db.devdbs) if (d.container) opts.push([d.container, `Entwickler-DB ${d.name}`]);
+  if (!opts.length) return "";
+  let sel = loadSel[db.sid];
+  if (!opts.some(o => o[0] === sel)) sel = loadSel[db.sid] = opts[0][0];
+  const cached = metricsCache[`${view.hid}:${sel}:${loadRange}`];
+  if (!cached || Date.now() - cached.at > 25000) loadMetrics(sel, loadRange).then(() => { if (view.kind === "db") render(); }).catch(() => {});
+  return `<section aria-labelledby="h-load">
+    <div class="load-head"><h2 id="h-load">Auslastung</h2>
+      <select data-act="load-sel" data-sid="${esc(db.sid)}">${opts.map(([n, l]) => `<option value="${esc(n)}" ${n === sel ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>
+      <span class="days">${RANGES.map(([r, l]) => `<label><input type="radio" name="loadrange" value="${r}" data-act="load-range" ${r === loadRange ? "checked" : ""}>${l}</label>`).join("")}</span>
+      ${canLogs(sel, db) ? `<button class="small" data-act="ct-logs" data-name="${esc(sel)}">Logs</button>` : ""}</div>
+    ${cached ? chartsHtml(cached.data) : '<div class="chart-empty">Lade …</div>'}
+  </section>`;
+}
+
+function canLogs(name, db) {
+  if (isAdmin()) return true;
+  const d = db && db.devdbs.find(x => x.container === name);
+  return !!(d && d.owner === O.me.username);
+}
+
+let logsTimer = null;
+function openLogs(name) {
+  const dlg = $("#dlgLogs");
+  $(".js-name", dlg).textContent = name;
+  const pre = $(".js-log", dlg);
+  const load = async () => {
+    try {
+      const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
+      const r = await api("GET", `/api/containers/${encodeURIComponent(name)}/logs?tail=${$(".js-tail", dlg).value}`);
+      pre.textContent = r.lines.join("\n") || "(keine Ausgabe)";
+      if (atBottom || pre.dataset.first !== "0") { pre.scrollTop = pre.scrollHeight; pre.dataset.first = "0"; }
+    } catch (e) { pre.textContent = e.message; }
+  };
+  pre.dataset.first = "1"; pre.textContent = "Lade …";
+  $(".js-refresh", dlg).onclick = load;
+  $(".js-tail", dlg).onchange = () => { pre.dataset.first = "1"; load(); };
+  $(".js-close", dlg).onclick = () => dlg.close();
+  dlg.onclose = () => { clearInterval(logsTimer); logsTimer = null; };
+  clearInterval(logsTimer);
+  logsTimer = setInterval(() => { if ($(".js-auto", dlg).checked) load(); }, 5000);
+  dlg.showModal();
+  load();
+}
+
+let metricsDlgTimer = null;
+function openMetricsDialog(name) {
+  const dlg = $("#dlgMetrics");
+  let range = loadRange;
+  $(".js-name", dlg).textContent = name;
+  const draw = async force => {
+    $(".js-range", dlg).innerHTML = RANGES.map(([r, l]) => `<label><input type="radio" name="mrange" value="${r}" ${r === range ? "checked" : ""}>${l}</label>`).join("");
+    dlg.querySelectorAll("input[name=mrange]").forEach(i => { i.onchange = () => { range = +i.value; draw(true); }; });
+    try { $(".js-charts", dlg).innerHTML = chartsHtml(await loadMetrics(name, range, force)); }
+    catch (e) { $(".js-charts", dlg).innerHTML = `<p class="bad">${esc(e.message)}</p>`; }
+  };
+  $(".js-close", dlg).onclick = () => dlg.close();
+  dlg.onclose = () => { clearInterval(metricsDlgTimer); metricsDlgTimer = null; };
+  clearInterval(metricsDlgTimer);
+  metricsDlgTimer = setInterval(() => draw(true), 30000);
+  $(".js-charts", dlg).innerHTML = '<div class="chart-empty">Lade …</div>';
+  dlg.showModal();
+  draw(true);
+}
+
+/* ------------------------------------------------------------ Seite „Auslastung“ des Hosts */
+let hostLoad = { range: 3600, data: null, fetched: 0 };
+async function loadLoadPage(force) {
+  try {
+    const [latest, host] = await Promise.all([api("GET", "/api/metrics"),
+      api("GET", `/api/metrics?name=__host__&range=${hostLoad.range}`)]);
+    let cts = { containers: [] };
+    try { cts = await api("GET", "/api/containers"); } catch {}
+    hostLoad.data = { ...latest, points: host.points, containers: cts.containers };
+    hostLoad.fetched = Date.now();
+    if (view.kind === "load") renderLoadPage();
+  } catch (e) { if (force) toast(e.message); }
+}
+
+function pctBar(p) {
+  const v = Math.max(0, Math.min(100, p || 0));
+  return `<div class="meterbar"><span class="${v > 90 ? "crit" : v > 75 ? "hi" : ""}" style="width:${v.toFixed(1)}%"></span></div>`;
+}
+
+function renderLoadPage() {
+  const main = $("#main"), d = hostLoad.data;
+  if (!d) { main.innerHTML = "<p>Lade Auslastung …</p>"; return; }
+  const h = d.host, cap = d.capacity, cores = d.cores || 1, pts = d.points || [];
+  const n1 = v => (v || 0).toLocaleString("de-DE", { maximumFractionDigits: 2 });
+  const lg = (color, text) => `<span><i style="background:${color}"></i>${esc(text)}</span>`;
+  const card = (title, now, svg, legend) => `<div class="chart"><h3><span>${title}</span><span class="now">${now}</span></h3>${svg}
+    ${legend ? `<div class="legend">${legend}</div>` : ""}</div>`;
+  const tiles = h ? `<div class="tiles">
+    <div class="tile"><span class="k">CPU</span><span class="v">${fmtPct(h.cpu)}</span>${pctBar(h.cpu)}<span class="s">davon I/O-Wartezeit ${fmtPct(h.iowait)}, ${cores} Kerne</span></div>
+    <div class="tile"><span class="k">Load 1 / 5 / 15 min</span><span class="v">${n1(h.load1)}</span>${pctBar(100 * h.load1 / cores)}<span class="s">${n1(h.load5)} / ${n1(h.load15)} bei ${cores} Kernen</span></div>
+    <div class="tile"><span class="k">Arbeitsspeicher</span><span class="v">${fmtBytes(h.mem_used)}</span>${pctBar(100 * h.mem_used / h.mem_total)}<span class="s">von ${fmtBytes(h.mem_total)}, verfügbar ${fmtBytes(h.mem_avail)}</span></div>
+    <div class="tile"><span class="k">Swap</span><span class="v">${h.swap_total ? fmtBytes(h.swap_used) : "–"}</span>${h.swap_total ? pctBar(100 * h.swap_used / h.swap_total) : ""}<span class="s">${h.swap_total ? "von " + fmtBytes(h.swap_total) : "kein Swap eingerichtet"}</span></div>
+    <div class="tile"><span class="k">Platten</span><span class="v">${fmtRate(h.rd + h.wr)}</span><span class="s">lesen ${fmtRate(h.rd)}, schreiben ${fmtRate(h.wr)}</span></div>
+    ${cap ? `<div class="tile capacity"><span class="k">Platz für weitere Entwickler-DBs</span><span class="v">${cap.fits > 0 ? "etwa " + cap.fits : "keine"}</span>
+      <span class="s">bei je ~${n1(cap.dev_db_mb / 1024)} GB und ${fmtBytes(cap.reserve)} Reserve fürs System${cap.swapping ? '<br><b class="bad">Der Host lagert bereits aus – keine weiteren DBs starten.</b>' : ""}</span></div>` : ""}
+  </div>` : '<p class="muted-note">Noch keine Messwerte des Hosts – die ersten kommen nach einer Messperiode.</p>';
+  const last = pts[pts.length - 1] || {};
+  const charts = `<div class="charts host-charts">
+    ${card("CPU des Hosts", fmtPct(last.cpu), chartSvg(pts, [{ key: "cpu", color: "var(--release)", label: "belegt" }, { key: "iowait", color: "#b0731b", label: "I/O-Wartezeit" }], fmtPct, d.interval, 100),
+      lg("var(--release)", "belegt") + lg("#b0731b", "I/O-Wartezeit"))}
+    ${card("Arbeitsspeicher und Swap", last.mem_used != null ? `${fmtBytes(last.mem_used)} von ${fmtBytes(last.mem_total)}` : "–",
+      chartSvg(pts, [{ key: "mem_used", color: "var(--branch)", label: "RAM" }, { key: "swap_used", color: "var(--err)", label: "Swap" }], fmtBytes, d.interval, last.mem_total),
+      lg("var(--branch)", "RAM belegt") + lg("var(--err)", "Swap belegt") + "<span>Obergrenze der Achse: RAM gesamt</span>")}
+    ${card("Platten", last.rd != null ? `${fmtRate(last.rd)} / ${fmtRate(last.wr)}` : "–",
+      chartSvg(pts, [{ key: "rd", color: "var(--release)", label: "lesen" }, { key: "wr", color: "#b0731b", label: "schreiben" }], fmtRate, d.interval),
+      lg("var(--release)", "lesen") + lg("#b0731b", "schreiben"))}
+    ${card("Load", last.load1 != null ? `${n1(last.load1)} / ${n1(last.load15)}` : "–",
+      chartSvg(pts, [{ key: "load1", color: "var(--release)", label: "1 min" }, { key: "load15", color: "var(--branch)", label: "15 min" }], n1, d.interval, cores),
+      lg("var(--release)", "1 min") + lg("var(--branch)", "15 min") + `<span>${cores} Kerne</span>`)}
+  </div>`;
+  const mem = c => (((d.latest || {})[c.name] || {}).mem) || 0;
+  const rows = (d.containers || []).filter(c => c.running).sort((a, b) => mem(b) - mem(a)).map(c => {
+    const l = (d.latest || {})[c.name];
+    return `<tr><td class="nw"><b>${esc(c.name)}</b></td><td class="nw">${esc(c.kind)}</td><td class="nw">${esc(c.sid || "–")}</td>
+      <td class="num nw">${l ? fmtPct(l.cpu) : "–"}</td><td class="num nw">${l ? fmtBytes(l.mem) : "–"}</td>
+      <td class="num nw">${l ? fmtRate(l.rd) : "–"}</td><td class="num nw">${l ? fmtRate(l.wr) : "–"}</td>
+      <td><div class="acts"><button class="quiet small" data-act="ct-metrics" data-name="${esc(c.name)}">Verlauf</button></div></td></tr>`;
+  }).join("");
+  main.innerHTML = `
+    <section class="dbhead"><h1>Auslastung</h1>
+      <div class="facts"><span>${esc(currentHost().name)}</span><span>Messung alle ${d.interval} s</span></div>
+      <div class="actions days">${RANGES.map(([r, l]) => `<label><input type="radio" name="hostrange" value="${r}" data-act="host-range" ${r === hostLoad.range ? "checked" : ""}>${l}</label>`).join("")}</div></section>
+    ${tiles}
+    ${charts}
+    <section style="margin-top:28px"><div class="section-head"><h2>Datenbanken auf diesem Host</h2><span class="hint">aktuelle Werte je laufendem Container, sortiert nach Arbeitsspeicher; CPU 100 % entspricht einem Kern</span></div>
+      <div class="table-wrap"><table class="snap"><thead><tr><th>Container</th><th>Art</th><th>Datenbank</th><th class="num">CPU</th><th class="num">RAM</th><th class="num">Lesen</th><th class="num">Schreiben</th><th></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="8">Keine laufenden Container.</td></tr>'}</tbody></table></div></section>`;
+}
+
 /* ------------------------------------------------------------ Seite „Vorgänge und Container“ */
 async function loadJobsPage() {
   try {
-    const [j, c] = await Promise.all([api("GET", "/api/jobs?limit=300"), api("GET", "/api/containers")]);
+    const [j, c, m] = await Promise.all([api("GET", "/api/jobs?limit=300"), api("GET", "/api/containers"),
+                                         api("GET", "/api/metrics").catch(() => ({ latest: {} }))]);
     jobsPage = { jobs: j.jobs, containers: c.containers };
+    metricsLatest = m.latest || {};
     for (const id of openPageLogs) {
       const job = jobsPage.jobs.find(x => x.id === id);
       if (!pageLogs[id] || (job && job.status === "läuft")) {
@@ -1502,7 +1763,13 @@ function renderJobsPage() {
       <td class="nw">${pillPlain(c.state, STATE[c.state] || (c.running ? "ok" : "off"))}</td>
       <td class="nw">${c.running ? fmtDuration(c.started) : "–"}</td><td class="nw">${c.port || "–"}</td>
       <td class="nw">${esc(c.owner || "–")}</td>
-      <td><div class="acts">${ctMine(c) ? `
+      ${(() => { const m = c.running && metricsLatest && metricsLatest[c.name];
+        return m ? `<td class="num nw">${fmtPct(m.cpu)}</td><td class="num nw">${fmtBytes(m.mem)}</td><td class="num nw">${fmtRate(m.rd + m.wr)}</td>`
+                 : '<td class="num">–</td><td class="num">–</td><td class="num">–</td>'; })()}
+      <td><div class="acts">
+        ${c.running ? `<button class="quiet small" data-act="ct-metrics" data-name="${esc(c.name)}">Auslastung</button>` : ""}
+        ${ctMine(c) ? `<button class="quiet small" data-act="ct-logs" data-name="${esc(c.name)}">Logs</button>` : ""}
+        ${ctMine(c) ? `
         ${c.running ? `<button class="quiet small" data-act="ct-stop" data-name="${esc(c.name)}" data-kind="${esc(c.kind)}">Stoppen</button>
         <button class="quiet small danger" data-act="ct-kill" data-name="${esc(c.name)}" data-kind="${esc(c.kind)}">Abschießen</button>` : ""}
         ${c.kind === "Master-DB" ? `<button class="quiet small" data-act="master-port" data-sid="${esc(c.sid)}" data-port="${c.port || ""}">Port ändern</button>` : ""}
@@ -1527,8 +1794,8 @@ function renderJobsPage() {
       <div class="actions"><button data-act="jobs-reload">Neu laden</button></div></section>
     <section style="margin-top:22px" aria-labelledby="h-ct">
       <div class="section-head"><h2 id="h-ct">Container</h2><span class="hint">nur Container von zeitkapsel; „Abschießen“ beendet sofort ohne sauberes Herunterfahren</span></div>
-      <div class="table-wrap"><table class="snap"><thead><tr><th>Name</th><th>Art</th><th>Datenbank</th><th>Status</th><th>Läuft seit</th><th>Port</th><th>Besitzer</th><th></th></tr></thead>
-        <tbody>${ctRows || '<tr><td colspan="8">Keine Container.</td></tr>'}</tbody></table></div>
+      <div class="table-wrap"><table class="snap"><thead><tr><th>Name</th><th>Art</th><th>Datenbank</th><th>Status</th><th>Läuft seit</th><th>Port</th><th>Besitzer</th><th class="num">CPU</th><th class="num">RAM</th><th class="num">I/O</th><th></th></tr></thead>
+        <tbody>${ctRows || '<tr><td colspan="11">Keine Container.</td></tr>'}</tbody></table></div>
     </section>
     <section style="margin-top:28px" aria-labelledby="h-jobs">
       <div class="section-head"><h2 id="h-jobs">Vorgänge</h2><span class="hint">die letzten 300, mit vollständigem Protokoll; bleiben über Neustarts erhalten</span></div>
@@ -1834,6 +2101,18 @@ document.addEventListener("click", async ev => {
         if (el) { el.scrollIntoView({ block: "center" }); history.replaceState(null, "", location.hash); el.setAttribute("tabindex", "-1"); el.focus(); }
         break;
       }
+      case "ct-logs":
+        openLogs(b.dataset.name);
+        break;
+      case "host-range":
+        hostLoad.range = +b.value; await loadLoadPage(true);
+        break;
+      case "ct-metrics":
+        openMetricsDialog(b.dataset.name);
+        break;
+      case "load-range":
+        loadRange = +b.value; render();
+        break;
       case "job-retry": {
         const j = (jobsPage && jobsPage.jobs.find(x => x.id === b.dataset.id)) || S.jobs.find(x => x.id === b.dataset.id)
           || await api("GET", `/api/jobs/${encodeURIComponent(b.dataset.id)}`);
@@ -1930,6 +2209,10 @@ document.addEventListener("click", async ev => {
     }
   } catch (e) { toast(e.message); }
 });
+document.addEventListener("change", ev => {
+  const t = ev.target;
+  if (t.dataset && t.dataset.act === "load-sel") { loadSel[t.dataset.sid] = t.value; render(); }
+});
 $("#jobsHide").addEventListener("click", () => { jobsHidden = true; try { localStorage.setItem("zk.jobsHidden", "1"); } catch {} renderJobs(); });
 $("#jobsReopen").addEventListener("click", () => { jobsHidden = false; try { localStorage.removeItem("zk.jobsHidden"); } catch {} renderJobs(); });
 try { jobsHidden = localStorage.getItem("zk.jobsHidden") === "1"; } catch {}
@@ -1941,6 +2224,7 @@ refresh().then(() => {
   if (view.kind === "admin") loadAdmin();
   if (view.kind === "access") loadAccess();
   if (view.kind === "jobs") loadJobsPage();
+  if (view.kind === "load") loadLoadPage(true);
 });
 setInterval(async () => {
   if (document.hidden) return;
@@ -1949,6 +2233,7 @@ setInterval(async () => {
     if (view.kind === "admin") await loadAdmin();
     if (view.kind === "access") await loadAccess(true);
     if (view.kind === "jobs") await loadJobsPage();
+    if (view.kind === "load" && Date.now() - hostLoad.fetched > 25000) await loadLoadPage();
     if (view.kind === "snapshots" && snapRows && snapRows.some(r => r.usage_pending)) await loadSnapshots();
     await refresh();
   }

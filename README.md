@@ -119,6 +119,17 @@ Weil die Datei im Subvolume liegt, wandert sie mit jedem Release und jeder Entwi
 
 Docker kann die Portzuordnung eines bestehenden Containers nicht ändern. „Port ändern“ (beim Kopf einer Datenbank, bei jeder Entwickler-DB und auf der Seite „Vorgänge und Container“) fährt den Container deshalb sauber herunter, entfernt ihn und erzeugt ihn mit dem neuen Port neu; die Daten im Subvolume bleiben unverändert. Das geht auch für eine Master-DB ohne Container, etwa wenn ihr gespeicherter Port inzwischen belegt ist. Der Dialog schlägt einen freien Port vor; Entwickler-DBs bleiben im Bereich `ZK_DEV_PORT_START` bis `ZK_DEV_PORT_END`. Master-Ports ändern Administratoren, Entwickler-DB-Ports auch ihre Besitzer.
 
+## Auslastung und Logs
+
+Der Agent misst alle 30 Sekunden (`ZK_METRICS_INTERVAL`) und hält 24 Stunden vor (`ZK_METRICS_HOURS`; gesichert in `meta/metrics.json`, damit ein Neustart die Kurven nicht löscht):
+
+- je Container von zeitkapsel CPU, Arbeitsspeicher sowie gelesene und geschriebene Bytes pro Sekunde (aus `docker stats`; CPU 100 % entspricht einem Kern);
+- den gesamten Host aus `/proc`: CPU-Auslastung und I/O-Wartezeit, Load, RAM gesamt/belegt/verfügbar, Swap, Lese- und Schreibrate der physischen Platten.
+
+Die Seite „Auslastung des Hosts“ zeigt die aktuellen Werte als Kacheln, die Verläufe über 1, 6 oder 24 Stunden und alle laufenden Datenbanken nach Speicherbedarf. Die Kachel „Platz für weitere Entwickler-DBs“ schätzt aus dem verfügbaren Arbeitsspeicher abzüglich einer Reserve für das System (10 % des RAM, mindestens 2 GB), wie viele Entwickler-DBs à `ZK_DEV_DB_MB` (Standard 2048 MB) noch passen; lagert der Host schon aus, steht dort eine Warnung. Jede Datenbank-Ansicht zeigt außerdem die Verläufe ihrer Master-DB und Entwickler-DBs.
+
+„Logs“ (in der Datenbank-Ansicht und auf „Vorgänge und Container“) zeigt `docker logs` eines Containers mit Zeitstempeln, wählbarer Zeilenzahl und automatischer Aktualisierung. Benutzer sehen die Logs ihrer eigenen Entwickler-DBs, Administratoren alle.
+
 ## Vorgänge und Container
 
 Lange Aktionen laufen als Vorgänge auf dem Agenten des Hosts. Das Fenster „Vorgänge“ unten rechts zeigt die letzten; es lässt sich jederzeit ausblenden, auch während etwas läuft – dann bleibt ein kleiner Knopf mit der Zahl der laufenden Vorgänge, der es wieder öffnet.

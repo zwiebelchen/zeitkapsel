@@ -35,6 +35,7 @@ import time
 import uuid
 from pathlib import Path
 
+import collections
 import logging
 import math
 import shlex
@@ -1499,6 +1500,173 @@ def find_container(name: str) -> dict:
 @bp.get("/api/containers")
 def api_containers():
     return jsonify(containers=container_rows())
+
+
+# --------------------------------------------------------------------------- Container-Logs
+@bp.get("/api/containers/<name>/logs")
+def api_container_logs(name):
+    find_container(name)
+    tail = max(10, min(int(request.args.get("tail") or 500), 10000))
+    p = subprocess.run(["docker", "logs", "--timestamps", "--tail", str(tail), name],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+    lines = p.stdout.splitlines()
+    return jsonify(name=name, tail=tail, lines=lines[-tail:])
+
+
+# --------------------------------------------------------------------------- Auslastung (CPU, RAM, I/O)
+METRICS_INTERVAL = max(5, int(env("METRICS_INTERVAL", "30")))
+METRICS_HOURS = max(1, int(env("METRICS_HOURS", "24")))
+METRICS_FILE = META / "metrics.json"
+_metrics: dict[str, collections.deque] = {}
+_metrics_io: dict[str, tuple[float, int, int]] = {}
+_metrics_lock = threading.Lock()
+_UNITS = {"b": 1, "kb": 1000, "mb": 1000 ** 2, "gb": 1000 ** 3, "tb": 1000 ** 4,
+          "kib": 1024, "mib": 1024 ** 2, "gib": 1024 ** 3, "tib": 1024 ** 4}
+
+
+def parse_bytes(text: str) -> int:
+    m = re.match(r"^\s*([\d.]+)\s*([KMGT]?i?B)\s*$", text or "", re.I)
+    return int(float(m.group(1)) * _UNITS.get(m.group(2).lower(), 1)) if m else 0
+
+
+def metrics_sample() -> None:
+    now = time.time()
+    keep = METRICS_HOURS * 3600 // METRICS_INTERVAL + 2
+    hp = host_sample(now)
+    if hp:
+        with _metrics_lock:
+            _metrics.setdefault(HOST_KEY, collections.deque(maxlen=keep)).append(hp)
+    relevant = {c["name"] for c in containers() if container_kind(c) and c["running"]}
+    if not relevant:
+        return
+    p = sh(["docker", "stats", "--no-stream", "--format", "{{json .}}"], check=False, timeout=90)
+    for line in p.stdout.splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        name = d.get("Name", "")
+        if name not in relevant:
+            continue
+        mem_used, _, mem_limit = (d.get("MemUsage") or "").partition("/")
+        rd, _, wr = (d.get("BlockIO") or "").partition("/")
+        rd_b, wr_b = parse_bytes(rd), parse_bytes(wr)
+        point = dict(t=int(now), cpu=round(float((d.get("CPUPerc") or "0%").rstrip("%") or 0), 2),
+                     mem=parse_bytes(mem_used), mem_limit=parse_bytes(mem_limit), rd=0, wr=0)
+        prev = _metrics_io.get(name)
+        if prev and now > prev[0] and rd_b >= prev[1] and wr_b >= prev[2]:
+            point["rd"] = int((rd_b - prev[1]) / (now - prev[0]))
+            point["wr"] = int((wr_b - prev[2]) / (now - prev[0]))
+        _metrics_io[name] = (now, rd_b, wr_b)
+        with _metrics_lock:
+            _metrics.setdefault(name, collections.deque(maxlen=keep)).append(point)
+
+
+HOST_KEY = "__host__"
+DEV_DB_MB = int(env("DEV_DB_MB", "2048"))          # grober Bedarf einer Entwickler-DB (SGA+PGA+Prozesse)
+_host_prev: dict = {}
+DISK_RE = re.compile(r"^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|nvme\d+n\d+)$")
+
+
+def read_proc(name: str) -> str:
+    try:
+        return Path("/proc", name).read_text()
+    except OSError:
+        return ""
+
+
+def host_sample(now: float) -> dict | None:
+    cpu_line = next((l for l in read_proc("stat").splitlines() if l.startswith("cpu ")), "")
+    vals = [int(x) for x in cpu_line.split()[1:9]] if cpu_line else []
+    mem = {}
+    for line in read_proc("meminfo").splitlines():
+        k, _, v = line.partition(":")
+        if v.strip().split():
+            mem[k] = int(v.strip().split()[0]) * 1024
+    rd_s = wr_s = 0
+    for line in read_proc("diskstats").splitlines():
+        f = line.split()
+        if len(f) > 9 and DISK_RE.match(f[2]):
+            rd_s += int(f[5])
+            wr_s += int(f[9])
+    load = (read_proc("loadavg").split() + ["0", "0", "0"])[:3]
+    if not vals or "MemTotal" not in mem:
+        return None
+    total, idle, iowait = sum(vals), vals[3], vals[4]
+    point = dict(t=int(now), cpu=0.0, iowait=0.0, load1=float(load[0]), load5=float(load[1]), load15=float(load[2]),
+                 mem_total=mem["MemTotal"], mem_avail=mem.get("MemAvailable", mem.get("MemFree", 0)),
+                 mem_used=mem["MemTotal"] - mem.get("MemAvailable", mem.get("MemFree", 0)),
+                 swap_total=mem.get("SwapTotal", 0), swap_used=mem.get("SwapTotal", 0) - mem.get("SwapFree", 0),
+                 rd=0, wr=0)
+    prev = _host_prev.get("v")
+    if prev:
+        dt_total = total - prev["total"]
+        if dt_total > 0:
+            point["cpu"] = round(100 * (dt_total - (idle - prev["idle"]) - (iowait - prev["iowait"])) / dt_total, 1)
+            point["iowait"] = round(100 * (iowait - prev["iowait"]) / dt_total, 1)
+        if now > prev["t"] and rd_s >= prev["rd"] and wr_s >= prev["wr"]:
+            point["rd"] = int((rd_s - prev["rd"]) * 512 / (now - prev["t"]))
+            point["wr"] = int((wr_s - prev["wr"]) * 512 / (now - prev["t"]))
+    _host_prev["v"] = dict(t=now, total=total, idle=idle, iowait=iowait, rd=rd_s, wr=wr_s)
+    return point if prev else None
+
+
+def host_capacity(p: dict) -> dict:
+    """Wie viele weitere Entwickler-DBs passen ungefähr noch in den verfügbaren Arbeitsspeicher?"""
+    reserve = max(2 * 1024 ** 3, p["mem_total"] // 10)
+    free_for_dbs = max(0, p["mem_avail"] - reserve)
+    return dict(dev_db_mb=DEV_DB_MB, reserve=reserve, fits=int(free_for_dbs // (DEV_DB_MB * 1024 ** 2)),
+                swapping=p["swap_used"] > 256 * 1024 ** 2)
+
+
+def metrics_save() -> None:
+    with _metrics_lock:
+        data = {k: list(v) for k, v in _metrics.items()}
+    try:
+        write_json(METRICS_FILE, dict(interval=METRICS_INTERVAL, series=data))
+    except OSError:
+        pass
+
+
+def metrics_load() -> None:
+    try:
+        data = json.loads(METRICS_FILE.read_text())
+    except (OSError, ValueError):
+        return
+    keep = METRICS_HOURS * 3600 // METRICS_INTERVAL + 2
+    cutoff = time.time() - METRICS_HOURS * 3600
+    with _metrics_lock:
+        for name, pts in (data.get("series") or {}).items():
+            _metrics[name] = collections.deque((p for p in pts if p.get("t", 0) >= cutoff), maxlen=keep)
+
+
+def metrics_loop() -> None:
+    n = 0
+    while True:
+        try:
+            metrics_sample()
+            n += 1
+            if n % 10 == 0:
+                metrics_save()   # alle ~5 Minuten sichern, damit ein Neustart die Kurven nicht löscht
+        except Exception:  # noqa: BLE001
+            log.exception("Fehler beim Erfassen der Auslastung")
+        time.sleep(METRICS_INTERVAL)
+
+
+@bp.get("/api/metrics")
+def api_metrics():
+    """Ohne name: letzter Wert je Container; mit name: Verlauf der letzten range Sekunden."""
+    name = request.args.get("name")
+    with _metrics_lock:
+        if not name:
+            latest = {k: v[-1] for k, v in _metrics.items() if v}
+            host = latest.pop(HOST_KEY, None)
+            return jsonify(interval=METRICS_INTERVAL, cores=os.cpu_count(), latest=latest, host=host,
+                           capacity=host_capacity(host) if host else None)
+        rng = max(300, min(int(request.args.get("range") or 3600), METRICS_HOURS * 3600))
+        cutoff = time.time() - rng
+        pts = [p for p in _metrics.get(name, []) if p["t"] >= cutoff]
+    return jsonify(name=name, interval=METRICS_INTERVAL, cores=os.cpu_count(), range=rng, points=pts)
 
 
 @bp.get("/api/containers/<name>")
@@ -3538,3 +3706,5 @@ def start_agent() -> None:
     jobs_housekeeping()
     threading.Thread(target=scheduler_loop, daemon=True, name="zeitplaner").start()
     threading.Thread(target=usage_worker, daemon=True, name="platzermittlung").start()
+    metrics_load()
+    threading.Thread(target=metrics_loop, daemon=True, name="auslastung").start()
